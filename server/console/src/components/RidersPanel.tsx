@@ -1,9 +1,24 @@
 import { useState } from "react";
-import { App as AntApp, Button, Card, Empty, Input, Modal, Space, Tag, Typography } from "antd";
-import { PHASE_LABEL, SPEED_MODE_LABEL } from "../const";
+import {
+  App as AntApp,
+  Badge,
+  Button,
+  Card,
+  Empty,
+  Input,
+  List,
+  Modal,
+  Space,
+  Statistic,
+  Tag,
+  Typography,
+  theme,
+} from "antd";
+import { HUMAN_RIDER_COLOR, PHASE_LABEL, SPEED_MODE_LABEL } from "../const";
 import { useIsControl, useStore } from "../hooks";
 import type { RiderBrief } from "../protocol";
 import { store, yuan } from "../store";
+import { Metric, MetricRow } from "./Metric";
 
 interface Props {
   selected: number | null;
@@ -13,6 +28,7 @@ interface Props {
 export function RidersPanel({ selected, onSelect }: Props) {
   const snap = useStore((s) => s.snap);
   const isControl = useIsControl();
+  const { token } = theme.useToken();
   const { message } = AntApp.useApp();
   const [renaming, setRenaming] = useState<RiderBrief | null>(null);
   const [draft, setDraft] = useState("");
@@ -53,79 +69,100 @@ export function RidersPanel({ selected, onSelect }: Props) {
 
   return (
     <div className="console-scroll">
-      <div className="stat-grid">
-        {stats.map(([v, k]) => (
-          <div key={k} className="stat-cell">
-            <b>{v}</b>
-            <span>{k}</span>
-          </div>
-        ))}
-      </div>
+      {/* 统计是「读」的信息：标题用次级文本，数值用标题级字号并锁表格数字。 */}
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <div className="stat-grid">
+          {stats.map(([v, k]) => (
+            <Statistic
+              key={k}
+              title={k}
+              value={v}
+              valueStyle={{
+                fontSize: token.fontSizeHeading4,
+                fontVariantNumeric: "tabular-nums",
+              }}
+            />
+          ))}
+        </div>
+      </Card>
 
-      <Space direction="vertical" size={8} style={{ width: "100%" }}>
-        {riders.map((r) => (
-          <Card
-            key={r.id}
-            size="small"
-            hoverable
+      <List
+        size="small"
+        header="骑手"
+        itemLayout="vertical"
+        rowKey="id"
+        dataSource={riders}
+        renderItem={(r) => (
+          <List.Item
             onClick={() => onSelect(r.id)}
             style={{
-              borderColor: selected === r.id ? "#ff7a1a" : undefined,
-              opacity: r.online ? 1 : 0.6,
+              paddingInline: 8,
+              borderRadius: token.borderRadius,
+              cursor: "pointer",
+              // 选中态取 antd 的「导航里你在这儿」那一档，不另造颜色。
+              background: selected === r.id ? token.controlItemBgActive : undefined,
             }}
-            title={
-              <Space size={6}>
-                <span style={{ color: r.kind === "human" ? "#9b59b6" : "#ff7a1a" }}>●</span>
-                <span>{r.name}</span>
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>#{r.id}</Typography.Text>
-                {r.kind === "human" && <Tag color="purple" style={{ marginInlineEnd: 0 }}>真人</Tag>}
-                {!r.online && <Tag style={{ marginInlineEnd: 0 }}>离线</Tag>}
-                {r.frozen && <Tag color="blue" style={{ marginInlineEnd: 0 }}>冻结</Tag>}
-                {r.injured && <Tag color="red" style={{ marginInlineEnd: 0 }}>受伤</Tag>}
-              </Space>
-            }
-            extra={
-              isControl && (
-                <Space size={4}>
-                  <Button
-                    size="small"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      openRename(r);
-                    }}
-                  >
-                    改名
-                  </Button>
-                  <Button
-                    size="small"
-                    type={r.online ? "default" : "primary"}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      store.send("set_rider_online", { rider_id: r.id, online: !r.online });
-                    }}
-                  >
-                    {r.online ? "下线" : "上线"}
-                  </Button>
-                </Space>
-              )
+            actions={
+              isControl
+                ? [
+                    <Button
+                      key="rename"
+                      size="small"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openRename(r);
+                      }}
+                    >
+                      改名
+                    </Button>,
+                    <Button
+                      key="online"
+                      size="small"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        store.send("set_rider_online", { rider_id: r.id, online: !r.online });
+                      }}
+                    >
+                      {r.online ? "下线" : "上线"}
+                    </Button>,
+                  ]
+                : undefined
             }
           >
-            <Space size={12} wrap style={{ fontSize: 12 }}>
-              <span>Lv{r.level}</span>
-              <span>评分 {r.rating.toFixed(2)}</span>
-              <span>完成 {r.completed}</span>
-              <span>
-                持单 {r.held.length > 0 ? `#${r.held.join(" #")}` : "0"}
-              </span>
-              <span>{r.phase ? PHASE_LABEL[r.phase] : "空闲"}</span>
-              <span>{SPEED_MODE_LABEL[r.speed_mode] ?? r.speed_mode}</span>
-              {r.hourly_wage_cents != null && <span>时薪 ¥{yuan(r.hourly_wage_cents)}</span>}
-              {r.takehome_cents != null && <span>到手 ¥{yuan(r.takehome_cents)}</span>}
-              {r.fatigue != null && <span>疲劳 {Math.round(r.fatigue * 100)}%</span>}
-            </Space>
-          </Card>
-        ))}
-      </Space>
+            <List.Item.Meta
+              title={
+                <Space size={8}>
+                  {/* 在线与否是关键状态，用 Badge 的点，不用彩色正文。 */}
+                  <Badge status={r.online ? "success" : "default"} />
+                  <Typography.Text
+                    strong
+                    style={{ color: r.kind === "human" ? HUMAN_RIDER_COLOR : undefined }}
+                  >
+                    {r.name}
+                  </Typography.Text>
+                  <Metric>#{r.id}</Metric>
+                  {r.kind === "human" && <Tag color="purple">真人</Tag>}
+                  {r.frozen && <Badge status="warning" text="冻结" />}
+                  {r.injured && <Badge status="error" text="受伤" />}
+                </Space>
+              }
+              description={
+                <MetricRow>
+                  <Metric>Lv{r.level}</Metric>
+                  <Metric>评分 {r.rating.toFixed(2)}</Metric>
+                  <Metric>完成 {r.completed}</Metric>
+                  <Metric>持单 {r.held.length > 0 ? `#${r.held.join(" #")}` : "0"}</Metric>
+                  <Metric>{r.phase ? PHASE_LABEL[r.phase] : "空闲"}</Metric>
+                  <Metric>{SPEED_MODE_LABEL[r.speed_mode] ?? r.speed_mode}</Metric>
+                  {r.hourly_wage_cents != null && <Metric>时薪 ¥{yuan(r.hourly_wage_cents)}</Metric>}
+                  {r.takehome_cents != null && <Metric>到手 ¥{yuan(r.takehome_cents)}</Metric>}
+                  {r.fatigue != null && <Metric>疲劳 {Math.round(r.fatigue * 100)}%</Metric>}
+                </MetricRow>
+              }
+            />
+          </List.Item>
+        )}
+      />
 
       <Modal
         open={renaming !== null}

@@ -1,43 +1,48 @@
 import { theme, type ThemeConfig } from "antd";
-import { ACCENT } from "./const";
+import {
+  COLOR_ERROR,
+  COLOR_PRIMARY,
+  COLOR_SUCCESS,
+  COLOR_WARNING,
+  FONT_STACK,
+} from "./const";
 
 /**
- * 把原来那套手写 CSS 变量映射成 antd token。
+ * Ant Design 视觉语言的主题配置。
  *
- * `darkAlgorithm` 负责整体暗色兜底，token 负责把配色拉回原来的橙黑主题——
- * 否则 antd 默认的蓝紫会在暗色下显得很突兀。
+ * 只做两件事：
+ *
+ * 1. **换种子**——主色、四个语义色、字体栈、基准字号、圆角。
+ *    贴片、hover、active、outline 等派生色由 `defaultAlgorithm` 展开，
+ *    不手写第二套梯度。
+ * 2. **把 Layout 拉回三层表面模型**——antd 的 `headerBg` / `siderBg`
+ *    默认是深蓝 `#001529`，与亮色表面模型冲突，必须显式指回容器白。
+ *
+ * 不使用 `darkAlgorithm`：底图是高德 / OSM 的亮色瓦片，暗色外壳会与地图打架。
+ * 需要暗色时整包换成 `darkAlgorithm` 即可，算法会自己翻转表面阶梯与阴影。
  */
 export const consoleTheme: ThemeConfig = {
-  algorithm: theme.darkAlgorithm,
+  algorithm: theme.defaultAlgorithm,
   token: {
-    colorPrimary: ACCENT,
-    colorBgBase: "#0f1218",
-    colorBgContainer: "#171b23",
-    colorBgElevated: "#1b1f27",
-    colorBgLayout: "#0f1218",
-    colorBorder: "#262c38",
-    colorBorderSecondary: "#262c38",
-    colorText: "#e6e9ef",
-    colorTextSecondary: "#8a93a6",
-    colorSuccess: "#2ecc71",
-    colorWarning: "#f5b041",
-    colorError: "#e74c3c",
-    colorInfo: "#3d8bfd",
+    colorPrimary: COLOR_PRIMARY,
+    colorInfo: COLOR_PRIMARY,
+    colorSuccess: COLOR_SUCCESS,
+    colorWarning: COLOR_WARNING,
+    colorError: COLOR_ERROR,
+    fontFamily: FONT_STACK,
+    fontSize: 14,
     borderRadius: 6,
-    fontSize: 13,
-    fontFamily: '-apple-system, "PingFang SC", "Microsoft YaHei", sans-serif',
   },
   components: {
     Layout: {
-      headerBg: "#171b23",
-      bodyBg: "#0f1218",
-      siderBg: "#171b23",
+      // bg-layout：页面底板，包围并承载其余一切。
+      bodyBg: "#F5F5F5",
+      // bg-container：页头与侧栏是内容面，不是抬升面。
+      headerBg: "#FFFFFF",
+      siderBg: "#FFFFFF",
+      headerPadding: "0 16px",
     },
-    Card: {
-      colorBgContainer: "#10141b",
-    },
-    Tabs: {
-      itemColor: "#8a93a6",
-    },
+    // 抬升面靠阴影而非颜色区分，卡片阴影收紧一档。
+    Card: { paddingLG: 24 },
   },
 };

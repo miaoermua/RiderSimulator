@@ -1,8 +1,9 @@
-import { Card, Empty, Select, Space, Tag, Typography } from "antd";
+import { Badge, Empty, List, Select, Space, Typography } from "antd";
 import { STATUS_LABEL } from "../const";
 import { useIsControl, useStore } from "../hooks";
-import type { Order, RiderBrief } from "../protocol";
+import type { Order } from "../protocol";
 import { store, yuan } from "../store";
+import { Metric, MetricRow } from "./Metric";
 
 /**
  * 大厅待抢 + 在跑订单。
@@ -22,137 +23,113 @@ export function OrdersPanel() {
 
   return (
     <div className="console-scroll">
-      <Section title="大厅待抢" count={snap.hall.length}>
-        {snap.hall.length === 0 ? (
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            大厅是空的
-          </Typography.Text>
-        ) : (
-          snap.hall.map((o) => (
-            <HallCard
-              key={o.id}
-              order={o}
-              elapsed={snap.elapsed_min}
-              candidates={candidates}
-              isControl={isControl}
+      <List
+        size="small"
+        header="大厅待抢"
+        itemLayout="vertical"
+        rowKey="id"
+        dataSource={snap.hall}
+        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="大厅是空的" /> }}
+        style={{ marginBottom: 24 }}
+        renderItem={(o) => (
+          <List.Item>
+            <List.Item.Meta
+              title={<OrderTitle order={o} right={<Badge {...ttlBadge(o.claim_deadline_min - snap.elapsed_min, "窗口")} />} />}
+              description={
+                <MetricRow>
+                  <Metric>{(o.distance_m / 1000).toFixed(1)}km</Metric>
+                  <Metric>承诺 {o.promised_minutes} 分</Metric>
+                  <Metric>抽水 ¥{yuan(o.fee.commission_cents)}</Metric>
+                  {o.task && <Metric>任务 {o.task.name}</Metric>}
+                </MetricRow>
+              }
             />
-          ))
+            {isControl && (
+              <Select
+                style={{ width: "100%", marginTop: 8 }}
+                size="small"
+                showSearch
+                optionFilterProp="label"
+                placeholder="指派给…"
+                value={null}
+                options={candidates.map((r) => ({
+                  value: r.id,
+                  label: `${r.name}（${r.held.length} 单）`,
+                }))}
+                onChange={(v) => store.send("force_assign", { order_id: o.id, rider_id: v })}
+              />
+            )}
+          </List.Item>
         )}
-      </Section>
+      />
 
-      <Section title="在跑" count={snap.active_orders.length}>
-        {snap.active_orders.length === 0 ? (
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            没有在跑的单
-          </Typography.Text>
-        ) : (
-          snap.active_orders.map((o) => (
-            <ActiveCard key={o.id} order={o} elapsed={snap.elapsed_min} nameOf={nameOf} />
-          ))
+      <List
+        size="small"
+        header="在跑"
+        itemLayout="vertical"
+        rowKey="id"
+        dataSource={snap.active_orders}
+        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有在跑的单" /> }}
+        renderItem={(o) => (
+          <List.Item>
+            <List.Item.Meta
+              title={
+                <OrderTitle
+                  order={o}
+                  right={<Badge {...ttlBadge(o.created_at_min + o.promised_minutes - snap.elapsed_min, "剩")} />}
+                />
+              }
+              description={<ActiveMeta order={o} rider={nameOf(o.assigned_to)} />}
+            />
+          </List.Item>
         )}
-      </Section>
+      />
     </div>
   );
 }
 
-function Section({
-  title,
-  count,
-  children,
-}: {
-  title: string;
-  count: number;
-  children: React.ReactNode;
-}) {
+/** 标题行：`#id 商家 → 顾客`，右侧挂状态徽标并被推到最右。 */
+function OrderTitle({ order: o, right }: { order: Order; right: React.ReactNode }) {
   return (
-    <div style={{ marginBottom: 12 }}>
-      <Typography.Title level={5} style={{ marginTop: 0, marginBottom: 8 }}>
-        {title} <Typography.Text type="secondary" style={{ fontSize: 12 }}>{count}</Typography.Text>
-      </Typography.Title>
-      <Space direction="vertical" size={8} style={{ width: "100%" }}>
-        {children}
-      </Space>
-    </div>
+    <Space size={8} style={{ width: "100%" }}>
+      <Typography.Text strong>#{o.id}</Typography.Text>
+      <Typography.Text>{o.merchant_name}</Typography.Text>
+      <Metric>→ {o.customer_address}</Metric>
+      <span style={{ marginInlineStart: "auto" }}>
+        <Space size={8}>
+          <Typography.Text strong>¥{yuan(o.fee.quoted_fee_cents)}</Typography.Text>
+          {right}
+        </Space>
+      </span>
+    </Space>
   );
 }
 
-function HallCard({
-  order: o,
-  elapsed,
-  candidates,
-  isControl,
-}: {
-  order: Order;
-  elapsed: number;
-  candidates: RiderBrief[];
-  isControl: boolean;
-}) {
-  const ttl = o.claim_deadline_min - elapsed;
+function ActiveMeta({ order: o, rider }: { order: Order; rider: string }) {
   return (
-    <Card size="small">
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <b>#{o.id}</b> {o.merchant_name}{" "}
-          <Typography.Text type="secondary">→ {o.customer_address}</Typography.Text>
-        </div>
-        <Typography.Text strong style={{ color: "#ff7a1a" }}>
-          ¥{yuan(o.fee.quoted_fee_cents)}
-        </Typography.Text>
-      </div>
-      <Typography.Text type="secondary" style={{ fontSize: 11 }}>
-        {(o.distance_m / 1000).toFixed(1)}km · 承诺 {o.promised_minutes} 分 · 抽水 ¥
-        {yuan(o.fee.commission_cents)}
-        {o.task ? ` · 任务：${o.task.name}` : ""}
-        {ttl >= 0 ? ` · 窗口剩 ${ttl} 分` : ""}
-      </Typography.Text>
-      {isControl && (
-        <Space.Compact style={{ width: "100%", marginTop: 6 }}>
-          <Select
-            size="small"
-            style={{ flex: 1 }}
-            placeholder="选骑手"
-            options={candidates.map((r) => ({
-              value: r.id,
-              label: `${r.name}（${r.held.length} 单）`,
-            }))}
-            onChange={(v) => store.send("force_assign", { order_id: o.id, rider_id: v })}
-            value={null}
-          />
-        </Space.Compact>
-      )}
-    </Card>
+    <MetricRow>
+      <Metric>{STATUS_LABEL[o.status] ?? o.status}</Metric>
+      <Metric>骑手 {rider}</Metric>
+      <Metric>{(o.distance_m / 1000).toFixed(1)}km</Metric>
+      <Metric>到手 ¥{yuan(o.fee.takehome_cents)}</Metric>
+      {o.forced && <Metric>强制</Metric>}
+      {o.back_order && <Metric>背单</Metric>}
+      {o.urge_count ? <Metric>催 {o.urge_count}</Metric> : null}
+    </MetricRow>
   );
 }
 
-function ActiveCard({
-  order: o,
-  elapsed,
-  nameOf,
-}: {
-  order: Order;
-  elapsed: number;
-  nameOf: (id: number | null) => string;
-}) {
-  const left = o.created_at_min + o.promised_minutes - elapsed;
-  const ttlColor = left < 0 ? "red" : left < 10 ? "orange" : "default";
-  return (
-    <Card size="small">
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <b>#{o.id}</b> {o.merchant_name}{" "}
-          <Typography.Text type="secondary">→ {o.customer_address}</Typography.Text>
-        </div>
-        <Tag color={ttlColor} style={{ marginInlineEnd: 0 }}>
-          {left < 0 ? `超时 ${-left} 分` : `剩 ${left} 分`}
-        </Tag>
-      </div>
-      <Typography.Text type="secondary" style={{ fontSize: 11 }}>
-        {STATUS_LABEL[o.status] ?? o.status} · 骑手 {nameOf(o.assigned_to)} ·{" "}
-        {(o.distance_m / 1000).toFixed(1)}km · 到手 ¥{yuan(o.fee.takehome_cents)}
-        {o.forced ? " · 强制" : ""}
-        {o.back_order ? " · 背单" : ""}
-        {o.urge_count ? ` · 催 ${o.urge_count}` : ""}
-      </Typography.Text>
-    </Card>
-  );
+/**
+ * 时限状态。
+ *
+ * 关键状态交 `Badge` 而不是 `Tag`——规范里 Tag 只做分类标签，
+ * 且 Tag 无法承载「点 + 文案」的状态语义。
+ */
+function ttlBadge(minutes: number, prefix: string): {
+  status: "error" | "warning" | "default";
+  text: string;
+} {
+  if (minutes < 0) return { status: "error", text: `${prefix}超时 ${-minutes} 分` };
+  if (minutes < 10) return { status: "warning", text: `${prefix} ${minutes} 分` };
+  return { status: "default", text: `${prefix} ${minutes} 分` };
 }

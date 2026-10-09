@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  Alert,
   App as AntApp,
   Button,
-  Card,
   Divider,
   Empty,
   Input,
@@ -40,15 +40,17 @@ export function SettingsPanel() {
   return (
     <div className="console-scroll">
       {!isControl && (
-        <Card size="small" style={{ marginBottom: 12, color: "#f5b041" }}>
-          当前是观战身份，设置只读。
-        </Card>
+        <Alert
+          type="warning"
+          showIcon
+          message="当前是观战身份，设置只读。"
+          style={{ marginBottom: 16 }}
+        />
       )}
 
       <Heading>显示</Heading>
       <Row label="地图坐标系" hint="切换后底图跟着换：GCJ-02 用高德，WGS-84 用 OpenStreetMap">
         <Segmented
-          size="small"
           disabled={!isControl}
           value={c.coord_system ?? "gcj02"}
           options={[
@@ -59,15 +61,12 @@ export function SettingsPanel() {
         />
       </Row>
       <Row label="坐标系说明">
-        <Typography.Text type="secondary" style={{ fontSize: 11 }}>
-          {COORD_LABEL[c.coord_system ?? "gcj02"]}
-        </Typography.Text>
+        <Typography.Text type="secondary">{COORD_LABEL[c.coord_system ?? "gcj02"]}</Typography.Text>
       </Row>
 
       <Heading>AI</Heading>
       <Row label="AI 骑手数量" hint="0~8；减少时手上有单的先跑完">
         <InputNumber
-          size="small"
           min={0}
           max={8}
           disabled={!isControl}
@@ -102,7 +101,6 @@ export function SettingsPanel() {
       <Heading>世界</Heading>
       <Row label="天气">
         <Select
-          size="small"
           style={{ width: 120 }}
           disabled={!isControl}
           value={snap.weather}
@@ -122,7 +120,6 @@ export function SettingsPanel() {
       </Row>
       <Row label="每日单量上限" hint="0 = 不限">
         <InputNumber
-          size="small"
           min={0}
           disabled={!isControl}
           value={c.max_orders_per_day}
@@ -136,7 +133,6 @@ export function SettingsPanel() {
       <Heading>规则</Heading>
       <Row label="抢单窗口（秒）">
         <InputNumber
-          size="small"
           min={1}
           max={10}
           disabled={!isControl}
@@ -146,7 +142,6 @@ export function SettingsPanel() {
       </Row>
       <Row label="背单上限">
         <InputNumber
-          size="small"
           min={1}
           max={5}
           disabled={!isControl}
@@ -194,7 +189,7 @@ export function SettingsPanel() {
       {info?.hub && (
         <>
           <Heading>服务器</Heading>
-          <Typography.Text type="secondary" style={{ fontSize: 11, wordBreak: "break-all" }}>
+          <Typography.Text type="secondary" style={{ wordBreak: "break-all" }}>
             {JSON.stringify(info.hub)}
           </Typography.Text>
         </>
@@ -284,7 +279,7 @@ function AdvancedSection({
             setNames(e.target.value);
           }}
         />
-        <Button size="small" disabled={disabled} onClick={saveNames} style={{ marginTop: 6 }}>
+        <Button disabled={disabled} onClick={saveNames} style={{ marginTop: 8 }}>
           应用名单
         </Button>
       </Row>
@@ -326,11 +321,10 @@ function AdvancedSection({
         />
       </Row>
       <Space style={{ marginTop: 8 }}>
-        <Button size="small" disabled={disabled} onClick={saveLlm}>
+        <Button disabled={disabled} onClick={saveLlm}>
           保存
         </Button>
         <Button
-          size="small"
           danger
           disabled={disabled}
           onClick={() =>
@@ -344,14 +338,15 @@ function AdvancedSection({
           清除 Key
         </Button>
       </Space>
-      <Divider style={{ margin: "16px 0 8px" }} />
+      <Divider style={{ margin: "16px 0 8px" }} />{/* 接入配置与运行参数分段 */}
     </>
   );
 }
 
+/** 分组标题：`title-lg`（16px / 600）。标题就该是主文本色，次级色留给描述。 */
 function Heading({ children }: { children: React.ReactNode }) {
   return (
-    <Typography.Title level={5} style={{ marginTop: 14, marginBottom: 4 }} type="secondary">
+    <Typography.Title level={5} style={{ marginTop: 24, marginBottom: 8 }}>
       {children}
     </Typography.Title>
   );
@@ -372,11 +367,7 @@ function Row({
     <div className={`set-row${stack ? " stack" : ""}`}>
       <div>
         <div>{label}</div>
-        {hint && (
-          <Typography.Text type="secondary" style={{ fontSize: 11 }}>
-            {hint}
-          </Typography.Text>
-        )}
+        {hint && <Typography.Text type="secondary">{hint}</Typography.Text>}
       </div>
       <div className="set-ctl">{children}</div>
     </div>

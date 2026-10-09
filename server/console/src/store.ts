@@ -220,7 +220,8 @@ class ConsoleStore {
         this.log(
           `#${d.order_id} ${d.rider_name} 送达${d.late ? "（超时）" : ""}，到手 ${yuan(d.takehome_cents)}`,
           d.late ? "超时" : undefined,
-          d.late ? "var(--bad)" : undefined,
+          // Tag 的 color 走 Ant Design 预置调色板名，不引自定义色值。
+          d.late ? "red" : undefined,
         );
         break;
       }
@@ -230,7 +231,7 @@ class ConsoleStore {
         break;
       case "fine_issued": {
         const f = p as EventPayloads["fine_issued"];
-        this.log(`罚款 ${f.reason} -${yuan(f.amount_cents)}`, "罚款", "var(--bad)");
+        this.log(`罚款 ${f.reason} -${yuan(f.amount_cents)}`, "罚款", "red");
         break;
       }
       case "config_changed":
@@ -238,7 +239,7 @@ class ConsoleStore {
         break;
       case "ai_decision": {
         const a = p as EventPayloads["ai_decision"];
-        if (a.note) this.log(a.note, a.source, "var(--blue)");
+        if (a.note) this.log(a.note, a.source, "blue");
         break;
       }
       case "task_message": {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { App as AntApp, Layout, Tabs } from "antd";
+import { App as AntApp, Layout, Tabs, theme } from "antd";
 import { useStore } from "./hooks";
 import { LoginGate } from "./components/LoginGate";
 import { LogPanel } from "./components/LogPanel";
@@ -10,18 +10,9 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { TopBar } from "./components/TopBar";
 import { store } from "./store";
 
-const HEADER_STYLE: React.CSSProperties = {
-  height: 48,
-  lineHeight: "48px",
-  padding: "0 16px",
-  display: "flex",
-  alignItems: "center",
-  gap: 16,
-  borderBottom: "1px solid #262c38",
-};
-
 export function App() {
   const { message } = AntApp.useApp();
+  const { token } = theme.useToken();
   const role = useStore((s) => s.role);
   const [tab, setTab] = useState("riders");
   const [selected, setSelected] = useState<number | null>(null);
@@ -45,14 +36,22 @@ export function App() {
 
   return (
     <Layout style={{ height: "100vh" }}>
-      <Layout.Header style={HEADER_STYLE}>
+      {/* 页头是容器面（白），与页面底板（#F5F5F5）靠一条弱边框分层，不用阴影。 */}
+      <Layout.Header
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 16,
+          borderBottom: `1px solid ${token.colorBorderSecondary}`,
+        }}
+      >
         <TopBar />
       </Layout.Header>
       <Layout style={{ minHeight: 0 }}>
         <Layout.Content style={{ position: "relative", minWidth: 0 }}>
           <MapView selected={selected} onPickRider={pickRider} />
         </Layout.Content>
-        <Layout.Sider width={420} theme="dark" className="console-sider" style={{ borderLeft: "1px solid #262c38" }}>
+        <Layout.Sider width={420} theme="light" className="console-sider">
           <Tabs activeKey={tab} onChange={setTab} items={panels} />
         </Layout.Sider>
       </Layout>

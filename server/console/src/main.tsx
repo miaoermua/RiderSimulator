@@ -7,9 +7,13 @@ import "leaflet/dist/leaflet.css";
 import "./styles.css";
 import { App } from "./App";
 import { consoleTheme } from "./theme";
+import { applyDesignTokenVars } from "./tokens";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("缺少 #root 挂载点");
+
+// 先把令牌写成 CSS 变量，再挂载——首帧就是最终颜色，不会闪。
+applyDesignTokenVars();
 
 createRoot(root).render(
   <StrictMode>

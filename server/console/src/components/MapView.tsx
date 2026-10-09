@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import L from "leaflet";
+import { theme } from "antd";
 import { BASEMAPS } from "../basemaps";
-import { PHASE_COLOR, PHASE_LABEL, STATUS_LABEL } from "../const";
+import { HUMAN_RIDER_COLOR, ORDER_COLOR, PHASE_COLOR, PHASE_LABEL, STATUS_LABEL } from "../const";
 import type { Order, RiderBrief } from "../protocol";
 import { store } from "../store";
 import { useStore } from "../hooks";
@@ -14,19 +15,15 @@ interface Props {
 /** 成都市中心，和 `sim::world` 的默认商圈一致。 */
 const DEFAULT_CENTER: [number, number] = [30.66, 104.06];
 
-const ORDER_COLOR: Record<string, string> = {
-  pending: "#f5b041",
-  assigned: "#3d8bfd",
-  picked_up: "#2ecc71",
-  late: "#e74c3c",
-};
-
 /**
  * Leaflet 图层视图。
  *
  * Leaflet 是命令式 API，组件库托管不了，所以这里用 `useState` 持有 map 实例
  * 让 effect 之间有明确的先后顺序；重绘订阅的是**快照**而非 tick，
  * 因此 60x 档下地图不会每 16ms 被重建一次。
+ *
+ * 图层颜色一律从 `theme.useToken()` 取——地图不归 antd 组件管，
+ * 但它是界面的一部分，不该自带一套写死的色板。
  */
 export function MapView({ selected, onPickRider }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -34,6 +31,7 @@ export function MapView({ selected, onPickRider }: Props) {
   const pickRef = useRef(onPickRider);
   pickRef.current = onPickRider;
 
+  const { token } = theme.useToken();
   const [map, setMap] = useState<L.Map | null>(null);
   const snap = useStore((s) => s.snap);
   const coord = useStore((s) => s.snap?.config.coord_system ?? "gcj02");
@@ -79,13 +77,14 @@ export function MapView({ selected, onPickRider }: Props) {
   useEffect(() => {
     if (!map || !snap) return;
     const group = L.layerGroup();
+    const muted = token.colorTextTertiary;
 
     for (const m of snap.merchants) {
       L.circleMarker([m.lat, m.lng], {
         radius: 4,
-        color: "#8a93a6",
+        color: muted,
         weight: 1,
-        fillColor: "#8a93a6",
+        fillColor: muted,
         fillOpacity: 0.7,
       })
         .bindTooltip(`${m.name} · ${m.signature}`)
@@ -93,7 +92,7 @@ export function MapView({ selected, onPickRider }: Props) {
     }
 
     const drawOrder = (o: Order) => {
-      const color = ORDER_COLOR[o.status] ?? "#f5b041";
+      const color = ORDER_COLOR[o.status] ?? token.colorWarning;
       L.polyline(
         [
           [o.merchant_lat, o.merchant_lng],
@@ -116,14 +115,18 @@ export function MapView({ selected, onPickRider }: Props) {
     snap.active_orders.forEach(drawOrder);
 
     for (const r of snap.riders) {
-      const color = r.kind === "human" ? "#9b59b6" : r.phase ? PHASE_COLOR[r.phase] : "#8a93a6";
+      const color =
+        r.kind === "human" ? HUMAN_RIDER_COLOR : r.phase ? PHASE_COLOR[r.phase] : muted;
       const isSelected = selected === r.id;
+      // 选中态用主色描边 + 外发光，与 `menu-item-selected` 是同一套语义。
+      const ring = isSelected
+        ? `border-color:${token.colorPrimary};box-shadow:0 0 0 3px ${token.colorPrimaryBorder}`
+        : "";
       const icon = L.divIcon({
         className: "",
         html:
           `<div class="rider-icon${r.online ? "" : " off"}"` +
-          ` style="background:${color};${isSelected ? "border-color:#ff7a1a;box-shadow:0 0 0 3px rgba(255,122,26,.45)" : ""}">` +
-          `${r.name.slice(0, 1)}</div>`,
+          ` style="background:${color};${ring}">${escapeHtml(r.name.slice(0, 1))}</div>`,
         iconSize: [26, 26],
         iconAnchor: [13, 13],
       });
@@ -137,7 +140,7 @@ export function MapView({ selected, onPickRider }: Props) {
     return () => {
       map.removeLayer(group);
     };
-  }, [map, snap, selected]);
+  }, [map, snap, selected, token]);
 
   return <div className="console-map" ref={hostRef} />;
 }
@@ -149,4 +152,13 @@ function riderTooltip(r: RiderBrief): string {
   if (!r.online) bits.push("离线");
   if (r.frozen) bits.push("冻结");
   return bits.join(" · ");
+}
+
+/** 骑手名进的是 `innerHTML`，先转义再拼。 */
+function escapeHtml(s: string): string {
+  return s.replace(
+    /[&<>"']/g,
+    (ch) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] ?? ch,
+  );
 }

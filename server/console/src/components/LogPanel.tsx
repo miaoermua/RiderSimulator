@@ -1,11 +1,11 @@
-import { Empty, Tag, Typography } from "antd";
+import { Empty, List, Space, Tag, Typography } from "antd";
 import { useStore } from "../hooks";
 
 /**
  * 事件日志。
  *
- * 原来靠 `innerHTML` 拼字符串，现在改成结构化条目数组——
- * 文本不再经过 HTML 解析，服务端来的商家名里带 `<` 也不会破版。
+ * 条目是结构化数据（原来靠 `innerHTML` 拼字符串，商家名里带 `<` 就会破版），
+ * 渲染交给 React 转义。列表用 antd 的 `List`，分隔线与内边距都来自令牌。
  */
 export function LogPanel() {
   const logs = useStore((s) => s.logs);
@@ -16,19 +16,26 @@ export function LogPanel() {
 
   return (
     <div className="console-scroll">
-      {logs.map((l) => (
-        <div key={l.id} className="log-item">
-          <Typography.Text type="secondary" className="log-time">
-            {l.at}
-          </Typography.Text>
-          {l.tag && (
-            <Tag color={l.tagColor} style={{ marginInlineEnd: 6 }}>
-              {l.tag}
-            </Tag>
-          )}
-          <span>{l.text}</span>
-        </div>
-      ))}
+      <List
+        size="small"
+        rowKey="id"
+        dataSource={logs}
+        renderItem={(l) => (
+          <List.Item style={{ display: "block", paddingInline: 0 }}>
+            <Space size={8} align="baseline">
+              <Typography.Text type="secondary" className="log-time">
+                {l.at}
+              </Typography.Text>
+              {l.tag && (
+                <Tag color={l.tagColor} style={{ marginInlineEnd: 0 }}>
+                  {l.tag}
+                </Tag>
+              )}
+              <Typography.Text>{l.text}</Typography.Text>
+            </Space>
+          </List.Item>
+        )}
+      />
     </div>
   );
 }
