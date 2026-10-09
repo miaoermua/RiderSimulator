@@ -30,6 +30,13 @@ pnpm-debug.log*
 # ---- macOS ----
 .DS_Store
 
+# ---- 运行时数据（SQLite 及 WAL/SHM 伴生文件）----
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
 # ---- 竞品调研缓存（参考资料，会随平台版本过期，不入库）----
 docs/cache/
 
