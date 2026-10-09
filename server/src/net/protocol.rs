@@ -107,6 +107,28 @@ pub enum ClientMessage {
     SetConfig(ConfigPatch),
     /// 强制某个骑手上线 / 下线。手上有单时不能下线。
     SetRiderOnline { rider_id: RiderId, online: bool },
+    /// 切换实时档：1 模拟分钟 = 真实 60 秒。
+    ///
+    /// `wall_minute` 是真实钟表的「当日第几分钟」（0..1439），由控制端浏览器给出，
+    /// 服务端不引入时区库。缺省时用 UTC 兜底。
+    SetRealtime {
+        enabled: bool,
+        #[serde(default)]
+        wall_minute: Option<u32>,
+    },
+    /// 给单个骑手改名（控制端 / 骑手卡片上的就近改名）。
+    RenameRider { rider_id: RiderId, name: String },
+    /// 按名单批量重命名模拟骑手（顺序对应 id 升序，空行跳过）。
+    SetRiderNames { names: Vec<String> },
+    /// 配置 LLM 接入。字段缺省 = 不改；`api_key` 传空串 = 清除 Key。
+    SetLlmConfig {
+        #[serde(default)]
+        api_key: Option<String>,
+        #[serde(default)]
+        base_url: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+    },
 }
 
 /// `set_config` 的载荷。每个字段都是可选的，越界值在服务端夹取。
@@ -346,6 +368,59 @@ mod tests {
 
         let m: ClientMessage = serde_json::from_str(r#"{"type":"set_config"}"#).unwrap();
         assert!(matches!(m, ClientMessage::SetConfig(_)));
+    }
+
+    #[test]
+    fn realtime_rename_and_llm_messages_parse() {
+        let m: ClientMessage =
+            serde_json::from_str(r#"{"type":"set_realtime","enabled":true,"wall_minute":870}"#)
+                .unwrap();
+        let ClientMessage::SetRealtime {
+            enabled,
+            wall_minute,
+        } = m
+        else {
+            panic!("应解析为 set_realtime");
+        };
+        assert!(enabled);
+        assert_eq!(wall_minute, Some(870));
+
+        // wall_minute 可以缺省，由服务端兜底。
+        let m: ClientMessage =
+            serde_json::from_str(r#"{"type":"set_realtime","enabled":false}"#).unwrap();
+        assert!(matches!(
+            m,
+            ClientMessage::SetRealtime {
+                enabled: false,
+                wall_minute: None
+            }
+        ));
+
+        let m: ClientMessage =
+            serde_json::from_str(r#"{"type":"rename_rider","rider_id":3,"name":"张三"}"#).unwrap();
+        assert!(matches!(m, ClientMessage::RenameRider { rider_id: 3, .. }));
+
+        let m: ClientMessage =
+            serde_json::from_str(r#"{"type":"set_rider_names","names":["甲","乙"]}"#).unwrap();
+        let ClientMessage::SetRiderNames { names } = m else {
+            panic!("应解析为 set_rider_names");
+        };
+        assert_eq!(names, vec!["甲".to_string(), "乙".to_string()]);
+
+        // 只改模型：api_key 缺省 = 不动，不能被解析成空串。
+        let m: ClientMessage =
+            serde_json::from_str(r#"{"type":"set_llm_config","model":"deepseek-chat"}"#).unwrap();
+        let ClientMessage::SetLlmConfig {
+            api_key,
+            base_url,
+            model,
+        } = m
+        else {
+            panic!("应解析为 set_llm_config");
+        };
+        assert_eq!(api_key, None);
+        assert_eq!(base_url, None);
+        assert_eq!(model.as_deref(), Some("deepseek-chat"));
     }
 
     #[test]

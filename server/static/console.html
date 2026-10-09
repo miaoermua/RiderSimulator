@@ -19,8 +19,12 @@
   button:hover { border-color: var(--accent); }
   button.on { background: var(--accent); border-color: var(--accent); color: #111; }
   button:disabled { opacity: .4; cursor: default; }
-  select, input[type=text], input[type=password], input[type=number] {
+  select, input[type=text], input[type=password], input[type=number], textarea {
     background: #10141b; border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+  textarea { width: 100%; padding: 6px 8px; resize: vertical; line-height: 1.5; }
+  /* 文本框类的设置项改成上下两行，不然会挤在 auto 那一列里 */
+  .set.stack { grid-template-columns: 1fr; }
+  .set.stack input { width: 100%; }
 
   #app { display: grid; grid-template-rows: 48px 1fr; height: 100%; }
   header { display: flex; align-items: center; gap: 16px; padding: 0 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
@@ -129,6 +133,22 @@
         </section>
         <section class="pane" id="pane-settings">
           <div id="settings"></div>
+          <!-- 接入配置单独放：这块每 tick 不重绘，否则输入框会被清空 -->
+          <div id="advanced">
+            <h3>骑手名单</h3>
+            <div class="set stack"><label>AI 骑手名字<span class="hint">一行一个，按骑手 id 顺序覆盖；空行跳过，重启后仍在</span></label>
+              <textarea id="rider-names" rows="4" placeholder="张三&#10;李四&#10;王五"></textarea>
+              <div class="row" style="margin-top:6px"><button id="rider-names-save">应用名单</button></div>
+            </div>
+            <h3>LLM 接入</h3>
+            <div class="set stack"><label>API Key<span class="hint" id="llm-key-state">未配置</span></label>
+              <input id="llm-key" type="password" autocomplete="new-password" placeholder="sk-…（留空 = 不改）"></div>
+            <div class="set stack"><label>Base URL<span class="hint">OpenAI 兼容端点，留空 = 用默认</span></label>
+              <input id="llm-base" type="text" placeholder="https://api.openai.com/v1"></div>
+            <div class="set stack"><label>模型</label>
+              <input id="llm-model" type="text" placeholder="gpt-4o-mini"></div>
+            <div class="row"><button id="llm-save">保存</button><button id="llm-clear">清除 Key</button></div>
+          </div>
         </section>
         <section class="pane" id="pane-log">
           <div id="log"></div>
@@ -171,6 +191,8 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const yuan = (c) => c == null ? "-" : (c / 100).toFixed(2);
 const hhmm = (m) => `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+/** 浏览器本地钟表的「当日第几分钟」，实时档靠它对齐真实时间。 */
+const nowMinuteOfDay = () => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); };
 const isControl = () => S.role === "control";
 
 function toast(msg, bad) {
@@ -253,6 +275,7 @@ function onEvent(name, p) {
     case "server_info":
       S.info = p;
       renderSettings();
+      renderAdvanced();
       break;
     case "tick":
       if (!S.snap) break;
@@ -433,19 +456,22 @@ function renderAll() {
   renderRiders();
   renderOrders();
   renderSettings();
+  renderAdvanced();
   drawMap();
 }
 
 function renderHeader() {
   const s = S.snap;
   if (!s) return;
-  $("clock").textContent = `第 ${s.day} 天 ${hhmm(s.sim_minute)}`;
-  $("weather").textContent = `${s.weather_label} ×${s.weather_speed_factor.toFixed(2)}${s.rain_bonus_cents ? ` 雨补 ${yuan(s.rain_bonus_cents)}` : ""}`;
   const c = s.config;
+  $("clock").textContent = `第 ${s.day} 天 ${hhmm(s.sim_minute)}${c.realtime ? " · 实时" : ""}`;
+  $("weather").textContent = `${s.weather_label} ×${s.weather_speed_factor.toFixed(2)}${s.rain_bonus_cents ? ` 雨补 ${yuan(s.rain_bonus_cents)}` : ""}`;
   $("peak").textContent = c.is_peak ? `高峰 ×${c.surge_multiplier.toFixed(1)}` : "平峰";
   $("peak").className = `chip ${c.is_peak ? "warn" : ""}`;
+  // 实时档和倍率档互斥：同一时刻只亮一个。
   $("speeds").innerHTML = SPEEDS.map((v) =>
-    `<button data-speed="${v}" class="${!c.paused && c.speed_multiplier === v ? "on" : ""}" ${isControl() ? "" : "disabled"}>${v}x</button>`).join(" ");
+    `<button data-speed="${v}" class="${!c.paused && !c.realtime && c.speed_multiplier === v ? "on" : ""}" ${isControl() ? "" : "disabled"}>${v}x</button>`).join(" ") +
+    ` <button data-realtime="1" class="${c.realtime ? "on" : ""}" ${isControl() ? "" : "disabled"}>实时</button>`;
   $("pause").textContent = c.paused ? "继续" : "暂停";
   $("pause").className = c.paused ? "on" : "";
   $("pause").disabled = !isControl();
@@ -486,7 +512,9 @@ function renderRiders() {
     return `<div class="card ${S.selected === r.id ? "sel" : ""}" data-rider="${r.id}">
       <div class="row">
         <span class="dot" style="background:${riderColor(r)}"></span>
-        <div class="grow"><b>${esc(r.name)}</b> <span class="muted small">${esc(r.key)} · Lv${r.level} · ★${r.rating.toFixed(2)} · ${r.completed} 单</span></div>
+        <div class="grow"><b>${esc(r.name)}</b>
+          ${isControl() ? `<button data-rename="${r.id}" style="padding:0 6px;font-size:11px">改名</button>` : ""}
+          <span class="muted small">${esc(r.key)} · Lv${r.level} · ★${r.rating.toFixed(2)} · ${r.completed} 单</span></div>
         <button data-online="${r.id}" data-to="${!r.online}" ${isControl() ? "" : "disabled"}>${r.online ? "下线" : "上线"}</button>
       </div>
       <div class="small" style="margin:4px 0">${tags} ${r.phase ? `<span class="tag" style="color:${PHASE_COLOR[r.phase]}">${PHASE[r.phase]}</span>` : ""}</div>
@@ -575,6 +603,39 @@ function renderSettings() {
   `;
 }
 
+/**
+ * 接入配置区：骑手名单 + LLM。
+ *
+ * 这块**不能**跟着 `renderSettings` 每 tick 重绘——输入框一重建，
+ * 用户打了一半的名字就没了。所以只更新值，不重建 DOM。
+ */
+function renderAdvanced() {
+  if (!S.snap) return;
+  const dis = !isControl();
+  const info = S.info || {};
+
+  const ta = $("rider-names");
+  if (document.activeElement !== ta) {
+    ta.value = [...S.riders.values()]
+      .filter((r) => r.kind !== "human")
+      .sort((a, b) => a.id - b.id)
+      .map((r) => r.name)
+      .join("\n");
+  }
+
+  const base = $("llm-base");
+  const model = $("llm-model");
+  if (document.activeElement !== base) base.value = info.llm_base_url || "";
+  if (document.activeElement !== model) model.value = info.llm_model || "";
+  $("llm-key-state").textContent = info.llm_configured
+    ? `已配置（${info.llm_model || "?"}）`
+    : "未配置：填一个 Key 才能用 LLM 大脑";
+
+  for (const id of ["rider-names", "rider-names-save", "llm-key", "llm-base", "llm-model", "llm-save", "llm-clear"]) {
+    $(id).disabled = dis;
+  }
+}
+
 function switchTab(name) {
   for (const b of $("tabs").children) b.classList.toggle("on", b.dataset.tab === name);
   for (const p of document.querySelectorAll(".pane")) p.classList.toggle("on", p.id === `pane-${name}`);
@@ -584,6 +645,12 @@ function switchTab(name) {
 
 $("tabs").addEventListener("click", (e) => { if (e.target.dataset.tab) switchTab(e.target.dataset.tab); });
 $("speeds").addEventListener("click", (e) => {
+  if (e.target.dataset.realtime) {
+    if (S.snap.config.paused) send("set_paused", { paused: false });
+    // 时钟对齐浏览器看到的真实钟表（服务端不引时区库，分钟数由前端给）。
+    send("set_realtime", { enabled: true, wall_minute: nowMinuteOfDay() });
+    return;
+  }
   const v = e.target.dataset.speed;
   if (!v) return;
   if (S.snap.config.paused) send("set_paused", { paused: false });
@@ -592,6 +659,15 @@ $("speeds").addEventListener("click", (e) => {
 $("pause").addEventListener("click", () => send("set_paused", { paused: !S.snap.config.paused }));
 
 $("riders").addEventListener("click", (e) => {
+  const rn = e.target.closest("[data-rename]");
+  if (rn) {
+    e.stopPropagation();
+    const id = Number(rn.dataset.rename);
+    const r = S.riders.get(id);
+    const name = prompt(`给 ${r ? r.name : "该骑手"} 换个名字（最多 12 字）`, r ? r.name : "");
+    if (name != null && name.trim()) send("rename_rider", { rider_id: id, name });
+    return;
+  }
   const b = e.target.closest("[data-online]");
   if (b) return send("set_rider_online", { rider_id: Number(b.dataset.online), online: b.dataset.to === "true" });
   const card = e.target.closest("[data-rider]");
@@ -620,6 +696,23 @@ $("settings").addEventListener("change", (e) => {
   if (t.id === "weather-sel") send("set_weather", { weather: t.value });
   else if (t.id === "commission") send("set_commission_rate", { rate: Number(t.value) / 100 });
   else if (t.id === "max-orders") send("set_config", { max_orders_per_day: Math.max(0, Number(t.value) || 0) });
+});
+
+$("advanced").addEventListener("click", (e) => {
+  const t = e.target;
+  if (t.id === "rider-names-save") {
+    const names = $("rider-names").value.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (!names.length) return toast("名单是空的：至少写一个名字", true);
+    send("set_rider_names", { names });
+  } else if (t.id === "llm-save") {
+    const body = { base_url: $("llm-base").value.trim(), model: $("llm-model").value.trim() };
+    const key = $("llm-key").value.trim();
+    if (key) body.api_key = key; // 留空 = 不碰已存的 Key
+    send("set_llm_config", body);
+    $("llm-key").value = "";
+  } else if (t.id === "llm-clear") {
+    if (confirm("清空 API Key？清空后 LLM 战术大脑会自动关闭。")) send("set_llm_config", { api_key: "" });
+  }
 });
 
 function login() {

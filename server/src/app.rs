@@ -31,7 +31,7 @@ use tokio::sync::{
 };
 use tokio::time::{Instant, sleep_until};
 
-use crate::llm::{PlanFetch, PreparedPlan, TacticalBrain, TaskJudge, TaskRuling};
+use crate::llm::{LlmConfig, PlanFetch, PreparedPlan, TacticalBrain, TaskJudge, TaskRuling};
 use crate::net::{
     Ack, ApiAuth, ApiError, ClientMessage, ConnId, DispatchItem, Envelope, Hub, Inbound,
     PROTOCOL_VERSION, Role, RpcReply, RpcRequest, code, render_snapshot, server_info,
@@ -105,6 +105,10 @@ pub struct App {
 
     brain: TacticalBrain,
     judge: TaskJudge,
+    /// LLM 接入配置（Key / Base URL / 模型）。控制台可改，落库后重启仍生效。
+    ///
+    /// **绝不下发**：任何给客户端的地方都只报「配没配」，不报内容。
+    llm_config: LlmConfig,
 
     inbound_tx: UnboundedSender<Inbound>,
     inbound_rx: Option<UnboundedReceiver<Inbound>>,
@@ -119,6 +123,11 @@ pub struct App {
     pending_plan: Option<LlmPlan>,
     /// 暂停前的倍率，恢复时用。
     paused_multiplier: u32,
+    /// 节拍需要重排。切档 / 对齐时钟后置位，让主循环从现在重新计时。
+    ///
+    /// 不重排会出两种洋相：实时档刚对齐完，被上一档剩下的节拍立刻推走一分钟；
+    /// 从实时档切回 8x，要干等 60 秒才走下一格。
+    beat_reset: bool,
     /// 最近一次大脑结论（给控制端看）。
     last_brain_note: String,
     tick_count: u64,
@@ -138,16 +147,42 @@ impl App {
         let (ruling_tx, ruling_rx) = unbounded_channel();
         let (plan_tx, plan_rx) = unbounded_channel();
 
-        // 没显式打开 LLM 就直接用关闭版：连环境变量都不读，
-        // 避免「明明没开却在烧配额」这种事故。
-        let (brain, judge) = if opts.llm_enabled {
-            (TacticalBrain::from_env(), TaskJudge::from_env())
+        // LLM 接入的优先级：控制台存下来的 > 环境变量 > 空配置。
+        //
+        // 命令行没开 LLM（`RIDER_SIM_LLM` 缺省 false）时**不读环境变量**，
+        // 避免「明明没开却在烧配额」；但控制台显式填过 Key 就认——
+        // 那是人的明确意图，且要能在重启后恢复。
+        let env_llm = opts.llm_enabled;
+        let llm_config = load_llm_config(&store).unwrap_or_else(|| {
+            if env_llm {
+                LlmConfig::from_env()
+            } else {
+                LlmConfig::default()
+            }
+        });
+        let (brain, judge) = if llm_config.has_key() {
+            (
+                TacticalBrain::from_config(&llm_config),
+                TaskJudge::from_config(&llm_config),
+            )
         } else {
             (TacticalBrain::disabled(), TaskJudge::disabled())
         };
 
+        let mut opts = opts;
+        // 「允许调用 LLM」= 命令行开过，或控制台配过 Key。
+        opts.llm_enabled = env_llm || llm_config.has_key();
+
         let mut world = world;
-        world.cfg.llm_brain_enabled = opts.llm_enabled && brain.is_enabled();
+        // 「真的去调」仍由控制台的 LLM 开关决定：控制台配的 Key 不会一重启就烧配额，
+        // 只有命令行显式开过才在启动时自动打开大脑。
+        world.cfg.llm_brain_enabled = env_llm && brain.is_enabled();
+
+        // 控制台存过的骑手名单，重启后接着用。
+        if let Some(names) = load_rider_names(&store) {
+            world.apply_rider_names(&names);
+        }
+
         let paused_multiplier = if world.cfg.speed_multiplier == 0 {
             1
         } else {
@@ -161,6 +196,7 @@ impl App {
             opts,
             brain,
             judge,
+            llm_config,
             inbound_tx,
             inbound_rx: Some(inbound_rx),
             ruling_tx,
@@ -170,6 +206,7 @@ impl App {
             inflight_since: None,
             pending_plan: None,
             paused_multiplier,
+            beat_reset: false,
             last_brain_note: String::new(),
             tick_count: 0,
             outbox: Vec::new(),
@@ -244,7 +281,15 @@ impl App {
                     self.on_tick();
                     next = Instant::now() + self.period();
                 }
-                Some(msg) = inbound.recv() => self.on_inbound(msg),
+                Some(msg) = inbound.recv() => {
+                    self.on_inbound(msg);
+                    // 控速类指令会改节拍长度（16ms 到 60s 都可能），
+                    // 处理完立刻重排下一次 tick，别让世界等旧的节拍。
+                    if self.beat_reset {
+                        self.beat_reset = false;
+                        next = Instant::now() + self.period();
+                    }
+                }
                 Some(r) = rulings.recv() => self.on_ruling(r),
                 Some((p, f)) = plans.recv() => self.on_plan(p, f),
                 _ = shutdown.changed() => {
@@ -324,6 +369,14 @@ impl App {
                 "brain_max_calls_per_day".into(),
                 json!(self.brain.max_calls_per_day()),
             );
+            // 只发给控制端（send_to_control），所以可以回模型信息；
+            // **Key 永远不出现在这里**，只报「配没配」。
+            obj.insert(
+                "llm_configured".into(),
+                json!(self.llm_config.has_key()),
+            );
+            obj.insert("llm_base_url".into(), json!(self.llm_config.base_url));
+            obj.insert("llm_model".into(), json!(self.llm_config.model));
         }
         self.hub
             .send_to_control(&Envelope::new("server_info", info));
@@ -699,6 +752,7 @@ impl App {
                 } else if app.world.cfg.speed_multiplier == 0 {
                     app.world.cfg.speed_multiplier = app.paused_multiplier.max(1);
                 }
+                app.beat_reset = true;
                 Some(json!({ "speed_multiplier": app.world.cfg.speed_multiplier }))
             }),
             M::SetSpeedMultiplier { multiplier } => {
@@ -706,9 +760,16 @@ impl App {
                     let m = multiplier.min(60);
                     app.world.cfg.speed_multiplier = m;
                     if m > 0 {
+                        // 选倍率档 = 退出实时档：两个模式互斥。
+                        app.world.cfg.realtime = false;
                         app.paused_multiplier = m;
                     }
-                    Some(json!({ "speed_multiplier": m, "tick_interval_ms": app.world.cfg.tick_interval_ms() }))
+                    app.beat_reset = true;
+                    Some(json!({
+                        "speed_multiplier": m,
+                        "realtime": app.world.cfg.realtime,
+                        "tick_interval_ms": app.world.cfg.tick_interval_ms(),
+                    }))
                 })
             }
             M::SetWeather { weather } => self.control(conn_id, role, "set_weather", |app| {
@@ -773,6 +834,132 @@ impl App {
                     }
                 })
             }
+            M::SetRealtime {
+                enabled,
+                wall_minute,
+            } => self.control(conn_id, role, "set_realtime", |app| {
+                app.world.cfg.realtime = enabled;
+                let mut aligned = None;
+                if enabled {
+                    // 对齐真实钟表：分钟数由控制端浏览器给（服务端不引时区库），
+                    // 缺省用 UTC 兜底。
+                    let minute = wall_minute.unwrap_or_else(utc_minute_of_day);
+                    aligned = Some(app.world.align_clock(minute));
+                }
+                // 对齐完要从「现在」重新计时：否则上一档剩下的那半个节拍
+                // 会立刻把刚对齐的钟面推走一分钟。
+                app.beat_reset = true;
+                // 实时档 60 秒才一个 tick，不补这一帧控制台的时钟会「卡住」。
+                app.outbox.push(SimEvent::Tick {
+                    day: app.world.day,
+                    sim_minute: app.world.sim_minute,
+                    elapsed_min: app.world.elapsed_min,
+                    speed_multiplier: app.world.cfg.speed_multiplier,
+                });
+                Some(json!({
+                    "realtime": enabled,
+                    "wall_minute": aligned,
+                    "sim_minute": app.world.sim_minute,
+                    "tick_interval_ms": app.world.cfg.tick_interval_ms(),
+                }))
+            }),
+            M::RenameRider { rider_id, name } => {
+                self.control(conn_id, role, "rename_rider", |app| {
+                    let changed = app.world.rename_rider(rider_id, &name);
+                    if changed {
+                        if let Some(ev) = scheduler::state_event(&app.world, rider_id) {
+                            app.outbox.push(ev);
+                        }
+                        app.persist_rider_names();
+                    }
+                    Some(json!({ "changed": changed, "rider_id": rider_id }))
+                })
+            }
+            M::SetRiderNames { names } => self.control(conn_id, role, "set_rider_names", |app| {
+                let changed = app.world.apply_rider_names(&names);
+                for id in &changed {
+                    if let Some(ev) = scheduler::state_event(&app.world, *id) {
+                        app.outbox.push(ev);
+                    }
+                }
+                app.persist_rider_names();
+                Some(json!({
+                    "changed": changed.len(),
+                    "names": app.world.sim_rider_names(),
+                }))
+            }),
+            M::SetLlmConfig {
+                api_key,
+                base_url,
+                model,
+            } => self.control(conn_id, role, "set_llm_config", |app| {
+                app.apply_llm_config(api_key, base_url, model);
+                // 配完立刻把新的「配没配 / 什么模型」推给控制端，表单才能回显。
+                app.push_server_info();
+                Some(json!({
+                    "llm_configured": app.llm_config.has_key(),
+                    "base_url": app.llm_config.base_url,
+                    "model": app.llm_config.model,
+                }))
+            }),
+        }
+    }
+
+    /// 应用控制台提交的 LLM 配置：改配置 → 重建 brain/judge → 落库。
+    ///
+    /// `None` = 这一项不动；`api_key` 传空串 = 清除 Key（连带把大脑开关落下）。
+    /// Key 只进数据库，不下发、不写日志。
+    fn apply_llm_config(
+        &mut self,
+        api_key: Option<String>,
+        base_url: Option<String>,
+        model: Option<String>,
+    ) {
+        if let Some(k) = api_key {
+            self.llm_config.api_key = k.trim().to_string();
+        }
+        if let Some(u) = base_url {
+            let u = u.trim();
+            self.llm_config.base_url = if u.is_empty() {
+                LlmConfig::default().base_url
+            } else {
+                u.to_string()
+            };
+        }
+        if let Some(m) = model {
+            let m = m.trim();
+            self.llm_config.model = if m.is_empty() {
+                LlmConfig::default().model
+            } else {
+                m.to_string()
+            };
+        }
+
+        // 重建客户端：战术大脑与任务判定共用同一份配置。
+        self.brain = TacticalBrain::from_config(&self.llm_config);
+        self.judge = TaskJudge::from_config(&self.llm_config);
+
+        let has_key = self.llm_config.has_key();
+        self.opts.llm_enabled = has_key;
+        if !has_key {
+            // 没 Key 就没有 LLM 可言，开关一并落下，
+            // 免得 UI 显示「已开启」却毫无反应。
+            self.world.cfg.llm_brain_enabled = false;
+        }
+        self.persist_llm_config();
+    }
+
+    /// 把当前 LLM 配置落库。Key 明文入库——本地模拟器，不上 vault。
+    fn persist_llm_config(&self) {
+        let _ = self.store.set_meta("llm_api_key", &self.llm_config.api_key);
+        let _ = self.store.set_meta("llm_base_url", &self.llm_config.base_url);
+        let _ = self.store.set_meta("llm_model", &self.llm_config.model);
+    }
+
+    /// 把当前模拟骑手名单落库，重启后接着用。
+    fn persist_rider_names(&self) {
+        if let Ok(t) = serde_json::to_string(&self.world.sim_rider_names()) {
+            let _ = self.store.set_meta("rider_names", &t);
         }
     }
 
@@ -1308,6 +1495,42 @@ impl App {
     }
 }
 
+/// 从库里读回控制台存过的 LLM 配置。没 Key 就当没配过。
+fn load_llm_config(store: &Store) -> Option<LlmConfig> {
+    fn non_empty(s: Option<String>) -> Option<String> {
+        s.filter(|s| !s.trim().is_empty())
+    }
+
+    let api_key = non_empty(store.meta("llm_api_key").ok().flatten())?;
+    let mut cfg = LlmConfig::default();
+    cfg.api_key = api_key;
+    if let Some(u) = non_empty(store.meta("llm_base_url").ok().flatten()) {
+        cfg.base_url = u;
+    }
+    if let Some(m) = non_empty(store.meta("llm_model").ok().flatten()) {
+        cfg.model = m;
+    }
+    Some(cfg)
+}
+
+/// 从库里读回骑手名单。解析失败就当没存过。
+fn load_rider_names(store: &Store) -> Option<Vec<String>> {
+    let raw = store.meta("rider_names").ok().flatten()?;
+    serde_json::from_str::<Vec<String>>(&raw).ok()
+}
+
+/// 兜底：按 UTC 折算「当日第几分钟」（0..1439）。
+///
+/// 只有控制端没给 `wall_minute` 时才用得上，所以不为了对齐钟表引入时区库——
+/// 宁可差几个时区，也不给本地模拟器加一个依赖。
+fn utc_minute_of_day() -> u32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    ((secs % 86_400) / 60) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1594,6 +1817,165 @@ mod tests {
     // -----------------------------------------------------------------
     // 控制端
     // -----------------------------------------------------------------
+
+    #[test]
+    fn set_realtime_aligns_the_clock_and_pushes_a_frame() {
+        let mut app = control_app();
+        let (mut ctrl, _) = hello(&mut app, 1, None);
+        drain(&mut ctrl);
+
+        send(
+            &mut app,
+            1,
+            ClientMessage::SetRealtime {
+                enabled: true,
+                wall_minute: Some(14 * 60 + 30),
+            },
+        );
+        assert!(app.world.cfg.realtime);
+        assert_eq!(app.world.sim_minute, 870, "时钟要对齐真实 14:30");
+        assert_eq!(
+            app.world.cfg.tick_interval_ms(),
+            crate::sim::config::REALTIME_TICK_MS
+        );
+
+        let v = drain(&mut ctrl);
+        let a = ack(&v);
+        assert_eq!(a["payload"]["data"]["realtime"].as_bool(), Some(true));
+        assert_eq!(a["payload"]["data"]["wall_minute"].as_u64(), Some(870));
+        assert_eq!(a["payload"]["data"]["tick_interval_ms"].as_u64(), Some(60_000));
+        // 实时档 60 秒才一个 tick，调完时钟必须立刻补一帧，否则控制台会卡住。
+        assert!(event(&v, "tick").is_some(), "对齐时钟后要推一帧 tick");
+
+        // 对齐完要让主循环重排节拍，不然会被上一档剩下的节拍推走一分钟。
+        assert!(app.beat_reset, "切实时档后要重排节拍");
+
+        // 选倍率档 = 退出实时档。
+        send(&mut app, 1, ClientMessage::SetSpeedMultiplier { multiplier: 4 });
+        assert!(!app.world.cfg.realtime);
+        assert_eq!(app.world.cfg.tick_interval_ms(), 250);
+        assert!(app.beat_reset, "切倍率档后也要重排");
+    }
+
+    #[test]
+    fn rider_renames_are_broadcast_and_batch_names_skip_blanks() {
+        let mut app = control_app();
+        let (mut ctrl, _) = hello(&mut app, 1, None);
+        drain(&mut ctrl);
+        let ids = app.world.sim_rider_ids();
+
+        send(
+            &mut app,
+            1,
+            ClientMessage::RenameRider {
+                rider_id: ids[0],
+                name: "  张三 ".into(),
+            },
+        );
+        assert_eq!(app.world.rider(ids[0]).unwrap().name, "张三");
+        let v = drain(&mut ctrl);
+        assert_eq!(ack(&v)["payload"]["data"]["changed"].as_bool(), Some(true));
+        assert!(
+            event(&v, "rider_state_changed").is_some(),
+            "改名要让所有端看到新名字"
+        );
+
+        // 批量名单：空名字不覆盖原名，顺序按 id 升序。
+        send(
+            &mut app,
+            1,
+            ClientMessage::SetRiderNames {
+                names: vec!["   ".into(), "李四".into()],
+            },
+        );
+        assert_eq!(app.world.rider(ids[0]).unwrap().name, "张三", "空名字要跳过");
+        assert_eq!(app.world.rider(ids[1]).unwrap().name, "李四");
+
+        // 非法名字：changed=false，世界不变。
+        send(
+            &mut app,
+            1,
+            ClientMessage::RenameRider {
+                rider_id: ids[1],
+                name: "   ".into(),
+            },
+        );
+        assert_eq!(app.world.rider(ids[1]).unwrap().name, "李四");
+        assert_eq!(app.world.sim_rider_names()[1], "李四");
+    }
+
+    #[test]
+    fn saved_names_and_llm_config_can_be_read_back() {
+        let store = Store::in_memory().unwrap();
+        assert!(load_rider_names(&store).is_none());
+        assert!(load_llm_config(&store).is_none());
+
+        store.set_meta("rider_names", r#"["甲","乙"]"#).unwrap();
+        assert_eq!(
+            load_rider_names(&store).unwrap(),
+            vec!["甲".to_string(), "乙".to_string()]
+        );
+
+        store.set_meta("llm_api_key", "sk-test").unwrap();
+        store.set_meta("llm_model", "deepseek-chat").unwrap();
+        let cfg = load_llm_config(&store).unwrap();
+        assert!(cfg.has_key());
+        assert_eq!(cfg.model, "deepseek-chat");
+        assert_eq!(cfg.base_url, "https://api.openai.com/v1", "没存过就回默认");
+
+        // 空 Key = 没配过；坏 JSON = 没存过。
+        store.set_meta("llm_api_key", "   ").unwrap();
+        assert!(load_llm_config(&store).is_none());
+        store.set_meta("rider_names", "{不是数组").unwrap();
+        assert!(load_rider_names(&store).is_none());
+    }
+
+    #[test]
+    fn console_llm_config_never_echoes_the_key() {
+        let mut app = control_app();
+        assert!(!app.llm_enabled(), "默认没有 Key 就不能调 LLM");
+        let (mut ctrl, _) = hello(&mut app, 1, None);
+        drain(&mut ctrl);
+
+        send(
+            &mut app,
+            1,
+            ClientMessage::SetLlmConfig {
+                api_key: Some("sk-secret-value".into()),
+                base_url: Some("https://api.deepseek.com/v1".into()),
+                model: Some("deepseek-chat".into()),
+            },
+        );
+
+        assert!(app.llm_config.has_key());
+        assert!(app.brain.is_enabled(), "填了 Key 就该有客户端");
+        assert!(app.llm_enabled(), "有 Key = 允许调用");
+        // 但「真的去调」仍要控制台显式打开开关，避免重启就烧配额。
+        assert!(!app.world.cfg.llm_brain_enabled);
+
+        let v = drain(&mut ctrl);
+        let text = serde_json::to_string(&v).unwrap();
+        assert!(!text.contains("sk-secret-value"), "Key 绝不能回传：{text}");
+        assert_eq!(
+            ack(&v)["payload"]["data"]["model"].as_str(),
+            Some("deepseek-chat")
+        );
+
+        // 清空 Key：连大脑开关一起落下。
+        send(
+            &mut app,
+            1,
+            ClientMessage::SetLlmConfig {
+                api_key: Some(String::new()),
+                base_url: None,
+                model: None,
+            },
+        );
+        assert!(!app.llm_config.has_key());
+        assert!(!app.llm_enabled());
+        assert!(!app.brain.is_enabled());
+        assert!(!app.world.cfg.llm_brain_enabled);
+    }
 
     #[test]
     fn control_commands_change_the_world_and_notify_everyone() {

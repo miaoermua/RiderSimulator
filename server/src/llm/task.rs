@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use crate::sim::task::matches_any;
 
-use super::client::{LlmClient, LlmError};
+use super::client::{LlmClient, LlmConfig, LlmError};
 
 /// 判定结果的来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -130,6 +130,11 @@ impl TaskJudge {
 
     pub fn from_env() -> Self {
         Self::new(LlmClient::from_env())
+    }
+
+    /// 从一份显式配置建（控制台里填的 Key 走这条路）。没 Key 即关键词兜底。
+    pub fn from_config(cfg: &LlmConfig) -> Self {
+        Self::new(LlmClient::new(cfg.clone()).ok())
     }
 
     /// 关闭状态：全部走关键词。

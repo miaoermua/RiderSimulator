@@ -23,7 +23,7 @@ use crate::sim::{
     world::World,
 };
 
-use super::client::LlmClient;
+use super::client::{LlmClient, LlmConfig};
 
 /// 一天最多调用次数。设计给的硬上限。
 pub const MAX_CALLS_PER_DAY: u32 = 24;
@@ -279,6 +279,14 @@ impl TacticalBrain {
     /// 从环境变量建。没配 Key 就是关闭状态。
     pub fn from_env() -> Self {
         Self::new(LlmClient::from_env())
+    }
+
+    /// 从一份显式配置建（控制台里填的 Key 走这条路）。
+    ///
+    /// 配置里没有 Key → 关闭状态；有 Key 但 HTTP 客户端建不起来 → 也是关闭状态。
+    /// 两种失败都不报错，调用方退回算法即可。
+    pub fn from_config(cfg: &LlmConfig) -> Self {
+        Self::new(LlmClient::new(cfg.clone()).ok())
     }
 
     /// 显式关掉。

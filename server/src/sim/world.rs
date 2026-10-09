@@ -43,6 +43,8 @@ pub struct ConfigView {
     pub seed: u64,
     pub speed_multiplier: u32,
     pub paused: bool,
+    /// 实时档：1 模拟分钟 = 真实 60 秒。
+    pub realtime: bool,
     pub tick_interval_ms: u64,
     pub commission_rate: f32,
     pub discriminative_commission: bool,
@@ -271,6 +273,74 @@ impl World {
     pub fn spawn_human_rider(&mut self, name: impl Into<String>) -> RiderId {
         let home = self.random_home();
         self.add_rider(RiderKind::Human, name, home)
+    }
+
+    /// 骑手名的字符上限。够写「张三」「AI-小队长」，再长卡片就换行。
+    pub const MAX_RIDER_NAME_CHARS: usize = 12;
+
+    /// 清洗一个骑手名：去首尾空白、剔除控制字符、截断到上限。
+    ///
+    /// 返回 `None` = 这名字不能用（洗完全是空的）。
+    pub fn sanitize_rider_name(raw: &str) -> Option<String> {
+        let cleaned: String = raw
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(Self::MAX_RIDER_NAME_CHARS)
+            .collect();
+        match cleaned.trim() {
+            "" => None,
+            s => Some(s.to_string()),
+        }
+    }
+
+    /// 给一个骑手改名。名字非法 / 骑手不存在 / 名字没变化都返回 `false`。
+    pub fn rename_rider(&mut self, id: RiderId, raw: &str) -> bool {
+        let Some(name) = Self::sanitize_rider_name(raw) else {
+            return false;
+        };
+        match self.riders.iter_mut().find(|r| r.id == id) {
+            Some(r) if r.name != name => {
+                r.name = name;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 按名单批量重命名**模拟**骑手（顺序对应 id 从小到大）。
+    ///
+    /// 名单比骑手长时多余的名字忽略；比骑手短时后面的骑手保留原名。
+    /// 返回真正改动的骑手 id。
+    pub fn apply_rider_names(&mut self, names: &[String]) -> Vec<RiderId> {
+        let ids = self.sim_rider_ids();
+        let mut changed = Vec::new();
+        for (id, raw) in ids.iter().zip(names.iter()) {
+            if self.rename_rider(*id, raw) {
+                changed.push(*id);
+            }
+        }
+        changed
+    }
+
+    /// 模拟骑手的 id（按 id 升序）。名单与展示都依赖这个顺序。
+    pub fn sim_rider_ids(&self) -> Vec<RiderId> {
+        let mut ids: Vec<RiderId> = self
+            .riders
+            .iter()
+            .filter(|r| r.kind == RiderKind::Simulated)
+            .map(|r| r.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// 模拟骑手当前的名字（按 id 升序），用于回显与落库。
+    pub fn sim_rider_names(&self) -> Vec<String> {
+        self.sim_rider_ids()
+            .into_iter()
+            .filter_map(|id| self.rider(id).map(|r| r.name.clone()))
+            .collect()
     }
 
     /// 控制端调 AI 骑手数量（0~8）。返回状态有变化的骑手。
@@ -546,6 +616,18 @@ impl World {
         false
     }
 
+    /// 把模拟时钟对齐到真实的「当日第几分钟」（0..1439）。
+    ///
+    /// **只动 `sim_minute`，不动 `elapsed_min`**：所有截止时间都挂在
+    /// `elapsed_min` 上，改它会让在跑的单凭空超时或凭空续命。`day` 也不动——
+    /// 实时档的语义是「第 N 天的 14:30 对齐真实 14:30」，天数仍由世界自己累加。
+    ///
+    /// 返回对齐后的 `sim_minute`。
+    pub fn align_clock(&mut self, minute_of_day: u32) -> u32 {
+        self.sim_minute = minute_of_day % MINUTES_PER_DAY;
+        self.sim_minute
+    }
+
     /// 在线时长与疲劳累积（在线才算）。
     pub fn accrue_online(&mut self) {
         let gain = self.cfg.fatigue.per_online_hour / 60.0;
@@ -572,6 +654,7 @@ impl World {
             seed: self.seed,
             speed_multiplier: self.cfg.speed_multiplier,
             paused: self.cfg.speed_multiplier == 0,
+            realtime: self.cfg.realtime,
             tick_interval_ms: self.cfg.tick_interval_ms(),
             commission_rate: self.cfg.commission_rate,
             discriminative_commission: self.cfg.discriminative_commission,
@@ -766,6 +849,59 @@ mod tests {
         assert_eq!(w.day, 2);
         assert_eq!(w.sim_minute, 0);
         assert_eq!(w.elapsed_min, 2);
+    }
+
+    #[test]
+    fn align_clock_only_moves_the_wall_clock() {
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 1);
+        w.elapsed_min = 500;
+
+        assert_eq!(w.align_clock(14 * 60 + 30), 870);
+        assert_eq!(w.sim_minute, 870);
+        // elapsed_min 是所有截止时间的唯一基准，对齐时钟不许动它。
+        assert_eq!(w.elapsed_min, 500, "对齐时钟不该改 elapsed_min");
+        assert_eq!(w.day, 1, "对齐时钟不该改天数");
+
+        // 越界回绕到当日范围内。
+        w.align_clock(MINUTES_PER_DAY + 5);
+        assert_eq!(w.sim_minute, 5);
+    }
+
+    #[test]
+    fn rider_names_are_sanitized_and_applied_in_order() {
+        let cfg = SimConfig {
+            sim_rider_count: 3,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 11);
+        let ids = w.sim_rider_ids();
+        assert_eq!(ids.len(), 3);
+
+        // 名单按 id 升序生效；空名字跳过，保留原名。
+        let names = ["  张三 ".to_string(), "李四".to_string(), "   ".to_string()];
+        assert_eq!(w.apply_rider_names(&names), vec![ids[0], ids[1]]);
+        assert_eq!(w.rider(ids[0]).unwrap().name, "张三");
+        assert_eq!(w.rider(ids[1]).unwrap().name, "李四");
+        assert!(w.rider(ids[2]).unwrap().name.starts_with("AI-"));
+
+        // 超长截断、控制字符剔除。
+        assert!(w.rename_rider(ids[2], "一二三四五六七八九十十一十二十三"));
+        assert_eq!(
+            w.rider(ids[2]).unwrap().name.chars().count(),
+            World::MAX_RIDER_NAME_CHARS
+        );
+        assert!(w.rename_rider(ids[2], "带\n换行单"));
+        assert_eq!(w.rider(ids[2]).unwrap().name, "带换行单");
+
+        // 空名、不存在的骑手、名字没变化都拒绝。
+        assert!(!w.rename_rider(ids[0], "   "));
+        assert!(!w.rename_rider(999, "无名"));
+        assert!(!w.rename_rider(ids[1], "李四"));
+        assert_eq!(w.sim_rider_names().len(), 3);
     }
 
     #[test]

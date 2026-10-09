@@ -4,6 +4,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 实时档下一个 tick 的真实时长：1 模拟分钟 = 真实 60 秒。
+///
+/// 这是「真实时间」与「1 分钟 1 秒」两个模式的分界：倍率档位压缩真实时间，
+/// 实时档让模拟时钟跟真实钟表同步走。
+pub const REALTIME_TICK_MS: u64 = 60_000;
+
 /// 配送费规则。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeRules {
@@ -137,6 +143,11 @@ pub struct SimConfig {
     pub order_spawn_interval_min: u32,
     /// 时间倍率：0=暂停，1/10/60。
     pub speed_multiplier: u32,
+    /// 实时档：1 模拟分钟 = 真实 60 秒，世界按真实钟表速度推进。
+    ///
+    /// 打开时 [`SimConfig::tick_interval_ms`] 返回 [`REALTIME_TICK_MS`]，
+    /// `speed_multiplier` 只保留「是否暂停」的语义（0 = 暂停）。
+    pub realtime: bool,
 }
 
 impl Default for SimConfig {
@@ -222,6 +233,7 @@ impl Default for SimConfig {
             sim_rider_count: 3,
             order_spawn_interval_min: 3,
             speed_multiplier: 1,
+            realtime: false,
         }
     }
 }
@@ -244,15 +256,28 @@ impl SimConfig {
 
     /// 抢单窗口换算成 tick 数。1 tick = 1 模拟分钟，
     /// 倍率越高，同样的现实秒数对应的 tick 越多。
+    ///
+    /// 实时档下一个 tick 就是 60 真实秒，比任何窗口都长，
+    /// 于是窗口退化成「1 tick」，抢单变成一颗 tick 内定胜负。
     pub fn claim_window_ticks(&self) -> u32 {
+        if self.realtime {
+            return 1;
+        }
         let m = self.speed_multiplier.max(1);
         (self.claim_window_secs * m).max(1)
     }
 
-    /// 现实上一个 tick 的毫秒数。倍率 1 时 = 1 秒 = 1 模拟分钟。
+    /// 现实上一个 tick 的毫秒数。
+    ///
+    /// - 暂停（倍率 0）：退回 1 秒节拍，`App::on_tick` 会直接跳过推进；
+    /// - 实时档：1 模拟分钟 = 真实 60 秒；
+    /// - 其余：倍率 1 时 = 1 秒 = 1 模拟分钟。
     pub fn tick_interval_ms(&self) -> u64 {
         if self.speed_multiplier == 0 {
             return 1000;
+        }
+        if self.realtime {
+            return REALTIME_TICK_MS;
         }
         1000 / self.speed_multiplier as u64
     }
@@ -295,5 +320,28 @@ mod tests {
         c.speed_multiplier = 0;
         assert_eq!(c.tick_interval_ms(), 1000);
         assert_eq!(c.claim_window_ticks(), 3);
+    }
+
+    #[test]
+    fn realtime_mode_runs_one_sim_minute_per_real_minute() {
+        let mut c = SimConfig::default();
+        assert!(!c.realtime, "默认真实时间是关的");
+
+        c.realtime = true;
+        assert_eq!(c.tick_interval_ms(), REALTIME_TICK_MS);
+        assert_eq!(c.tick_interval_ms(), 60_000);
+
+        // 窗口长不过一个 tick，实时档退化成 1。
+        assert_eq!(c.claim_window_ticks(), 1);
+        c.claim_window_secs = 10;
+        assert_eq!(c.claim_window_ticks(), 1);
+
+        // 倍率不再影响节拍。
+        c.speed_multiplier = 60;
+        assert_eq!(c.tick_interval_ms(), REALTIME_TICK_MS);
+
+        // 暂停优先于实时：世界冻住，节拍退回 1 秒等恢复。
+        c.speed_multiplier = 0;
+        assert_eq!(c.tick_interval_ms(), 1000);
     }
 }
