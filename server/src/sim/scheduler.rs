@@ -485,6 +485,10 @@ pub fn deliver(
 }
 
 /// 主动拒单（未接的单不能拒，只能忽略）。
+///
+/// 骑手取消已接单时，订单**退回大厅加价重投**，而不是就此作废——
+/// 真实场景里骑手取消了，平台会把单转给下一个骑手，不能让顾客的饭凭空消失。
+/// 罚金照扣（`fine.cancel_cents`），且重投次数照算。
 pub fn reject_order(
     world: &mut World,
     rider_id: RiderId,
@@ -504,19 +508,18 @@ pub fn reject_order(
             now,
         );
         rider.held.retain(|h| h.order_id != order_id);
-        if let Some(o) = world.order_mut(order_id) {
-            o.status = OrderStatus::Cancelled;
-            o.assigned_to = None;
+
+        let mut events = vec![SimEvent::FineIssued {
+            rider_id,
+            kind: "cancel".into(),
+            amount_cents: cfg.fine.cancel_cents,
+            reason: "取消已接订单".into(),
+        }];
+        // 回大厅重投；只有投满上限才真正流单。
+        if !world.release_to_hall(order_id) {
+            events.push(SimEvent::OrderExpired { order_id });
         }
-        return Ok(vec![
-            SimEvent::FineIssued {
-                rider_id,
-                kind: "cancel".into(),
-                amount_cents: cfg.fine.cancel_cents,
-                reason: "取消已接订单".into(),
-            },
-            SimEvent::OrderExpired { order_id },
-        ]);
+        return Ok(events);
     }
     let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
     rider.rejected += 1;

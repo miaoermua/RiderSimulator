@@ -36,18 +36,27 @@ export function OrdersPanel() {
             <List.Item.Meta
               title={<OrderTitle order={o} right={<Badge {...ttlBadge(o.claim_deadline_min - snap.elapsed_min, "窗口")} />} />}
               description={
-                <MetricRow>
-                  <Metric>{(o.distance_m / 1000).toFixed(1)}km</Metric>
-                  <Metric>承诺 {o.promised_minutes} 分</Metric>
-                  <Metric>抽水 ¥{yuan(o.fee.commission_cents)}</Metric>
-                  {o.task && <Metric>任务 {o.task.name}</Metric>}
-                </MetricRow>
+                <>
+                  <MetricRow>
+                    <Metric>{(o.distance_m / 1000).toFixed(1)}km</Metric>
+                    <Metric>承诺 {o.promised_minutes} 分</Metric>
+                    <Metric>抽水 ¥{yuan(o.fee.commission_cents)}</Metric>
+                    {o.redispatch_count > 0 && (
+                      <Metric>
+                        重投 {o.redispatch_count} 次 +¥{yuan(o.surcharge_cents)}
+                      </Metric>
+                    )}
+                    {o.task && <Metric>任务 {o.task.name}</Metric>}
+                  </MetricRow>
+                  <MetricRow>
+                    <Metric>{feeParts(o).join(" · ")}</Metric>
+                  </MetricRow>
+                </>
               }
             />
             {isControl && (
               <Select
                 style={{ width: "100%", marginTop: 8 }}
-                size="small"
                 showSearch
                 optionFilterProp="label"
                 placeholder="指派给…"
@@ -97,7 +106,8 @@ function OrderTitle({ order: o, right }: { order: Order; right: React.ReactNode 
       <Metric>→ {o.customer_address}</Metric>
       <span style={{ marginInlineStart: "auto" }}>
         <Space size={8}>
-          <Typography.Text strong>¥{yuan(o.fee.quoted_fee_cents)}</Typography.Text>
+          {/* 报价 + 重投补贴才是骑手实际看到的价，标题行不能只印计费规则那一半。 */}
+          <Typography.Text strong>¥{yuan(o.fee.quoted_fee_cents + o.surcharge_cents)}</Typography.Text>
           {right}
         </Space>
       </span>
@@ -111,12 +121,28 @@ function ActiveMeta({ order: o, rider }: { order: Order; rider: string }) {
       <Metric>{STATUS_LABEL[o.status] ?? o.status}</Metric>
       <Metric>骑手 {rider}</Metric>
       <Metric>{(o.distance_m / 1000).toFixed(1)}km</Metric>
-      <Metric>到手 ¥{yuan(o.fee.takehome_cents)}</Metric>
+      <Metric>到手 ¥{yuan(o.fee.takehome_cents + o.surcharge_cents)}</Metric>
+      {o.redispatch_count > 0 && <Metric>重投 {o.redispatch_count} 次</Metric>}
       {o.forced && <Metric>强制</Metric>}
       {o.back_order && <Metric>背单</Metric>}
       {o.urge_count ? <Metric>催 {o.urge_count}</Metric> : null}
     </MetricRow>
   );
+}
+
+/**
+ * 把报价拆成能对账的几项。
+ *
+ * 用「·」而不是「+」连接：高峰是系数不是加项，混在一起会算错账。
+ */
+function feeParts(o: Order): string[] {
+  const f = o.fee;
+  const parts = [`起步 ¥${yuan(f.base_fee_cents)}`, `里程 ¥${yuan(f.distance_extra_cents)}`];
+  if (f.level_bonus_cents > 0) parts.push(`等级 ¥${yuan(f.level_bonus_cents)}`);
+  if (f.surge_multiplier !== 1) parts.push(`高峰 ×${f.surge_multiplier.toFixed(2)}`);
+  if (f.rain_bonus_cents > 0) parts.push(`雨补 ¥${yuan(f.rain_bonus_cents)}`);
+  if (o.surcharge_cents > 0) parts.push(`重投补贴 ¥${yuan(o.surcharge_cents)}`);
+  return parts;
 }
 
 /**

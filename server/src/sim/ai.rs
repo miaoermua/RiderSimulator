@@ -77,7 +77,8 @@ pub fn plan_for(world: &World, rider: &Rider, order: &Order) -> DeliveryPlan {
 /// 这一单的预估到手（分/单）。
 pub fn estimated_takehome_cents(world: &World, rider: &Rider, order: &Order) -> i64 {
     let rate = super::economy::commission_rate_for(&world.cfg, rider);
-    let base = order.fee.quoted_fee_cents;
+    // 含重投补贴：加价会直接抬高预估时薪，订单因此更容易越过接单门槛。
+    let base = order.quoted_fee_cents();
     base - (base as f32 * rate).round() as i64 + order.back_order_bonus_cents
 }
 

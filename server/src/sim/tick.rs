@@ -156,7 +156,7 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>) {
                 .unwrap_or_default(),
             quoted_fee_cents: world
                 .order(a.order)
-                .map(|o| o.fee.takehome_cents)
+                .map(|o| o.takehome_cents())
                 .unwrap_or(0),
             forced: false,
         });

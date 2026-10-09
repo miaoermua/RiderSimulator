@@ -161,6 +161,17 @@ pub struct ConfigPatch {
     /// 下发坐标的坐标系。内部始终 GCJ-02，这里只影响出口转换。
     #[serde(default)]
     pub coord_system: Option<CoordSystem>,
+
+    // ---- 计价规则（「单价系统」）----
+    /// 起步价（分），0~2000。
+    #[serde(default)]
+    pub base_fee_cents: Option<i64>,
+    /// 超出里程阶梯后每公里单价（分/km），0~1000。
+    #[serde(default)]
+    pub per_km_over_cents: Option<i64>,
+    /// 等级加成（分/级），0~500。
+    #[serde(default)]
+    pub level_bonus_per_level_cents: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

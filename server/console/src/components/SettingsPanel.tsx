@@ -17,7 +17,7 @@ import {
 import { COORD_LABEL, WEATHERS } from "../const";
 import { useIsControl, useStore } from "../hooks";
 import type { CoordSystem } from "../protocol";
-import { store } from "../store";
+import { store, yuan } from "../store";
 
 /**
  * 设置面板。
@@ -108,16 +108,6 @@ export function SettingsPanel() {
           onChange={(v) => store.send("set_weather", { weather: v })}
         />
       </Row>
-      <Row label="平台抽水" hint="0%~30%，只抽配送费">
-        <Slider
-          style={{ width: 160 }}
-          min={0}
-          max={30}
-          value={Math.round(c.commission_rate * 100)}
-          disabled={!isControl}
-          onChangeComplete={(v) => store.send("set_commission_rate", { rate: v / 100 })}
-        />
-      </Row>
       <Row label="每日单量上限" hint="0 = 不限">
         <InputNumber
           min={0}
@@ -128,6 +118,64 @@ export function SettingsPanel() {
       </Row>
       <Row label="世界种子">
         <Typography.Text type="secondary">{c.seed}</Typography.Text>
+      </Row>
+
+      {/* 单价的账要能对得起来：给的（起步 + 里程 + 加成）、乘的（高峰）、
+          抽的（平台），一样一行摊开。只留一个「抽水」滑块等于把另外三样藏了。 */}
+      <Heading>计价</Heading>
+      <Row label="起步价" hint="含第一档里程；单位：元">
+        <InputNumber
+          min={0}
+          max={20}
+          step={0.5}
+          disabled={!isControl}
+          value={money(c.fee.base_fee_cents)}
+          onChange={(v) => store.send("set_config", { base_fee_cents: toCents(v) })}
+        />
+      </Row>
+      <Row label="里程阶梯" hint="按距离取不超过本单的最大档">
+        <Typography.Text type="secondary">
+          {tierRanges(c.fee.distance_tiers)}
+        </Typography.Text>
+      </Row>
+      <Row label="超出后每公里" hint="超出最后一档的单价；单位：元/km">
+        <InputNumber
+          min={0}
+          max={10}
+          step={0.1}
+          disabled={!isControl}
+          value={money(c.fee.per_km_over_cents)}
+          onChange={(v) => store.send("set_config", { per_km_over_cents: toCents(v) })}
+        />
+      </Row>
+      <Row label="等级加成" hint="每升一级多给的配送费；单位：元/级">
+        <InputNumber
+          min={0}
+          max={5}
+          step={0.1}
+          disabled={!isControl}
+          value={money(c.fee.level_bonus_per_level_cents)}
+          onChange={(v) => store.send("set_config", { level_bonus_per_level_cents: toCents(v) })}
+        />
+      </Row>
+      <Row label="平台抽水" hint="0%~30%，只抽配送费，不抽雨补与重投补贴">
+        <Slider
+          style={{ width: 160 }}
+          min={0}
+          max={30}
+          value={Math.round(c.commission_rate * 100)}
+          disabled={!isControl}
+          onChangeComplete={(v) => store.send("set_commission_rate", { rate: v / 100 })}
+        />
+      </Row>
+      <Row label="当前高峰系数">
+        <Typography.Text type="secondary">×{c.fee.surge_multiplier.toFixed(2)}</Typography.Text>
+      </Row>
+      <Row label="重投补贴" hint="没人接或骑手取消时加价重投，加满上限才流单">
+        <Typography.Text type="secondary">
+          每次 +¥{yuan(c.fee.redispatch_surcharge_step_cents)}，最多重投{" "}
+          {c.fee.max_redispatch_attempts} 次
+        </Typography.Text>
       </Row>
 
       <Heading>规则</Heading>
@@ -392,4 +440,42 @@ function SwitchRow({
       <Switch checked={value} disabled={disabled} onChange={onChange} />
     </Row>
   );
+}
+
+/** 计费项协议用「分」，界面用「元」，来回都得过一手。 */
+function money(cents: number): number {
+  return cents / 100;
+}
+
+function toCents(yuanValue: number | null): number {
+  return Math.max(0, Math.round((yuanValue ?? 0) * 100));
+}
+
+/**
+ * 把里程阶梯念成「几公里到几公里加多少钱」。
+ *
+ * 加价未变的相邻档会被合并——默认配置里 `(5000,350) (8000,350)` 就是这种，
+ * 逐档平铺会念出两句一模一样的「+¥3.50」，看着像 bug。
+ */
+function tierRanges(tiers: [number, number][]): string {
+  if (tiers.length === 0) return "—";
+  const km = (m: number) => (m / 1000).toFixed(1);
+
+  const steps: Array<[number, number]> = [];
+  for (const [m, cents] of tiers) {
+    const prev = steps[steps.length - 1];
+    if (prev && prev[1] === cents) continue;
+    steps.push([m, cents]);
+  }
+
+  const parts = [`<${km(steps[0][0])}km 不加价`];
+  steps.forEach(([m, cents], i) => {
+    const next = steps[i + 1];
+    parts.push(
+      next
+        ? `${km(m)}~${km(next[0])}km +¥${yuan(cents)}`
+        : `${km(m)}km 起 +¥${yuan(cents)}`,
+    );
+  });
+  return parts.join(" · ");
 }

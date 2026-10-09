@@ -35,6 +35,13 @@ async fn main() -> std::io::Result<()> {
         cfg.seed = seed;
     }
 
+    // 服务裸跑默认走实时档：1 模拟分钟 = 1 真实分钟。
+    //
+    // 出厂默认值仍是 `false`——那是给测试与库调用方的紧凑节拍（1 tick = 1 秒）。
+    // 「启动就是实时」是服务这一层的决定，放在这里既满足实盘观感，
+    // 又不会把测试里的抢单窗口断言（`claim_window_ticks`）一起改掉。
+    cfg.realtime = true;
+
     // ---------- 2. 剧本 ----------
     let dir = std::env::var_os("RIDER_SIM_DATA").map(PathBuf::from);
     let (content, warnings) = content::load(dir.as_deref(), cfg.seed);

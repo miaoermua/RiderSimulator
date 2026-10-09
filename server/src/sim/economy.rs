@@ -188,11 +188,11 @@ pub fn settle_delivery(
     };
     let late = order.is_late(now_min, buffer);
 
-    let fee = &order.fee;
-    rider.gross_cents += fee.quoted_fee_cents;
+    // 流水按骑手实拿口径记：含重投资补贴，但不含背单补偿（那是平台另掏的）。
+    rider.gross_cents += order.quoted_fee_cents();
 
-    // 到手 = 报价 - 抽水 + 背单补偿
-    let mut takehome = fee.takehome_cents + order.back_order_bonus_cents;
+    // 到手 = 报价 - 抽水 + 重投补贴 + 背单补偿
+    let mut takehome = order.takehome_cents() + order.back_order_bonus_cents;
     if late {
         // 超时：只赔配送费，雨补照给（雨天跑单的体面）
         takehome -= cfg.fine.deliver_timeout_cents.min(takehome.max(0));
@@ -228,12 +228,20 @@ pub fn settle_delivery(
                 order.id, cfg.fine.deliver_timeout_cents
             )
         } else {
+            // 重投过的单要单独标出补贴，否则流水里的到手金额对不上计价明细。
+            let surcharge = if order.surcharge_cents > 0 {
+                format!(" + 重投补贴 {}", order.surcharge_cents)
+            } else {
+                String::new()
+            };
             format!(
-                "订单 #{} 配送费 {} + 雨补 {} - 抽水 {}",
+                "订单 #{} 配送费 {} + 雨补 {}{surcharge} - 抽水 {}",
                 order.id,
-                fee.base_fee_cents + fee.distance_extra_cents + fee.level_bonus_cents,
-                fee.rain_bonus_cents,
-                fee.commission_cents
+                order.fee.base_fee_cents
+                    + order.fee.distance_extra_cents
+                    + order.fee.level_bonus_cents,
+                order.fee.rain_bonus_cents,
+                order.fee.commission_cents
             )
         },
     };

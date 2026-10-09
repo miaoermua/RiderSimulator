@@ -12,6 +12,18 @@ use super::geo::CoordSystem;
 /// 实时档让模拟时钟跟真实钟表同步走。
 pub const REALTIME_TICK_MS: u64 = 60_000;
 
+/// 订单重投上限。
+///
+/// 抢单窗口内无人接、或骑手取消已接单时，订单**不消失**，而是加价重回大厅，
+/// 连续这么多次都没人接才判流单（`Expired`）。
+///
+/// 真实场景里订单不会因为一时没人接就作废——平台会加价、扩大派单范围，
+/// 直到有骑手接走。这里的次数上限只是防止死单无限循环。
+pub const MAX_REDISPATCH_ATTEMPTS: u32 = 3;
+
+/// 每次重投的加价（分）。补贴全给骑手，平台不抽水。
+pub const REDISPATCH_SURCHARGE_STEP_CENTS: i64 = 100;
+
 /// 配送费规则。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeRules {
@@ -226,6 +238,7 @@ impl Default for SimConfig {
             commission_rate: 0.0,
             commission_on_rain_bonus: false,
             discriminative_commission: false,
+            // 3 秒 × 倍率 = 窗口 tick 数；实时档下退化为 1 tick（= 1 模拟分钟）。
             claim_window_secs: 3,
             allow_speeding: true,
             allow_unrestricted: false,

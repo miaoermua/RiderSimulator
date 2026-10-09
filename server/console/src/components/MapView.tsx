@@ -12,8 +12,13 @@ interface Props {
   onPickRider: (id: number) => void;
 }
 
-/** 成都市中心，和 `sim::world` 的默认商圈一致。 */
-const DEFAULT_CENTER: [number, number] = [30.66, 104.06];
+/**
+ * 武汉光谷，与 `sim::world` 的商圈中心一致。
+ *
+ * 这里只是首帧的兜底视角——拿到快照后会立刻 `fitBounds` 到商户范围。
+ * 但兜底值要是写到别的城市，首帧就会闪一下几百公里外的地图。
+ */
+const DEFAULT_CENTER: [number, number] = [30.5077, 114.4154];
 
 /**
  * Leaflet 图层视图。

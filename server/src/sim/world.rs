@@ -7,7 +7,7 @@ use serde::Serialize;
 use super::{
     MINUTES_PER_DAY, OrderId, RiderId,
     ai::LlmPlan,
-    config::SimConfig,
+    config::{MAX_REDISPATCH_ATTEMPTS, REDISPATCH_SURCHARGE_STEP_CENTS, SimConfig},
     economy,
     event::{DayLedger, RiderBrief},
     geo::{CoordSystem, LatLng, bearing_deg, haversine_m},
@@ -37,6 +37,28 @@ pub struct SimStats {
     pub llm_fallbacks: u32,
 }
 
+/// 计价规则的只读视图（「单价系统」的对外口径）。
+///
+/// 与 [`crate::sim::config::FeeRules`] 的区别：这里只暴露控制台要展示与要调的量，
+/// 阶梯表 `distance_tiers` 原样下发供前端描述「几公里内加多少钱」，
+/// 但只能改代码——它是玩法设计的骨架，不适合在运行时随手拖。
+#[derive(Debug, Clone, Serialize)]
+pub struct FeeView {
+    /// 起步价（分）。含 `distance_tiers[0].0` 以内的里程。
+    pub base_fee_cents: i64,
+    /// 里程阶梯：(距离下界米, 总附加费分)。取不超过本单距离的最大门槛。
+    pub distance_tiers: Vec<(u32, i64)>,
+    /// 超出最后一档后每公里单价（分/km）。
+    pub per_km_over_cents: i64,
+    /// 等级加成（分/级）。
+    pub level_bonus_per_level_cents: i64,
+    /// 当前时段的高峰系数。
+    pub surge_multiplier: f32,
+    /// 订单重投上限与每次加价，前端用来解释「为什么这单变贵了」。
+    pub max_redispatch_attempts: u32,
+    pub redispatch_surcharge_step_cents: i64,
+}
+
 /// 控制端可调项的只读视图。
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigView {
@@ -62,7 +84,8 @@ pub struct ConfigView {
     pub surge_multiplier: f32,
     /// 当前允许的档位（UI 灰显用）。
     pub allowed_speed_modes: Vec<SpeedMode>,
-    pub base_fee_cents: i64,
+    /// 计价规则（控制台「单价系统」面板据此渲染）。
+    pub fee: FeeView,
     pub insurance_per_day_cents: i64,
     pub backorder_late_buffer_min: u32,
     /// 下发坐标的坐标系（方案 A：内部始终 GCJ-02，这里只决定出口转换）。
@@ -554,6 +577,8 @@ impl World {
             picked_up_at_min: None,
             delivered_at_min: None,
             fee,
+            redispatch_count: 0,
+            surcharge_cents: 0,
             status: OrderStatus::Pending,
             assigned_to: None,
             forced: false,
@@ -567,14 +592,54 @@ impl World {
         Some(id)
     }
 
-    /// 超过抢单窗口的待抢单 → Expired。
+    /// 把订单退回大厅重投：阶梯加价、重置抢单窗口、累加重投次数。
+    ///
+    /// 返回 `true` 表示已重投（订单仍在池子里等人接），`false` 表示重投次数用尽、
+    /// 订单被判流单（`Expired`）。
+    ///
+    /// 这是「订单不会凭空消失」的唯一出口：无论是没人接还是骑手取消，
+    /// 都从这里回到池子，由 `ai::evaluate` 重新挑合适的骑手。
+    pub fn release_to_hall(&mut self, order_id: OrderId) -> bool {
+        let now = self.elapsed_min;
+        let window = self.cfg.claim_window_ticks() as u64;
+        let Some(o) = self.order_mut(order_id) else {
+            return false;
+        };
+
+        o.redispatch_count += 1;
+        o.assigned_to = None;
+        o.back_order = false;
+        o.back_order_bonus_cents = 0;
+
+        if o.redispatch_count >= MAX_REDISPATCH_ATTEMPTS {
+            o.status = OrderStatus::Expired;
+            return false;
+        }
+
+        // 补贴按重投次数阶梯累加：加价既补偿骑手，也提高越过 AI 接单意愿门槛的概率。
+        o.surcharge_cents = REDISPATCH_SURCHARGE_STEP_CENTS * o.redispatch_count as i64;
+        o.status = OrderStatus::Pending;
+        o.claim_deadline_min = now + window;
+        true
+    }
+
+    /// 超过抢单窗口的待抢单：加价重投，投满上限才判流单。
+    ///
+    /// 返回值只含**真正流单**的订单 id，重投成功的单不算——调用方据此决定
+    /// 要不要广播 `order_expired`。
     pub fn expire_stale_orders(&mut self) -> Vec<OrderId> {
         let now = self.elapsed_min;
+        let stale: Vec<OrderId> = self
+            .orders
+            .iter()
+            .filter(|o| o.status == OrderStatus::Pending && now > o.claim_deadline_min)
+            .map(|o| o.id)
+            .collect();
+
         let mut expired = Vec::new();
-        for o in &mut self.orders {
-            if o.status == OrderStatus::Pending && now > o.claim_deadline_min {
-                o.status = OrderStatus::Expired;
-                expired.push(o.id);
+        for id in stale {
+            if !self.release_to_hall(id) {
+                expired.push(id);
             }
         }
         self.stats.orders_expired += expired.len() as u64;
@@ -673,7 +738,15 @@ impl World {
             is_peak: self.cfg.is_peak(self.sim_minute),
             surge_multiplier: self.cfg.surge_multiplier(self.sim_minute),
             allowed_speed_modes: allowed,
-            base_fee_cents: self.cfg.fee.base_fee_cents,
+            fee: FeeView {
+                base_fee_cents: self.cfg.fee.base_fee_cents,
+                distance_tiers: self.cfg.fee.distance_tiers.clone(),
+                per_km_over_cents: self.cfg.fee.per_km_over_cents,
+                level_bonus_per_level_cents: self.cfg.fee.level_bonus_per_level_cents,
+                surge_multiplier: self.cfg.surge_multiplier(self.sim_minute),
+                max_redispatch_attempts: MAX_REDISPATCH_ATTEMPTS,
+                redispatch_surcharge_step_cents: REDISPATCH_SURCHARGE_STEP_CENTS,
+            },
             insurance_per_day_cents: self.cfg.fine.insurance_per_day_cents,
             backorder_late_buffer_min: self.cfg.backorder.late_buffer_min,
             coord_system: self.cfg.coord_system,
@@ -923,15 +996,60 @@ mod tests {
     }
 
     #[test]
-    fn stale_orders_expire() {
+    fn stale_orders_are_redispatched_before_expiring() {
         let mut w = World::new_for_test(SimConfig::default(), 3);
-        w.generate_order_batch(3);
+        let ids = w.generate_order_batch(3);
+
+        // 首轮超窗：不流单，加价回到池子里继续等人接。
         for _ in 0..10 {
             w.advance_clock();
         }
-        let expired = w.expire_stale_orders();
-        assert_eq!(expired.len(), 3);
-        assert!(w.pending_orders().is_empty());
+        assert!(w.expire_stale_orders().is_empty(), "首轮超窗不该直接流单");
+        assert_eq!(w.pending_orders().len(), 3, "订单应仍在大厅等人接");
+
+        let o = w.order(ids[0]).expect("订单还在");
+        assert_eq!(o.redispatch_count, 1);
+        assert_eq!(o.surcharge_cents, REDISPATCH_SURCHARGE_STEP_CENTS);
+        assert_eq!(
+            o.quoted_fee_cents(),
+            o.fee.quoted_fee_cents + REDISPATCH_SURCHARGE_STEP_CENTS,
+            "加价必须体现在骑手看到的报价上"
+        );
+        assert_eq!(o.status, OrderStatus::Pending);
+
+        // 再耗两轮，重投次数用尽 → 判流单。
+        for _ in 0..2 {
+            for _ in 0..10 {
+                w.advance_clock();
+            }
+            w.expire_stale_orders();
+        }
+        assert!(w.pending_orders().is_empty(), "投满上限后不该再留在池子");
+        assert_eq!(w.order(ids[0]).expect("订单还在").status, OrderStatus::Expired);
+    }
+
+    #[test]
+    fn cancelled_order_goes_back_to_hall() {
+        let mut w = World::new_for_test(SimConfig::default(), 1);
+        let ids = w.generate_order_batch(1);
+        let order_id = ids[0];
+
+        // 让骑手先接单，再取消。
+        let rider_id = w.riders[0].id;
+        crate::sim::scheduler::try_claim(&mut w, order_id, rider_id).expect("抢单失败");
+        assert!(w.riders[0].is_holding(order_id));
+
+        crate::sim::scheduler::reject_order(&mut w, rider_id, order_id).expect("取消失败");
+
+        let o = w.order(order_id).expect("订单还在");
+        assert_eq!(o.status, OrderStatus::Pending, "被取消的单要退回大厅而非作废");
+        assert!(o.assigned_to.is_none());
+        assert_eq!(o.redispatch_count, 1);
+        assert!(o.surcharge_cents > 0, "重投要加价");
+        assert!(
+            !w.riders[0].is_holding(order_id),
+            "取消后骑手不应再持有该单"
+        );
     }
 
     #[test]

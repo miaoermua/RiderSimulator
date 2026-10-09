@@ -60,10 +60,34 @@ export interface RiderBrief {
   expected_value_cents: number | null;
 }
 
+/** 单笔订单的计价明细。服务端全量下发，控制台据此把「单价」摊开给人看。 */
 export interface FeeBreakdown {
-  quoted_fee_cents: number;
+  base_fee_cents: number;
+  distance_extra_cents: number;
+  rain_bonus_cents: number;
+  level_bonus_cents: number;
+  /** 高峰系数，已乘进 `quoted_fee_cents`。 */
+  surge_multiplier: number;
   commission_cents: number;
+  quoted_fee_cents: number;
   takehome_cents: number;
+}
+
+/** 计价规则快照，控制台「计价」面板据此渲染。 */
+export interface FeeView {
+  /** 起步价（分），含第一档里程。 */
+  base_fee_cents: number;
+  /** 里程阶梯：(距离下界米, 该档总附加费分)。取不超过本单距离的最大门槛。 */
+  distance_tiers: [number, number][];
+  /** 超出最后一档后每公里单价（分/km）。 */
+  per_km_over_cents: number;
+  /** 等级加成（分/级）。 */
+  level_bonus_per_level_cents: number;
+  /** 当前时段高峰系数。 */
+  surge_multiplier: number;
+  /** 订单重投上限与每次加价，用来解释「为什么这单变贵了」。 */
+  max_redispatch_attempts: number;
+  redispatch_surcharge_step_cents: number;
 }
 
 export interface ExtraTask {
@@ -87,6 +111,10 @@ export interface Order {
   created_at_min: number;
   claim_deadline_min: number;
   fee: FeeBreakdown;
+  /** 退回大厅重投的次数：没人接、或骑手取消都会累加。累到上限才判流单。 */
+  redispatch_count: number;
+  /** 重投叠加的调度补贴（分），全给骑手、不抽水。 */
+  surcharge_cents: number;
   status: OrderStatus;
   assigned_to: number | null;
   forced: boolean;
@@ -140,7 +168,8 @@ export interface ConfigView {
   is_peak: boolean;
   surge_multiplier: number;
   allowed_speed_modes: SpeedMode[];
-  base_fee_cents: number;
+  /** 计价规则（单价系统）。 */
+  fee: FeeView;
   insurance_per_day_cents: number;
   backorder_late_buffer_min: number;
   /** 坐标系：方案 A 里由控制端设置，服务端下发快照时据此转换。 */

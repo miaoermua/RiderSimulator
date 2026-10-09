@@ -997,6 +997,16 @@ impl App {
         if let Some(v) = p.coord_system {
             cfg.coord_system = v;
         }
+        // 计价规则只影响之后新生成的订单，已在跑的单沿用当时的报价。
+        if let Some(v) = p.base_fee_cents {
+            cfg.fee.base_fee_cents = v.clamp(0, 2_000);
+        }
+        if let Some(v) = p.per_km_over_cents {
+            cfg.fee.per_km_over_cents = v.clamp(0, 1_000);
+        }
+        if let Some(v) = p.level_bonus_per_level_cents {
+            cfg.fee.level_bonus_per_level_cents = v.clamp(0, 500);
+        }
 
         let mut changed = self.world.enforce_speed_policy();
         if let Some(n) = p.sim_rider_count {
@@ -1224,7 +1234,7 @@ impl App {
         let (quoted, forced) = self
             .world
             .order(assignment.order)
-            .map(|o| (o.fee.quoted_fee_cents, o.forced))
+            .map(|o| (o.quoted_fee_cents(), o.forced))
             .unwrap_or((0, false));
         events.push(SimEvent::OrderClaimed {
             order_id: assignment.order,

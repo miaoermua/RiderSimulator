@@ -103,6 +103,15 @@ pub struct Order {
     pub delivered_at_min: Option<u64>,
 
     pub fee: FeeBreakdown,
+    /// 无人接 / 被取消而重投大厅的次数，见 [`crate::sim::config::MAX_REDISPATCH_ATTEMPTS`]。
+    ///
+    /// 注意它和 `status == Expired` 不是一回事：重投过但最终被接走的单也有计数。
+    pub redispatch_count: u32,
+    /// 重投叠加的调度补贴（分）。**全给骑手**，不计入抽水基数。
+    ///
+    /// 单独存而不是并进 `fee`，是为了让 `fee` 始终是「按计费规则算出来的报价」，
+    /// 补贴是派单博弈的产物，两者混在一起就再也说不清单价了。
+    pub surcharge_cents: i64,
     pub status: OrderStatus,
     pub assigned_to: Option<RiderId>,
     /// 强制指派单（控制端指派，骑手端弹确认框）。
@@ -124,6 +133,16 @@ impl Order {
     }
     pub fn customer_pos(&self) -> LatLng {
         LatLng::new(self.customer_lat, self.customer_lng)
+    }
+
+    /// 骑手看到的报价 = 计费规则报价 + 调度补贴。
+    pub fn quoted_fee_cents(&self) -> i64 {
+        self.fee.quoted_fee_cents + self.surcharge_cents
+    }
+
+    /// 骑手到手 = 计费规则到手 + 调度补贴（补贴不抽水）。
+    pub fn takehome_cents(&self) -> i64 {
+        self.fee.takehome_cents + self.surcharge_cents
     }
 
     /// 是否超过承诺送达时间（含背单缓冲）。
@@ -162,6 +181,8 @@ mod tests {
             picked_up_at_min: None,
             delivered_at_min: None,
             fee: FeeBreakdown::default(),
+            redispatch_count: 0,
+            surcharge_cents: 0,
             status: OrderStatus::Pending,
             assigned_to: None,
             forced: false,

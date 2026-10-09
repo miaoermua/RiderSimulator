@@ -1,4 +1,4 @@
-import { Badge, Button, Segmented, Space, Tag, Typography } from "antd";
+import { Badge, Button, Dropdown, Space, Tag, Typography } from "antd";
 import { SPEEDS } from "../const";
 import { useStore } from "../hooks";
 import { hhmm, nowMinuteOfDay, store, yuan } from "../store";
@@ -7,9 +7,9 @@ import { hhmm, nowMinuteOfDay, store, yuan } from "../store";
  * 顶栏是唯一订阅 tick 的组件——60x 档下它每 16ms 重渲染一次，
  * 所以里面只能放便宜的东西。地图和列表读的是快照，不受影响。
  *
- * 视觉上遵循两条规范：倍率是**互斥选择**，交给 `Segmented`（选中项即
- * 全屏唯一的主色动作）；暂停与连接状态是**状态**，交给 `Badge` 传达，
- * 不用彩色正文也不占用主色。
+ * 变速做成**折叠**的下拉：档位有七个，摊在页头会把时间和状态挤到边上，
+ * 而真正需要一眼看见的只有「当前跑多快」。运行状态交给 `Badge`，
+ * 倍率交给下拉按钮，两者不重复表达同一件事。
  */
 export function TopBar() {
   const role = useStore((s) => s.role);
@@ -38,7 +38,20 @@ export function TopBar() {
     store.send("set_realtime", { enabled: true, wall_minute: nowMinuteOfDay() });
   };
 
-  const runState = paused ? "paused" : realtime ? "realtime" : "running";
+  // 下拉按钮上只写倍率本身；暂停与否由旁边的 Badge 说，避免同一件事说两遍。
+  const speedLabel = realtime ? "实时" : `${speed}x`;
+
+  const speedMenu = {
+    selectable: true,
+    selectedKeys: [realtime ? "realtime" : String(speed)],
+    items: [
+      { key: "realtime", label: "实时（1 模拟分钟 = 1 真实分钟）" },
+      { type: "divider" as const },
+      ...SPEEDS.map((v) => ({ key: String(v), label: `${v}x` })),
+    ],
+    onClick: ({ key }: { key: string }) =>
+      key === "realtime" ? pickRealtime() : pickSpeed(Number(key)),
+  };
 
   return (
     <Space size={16} align="center" style={{ width: "100%" }}>
@@ -53,10 +66,7 @@ export function TopBar() {
         第 {day} 天 {hhmm(minute)}
       </Typography.Title>
 
-      <Badge
-        status={runState === "paused" ? "warning" : "processing"}
-        text={runState === "paused" ? "已暂停" : runState === "realtime" ? "实时" : "运行中"}
-      />
+      <Badge status={paused ? "warning" : "processing"} text={paused ? "已暂停" : "运行中"} />
 
       {snap && (
         <Space size={4}>
@@ -74,15 +84,15 @@ export function TopBar() {
         </Space>
       )}
 
-      <Segmented
-        value={realtime ? "realtime" : String(speed)}
-        disabled={!isControl}
-        onChange={(v) => (v === "realtime" ? pickRealtime() : pickSpeed(Number(v)))}
-        options={[
-          ...SPEEDS.map((v) => ({ label: `${v}x`, value: String(v) })),
-          { label: "实时", value: "realtime" },
-        ]}
-      />
+      <Dropdown menu={speedMenu} trigger={["click"]} disabled={!isControl}>
+        <Button disabled={!isControl}>
+          <Space size={6}>
+            变速
+            <span style={{ fontVariantNumeric: "tabular-nums" }}>{speedLabel}</span>
+            <span aria-hidden>▾</span>
+          </Space>
+        </Button>
+      </Dropdown>
 
       <Button disabled={!isControl} onClick={() => store.send("set_paused", { paused: !paused })}>
         {paused ? "继续" : "暂停"}

@@ -557,7 +557,7 @@ pub fn build_prompt(world: &World, idle: &[RiderId], pending: &[OrderId]) -> (St
             o.id,
             o.merchant_name,
             o.distance_m as f64 / 1000.0,
-            o.fee.quoted_fee_cents as f64 / 100.0,
+            o.quoted_fee_cents() as f64 / 100.0,
             o.promised_minutes,
             window,
             if nearest_km.is_finite() { nearest_km / 1000.0 } else { -1.0 },
