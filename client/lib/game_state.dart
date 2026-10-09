@@ -241,7 +241,7 @@ class GameState extends ChangeNotifier {
     _upsertOrder(order);
     note(
       '新单：${order.merchantName} → ${order.distanceLabel}，'
-      '到手 ${yuan(order.fee.takehomeCents)} 元',
+      '到手 ${yuan(order.effectiveTakehomeCents)} 元',
       kind: LogKind.money,
     );
   }

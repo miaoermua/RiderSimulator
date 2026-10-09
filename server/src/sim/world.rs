@@ -801,7 +801,10 @@ impl World {
                 .collect(),
             stats: self.stats.clone(),
             last_day_ledgers: self.last_day_ledgers.clone(),
-            claim_window_ms: self.cfg.claim_window_secs as u64 * 1000,
+            // 窗口的真实挂钟时长，而不是配置里那个「基准秒数」。
+            // 实时档下窗口退化为 1 tick，这里必须跟着变成 60000，否则
+            // 客户端会照着 3 秒去倒计时，而订单其实还能挂一分钟。
+            claim_window_ms: self.cfg.claim_window_ticks() as u64 * self.cfg.tick_interval_ms(),
         }
     }
 }

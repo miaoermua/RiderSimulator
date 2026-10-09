@@ -87,7 +87,7 @@ class OrderCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      '到手 ¥${yuan(order.fee.takehomeCents)}',
+                      '到手 ¥${yuan(order.effectiveTakehomeCents)}',
                       style: theme.textTheme.titleMedium?.copyWith(
                         color: Colors.green.shade700,
                         fontWeight: FontWeight.bold,

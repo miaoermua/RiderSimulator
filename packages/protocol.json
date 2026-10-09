@@ -85,15 +85,18 @@
         "sim_rider_count": "u32 (0..8)",
         "ai_batch_enabled": "bool",
         "max_orders_per_day": "u32 (0=不限)",
-        "coord_system": "gcj02 | wgs84"
+        "coord_system": "gcj02 | wgs84",
+        "base_fee_cents": "i64 (0..2000) 起步价",
+        "per_km_over_cents": "i64 (0..1000) 超出里程阶梯后每公里单价",
+        "level_bonus_per_level_cents": "i64 (0..500) 等级加成"
       },
-      "comment": "局部更新：只处理出现的字段，越界值服务端夹取。coord_system 只影响下发时的坐标转换，世界内部状态始终是 GCJ-02。"
+      "comment": "局部更新：只处理出现的字段，越界值服务端夹取。coord_system 只影响下发时的坐标转换，世界内部状态始终是 GCJ-02。三个计费字段只影响之后新生成的订单，已在跑的单沿用当时的报价。"
     }
   ],
   "server_events": {
     "transport": {
       "welcome": "握手成功。payload: { protocol_version, role, rider_id, rider_key, tick_interval_ms, server_minute, snapshot }",
-      "snapshot": "完整世界快照。payload: { day, sim_minute, elapsed_min, weather, config, riders, hall, active_orders, merchants, stats, claim_window_ms }。config.coord_system 决定所有下发坐标的坐标系。",
+      "snapshot": "完整世界快照。payload: { day, sim_minute, elapsed_min, weather, config, riders, hall, active_orders, merchants, stats, claim_window_ms }。config.coord_system 决定所有下发坐标的坐标系。config.fee 是计价规则（起步价 / 里程阶梯 / 每公里单价 / 等级加成 / 重投补贴），订单自己的 fee 是按其算出的单笔明细，另加 surcharge_cents（重投补贴）。claim_window_ms 是抢单窗口的**真实挂钟时长**，实时档下为 60000。",
       "ack": "动作应答。payload: { action, ok, code?, message?, data? }",
       "error": "传输层错误。payload: { code, message }",
       "pong": "心跳应答。payload: { elapsed_min }",
@@ -103,7 +106,11 @@
       "tick": { "audience": "public", "payload": "{ day, sim_minute, elapsed_min, speed_multiplier }" },
       "order_broadcast": { "audience": "public", "payload": "{ order, window_ms, expires_in_ms }" },
       "order_claimed": { "audience": "public", "payload": "{ order_id, rider_id, rider_name, quoted_fee_cents, forced }" },
-      "order_expired": { "audience": "public", "payload": "{ order_id }" },
+      "order_expired": {
+        "audience": "public",
+        "payload": "{ order_id }",
+        "comment": "订单彻底流单。抢单超窗或骑手取消都不会直接流单——订单会加价重回大厅（记在 redispatch_count / surcharge_cents 上），重投满 max_redispatch_attempts 次才发这个事件。"
+      },
       "order_picked_up": { "audience": "public", "payload": "{ order_id, rider_id, prep_minutes }" },
       "order_delivered": { "audience": "public", "payload": "{ order_id, rider_id, rider_name, late, takehome_cents, hourly_wage_cents }" },
       "rider_state_changed": {

@@ -295,6 +295,66 @@ class FeeView {
       );
 }
 
+/// 里程阶梯的一档。
+class ConfigDistanceTier {
+  const ConfigDistanceTier({required this.fromM, required this.cents});
+
+  /// 距离下界（米）。本单距离取不超过它的最大档。
+  final int fromM;
+  /// 该档的总附加费（分）。
+  final int cents;
+}
+
+/// 计价规则（服务端 `FeeView`）。
+///
+/// 与订单上的 [FeeView] 不是一回事：那个是**某一单**算出来的钱，
+/// 这个是**规则本身**，控制台「计价」面板据此渲染并调整。
+class ConfigFeeRules {
+  const ConfigFeeRules({
+    required this.baseFeeCents,
+    required this.distanceTiers,
+    required this.perKmOverCents,
+    required this.levelBonusPerLevelCents,
+    required this.surgeMultiplier,
+    required this.maxRedispatchAttempts,
+    required this.redispatchSurchargeStepCents,
+  });
+
+  /// 起步价（分），含第一档里程。
+  final int baseFeeCents;
+  final List<ConfigDistanceTier> distanceTiers;
+  /// 超出最后一档后每公里单价（分/km）。
+  final int perKmOverCents;
+  /// 等级加成（分/级）。
+  final int levelBonusPerLevelCents;
+  final double surgeMultiplier;
+  /// 订单重投上限与每次加价。
+  final int maxRedispatchAttempts;
+  final int redispatchSurchargeStepCents;
+
+  factory ConfigFeeRules.fromJson(Map<String, dynamic> j) => ConfigFeeRules(
+        baseFeeCents: reqInt(j['base_fee_cents']),
+        distanceTiers: _tiers(j['distance_tiers']),
+        perKmOverCents: reqInt(j['per_km_over_cents']),
+        levelBonusPerLevelCents: reqInt(j['level_bonus_per_level_cents']),
+        surgeMultiplier: reqDouble(j['surge_multiplier'], 1),
+        maxRedispatchAttempts: reqInt(j['max_redispatch_attempts']),
+        redispatchSurchargeStepCents: reqInt(j['redispatch_surcharge_step_cents']),
+      );
+
+  /// 阶梯是 `[[距离, 金额]]` 这样的**数组对**，不是对象数组，
+  /// 所以走不了 `listOf`（它只收 Map）。
+  static List<ConfigDistanceTier> _tiers(Object? v) {
+    if (v is! List) return const [];
+    return v.whereType<List>().map((e) {
+      return ConfigDistanceTier(
+        fromM: reqInt(e.isNotEmpty ? e[0] : null),
+        cents: reqInt(e.length > 1 ? e[1] : null),
+      );
+    }).toList();
+  }
+}
+
 class ExtraTaskView {
   const ExtraTaskView({
     required this.id,
@@ -344,6 +404,8 @@ class OrderView {
     required this.pickedUpAtMin,
     required this.deliveredAtMin,
     required this.fee,
+    required this.redispatchCount,
+    required this.surchargeCents,
     required this.status,
     required this.assignedTo,
     required this.forced,
@@ -370,6 +432,10 @@ class OrderView {
   final int? pickedUpAtMin;
   final int? deliveredAtMin;
   final FeeView fee;
+  /// 退回大厅重投的次数：没人接、或骑手取消都会累加。
+  final int redispatchCount;
+  /// 重投叠加的调度补贴（分），全给骑手、不抽水。
+  final int surchargeCents;
   final OrderStatus status;
   final int? assignedTo;
   final bool forced;
@@ -379,6 +445,15 @@ class OrderView {
   final ExtraTaskView? task;
 
   bool isMine(int? riderId) => riderId != null && assignedTo == riderId;
+
+  /// 骑手实际看到的报价 = 计费规则报价 + 重投补贴。
+  ///
+  /// 直接读 `fee.quotedFeeCents` 会少算一截：订单没人接或被取消后会加价重投，
+  /// 那部分补贴单独记在 `surchargeCents` 上，不计入 `fee`。
+  int get effectiveQuotedCents => fee.quotedFeeCents + surchargeCents;
+
+  /// 骑手实际到手 = 计费规则到手 + 重投补贴（补贴不抽水）。
+  int get effectiveTakehomeCents => fee.takehomeCents + surchargeCents;
 
   /// 距离展示：`1.2km` / `860m`。
   String get distanceLabel =>
@@ -404,6 +479,8 @@ class OrderView {
       pickedUpAtMin: optInt(j['picked_up_at_min']),
       deliveredAtMin: optInt(j['delivered_at_min']),
       fee: FeeView.fromJson(asMap(j['fee'])),
+      redispatchCount: reqInt(j['redispatch_count']),
+      surchargeCents: reqInt(j['surcharge_cents']),
       status: OrderStatus.parse(reqStr(j['status'])),
       assignedTo: optInt(j['assigned_to']),
       forced: reqBool(j['forced']),
@@ -534,7 +611,7 @@ class ConfigView {
     required this.maxOrdersPerDay,
     required this.isPeak,
     required this.surgeMultiplier,
-    required this.baseFeeCents,
+    required this.fee,
     required this.insurancePerDayCents,
   });
 
@@ -550,7 +627,9 @@ class ConfigView {
   final int maxOrdersPerDay;
   final bool isPeak;
   final double surgeMultiplier;
-  final int baseFeeCents;
+  /// 计价规则（单价系统）。过去这里只有一个 `base_fee_cents`，
+  /// 起步价以外的里程、等级、重投补贴都拿不到。
+  final ConfigFeeRules fee;
   final int insurancePerDayCents;
 
   factory ConfigView.fromJson(Map<String, dynamic> j) => ConfigView(
@@ -566,7 +645,7 @@ class ConfigView {
         maxOrdersPerDay: reqInt(j['max_orders_per_day']),
         isPeak: reqBool(j['is_peak']),
         surgeMultiplier: reqDouble(j['surge_multiplier'], 1),
-        baseFeeCents: reqInt(j['base_fee_cents']),
+        fee: ConfigFeeRules.fromJson(asMap(j['fee'])),
         insurancePerDayCents: reqInt(j['insurance_per_day_cents']),
       );
 }
