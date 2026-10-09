@@ -30,6 +30,9 @@ pnpm-debug.log*
 # ---- macOS ----
 .DS_Store
 
+# ---- 竞品调研缓存（参考资料，会随平台版本过期，不入库）----
+docs/cache/
+
 # ---- Agent 本地数据（项目记忆、技能缓存等，不入库）----
 .workbuddy/
 
