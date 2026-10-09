@@ -26,6 +26,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::sim::{
     OrderId, RiderId,
     event::{DayLedger, RiderBrief, SimEvent},
+    geo::{CoordSystem, LatLng, to_coord_system},
     world::World,
 };
 
@@ -279,10 +280,67 @@ fn payload_of(ev: &SimEvent) -> Option<Value> {
     Some(v.get("payload").cloned().unwrap_or(v))
 }
 
+/// 出站坐标的字段名对。
+///
+/// `geo.rs` 的契约是「坐标永远是独立字段 `lat`/`lng`」，订单额外带上
+/// `merchant_*` / `customer_*` 前缀。按字段名递归改写，一处就能覆盖
+/// 骑手 / 订单 / 商户所有出口，不必逐个结构体改。
+const COORD_PAIRS: [(&str, &str); 3] = [
+    ("lat", "lng"),
+    ("merchant_lat", "merchant_lng"),
+    ("customer_lat", "customer_lng"),
+];
+
+/// 递归把 JSON 里的坐标字段转到目标坐标系。
+fn convert_coords(v: &mut Value, target: CoordSystem) {
+    match v {
+        Value::Object(map) => {
+            for (lat_key, lng_key) in COORD_PAIRS {
+                let pair = map
+                    .get(lat_key)
+                    .and_then(Value::as_f64)
+                    .zip(map.get(lng_key).and_then(Value::as_f64));
+                if let Some((lat, lng)) = pair {
+                    let p = to_coord_system(LatLng::new(lat, lng), target);
+                    map.insert(lat_key.to_string(), json!(p.lat));
+                    map.insert(lng_key.to_string(), json!(p.lng));
+                }
+            }
+            for child in map.values_mut() {
+                convert_coords(child, target);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                convert_coords(child, target);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 出口挂钩：内部是 GCJ-02，只有目标不是它时才转换。
+fn apply_coord_system(world: &World, v: &mut Value) {
+    let target = world.cfg.coord_system;
+    if target != CoordSystem::Gcj02 {
+        convert_coords(v, target);
+    }
+}
+
+/// **权限过滤 + 坐标转换的唯一出口。**
+///
+/// 先按角色过滤，再把结果里的坐标转到配置的坐标系——保证每条出站消息
+/// 都走同一道转换，不会哪条事件漏掉。
+pub fn render(world: &World, ev: &SimEvent, role: Role, now_min: u64) -> Option<Value> {
+    let mut v = render_filtered(world, ev, role, now_min)?;
+    apply_coord_system(world, &mut v);
+    Some(v)
+}
+
 /// **权限过滤的核心函数。** `None` = 这个角色不该看到这条事件。
 ///
 /// 纯函数，因此可以脱离 WebSocket 单测——权限漏了是最严重的一类 bug。
-pub fn render(world: &World, ev: &SimEvent, role: Role, now_min: u64) -> Option<Value> {
+fn render_filtered(world: &World, ev: &SimEvent, role: Role, now_min: u64) -> Option<Value> {
     let is_control = role == Role::Control;
     let me = role.rider_id();
 
@@ -375,7 +433,9 @@ pub fn render_snapshot(world: &World, role: Role, now_min: u64) -> Value {
             None => Vec::new(),
         };
     }
-    serde_json::to_value(&snap).unwrap_or(Value::Null)
+    let mut v = serde_json::to_value(&snap).unwrap_or(Value::Null);
+    apply_coord_system(world, &mut v);
+    v
 }
 
 /// 给控制端的额外上下文：hub 状态 + 服务端配置（不含任何 Key）。
@@ -689,5 +749,47 @@ mod tests {
         let v = server_info(&w, &HubStats::default(), true, true);
         let text = v.to_string();
         assert!(!text.contains("key"), "server_info 里不该出现 key：{text}");
+    }
+
+    #[test]
+    fn outbound_coords_follow_the_configured_system() {
+        let mut w = world();
+        w.generate_order_batch(1);
+        assert!(w.rider(1).is_some(), "测试世界应有骑手");
+        assert!(!w.orders.is_empty(), "应生成一单");
+
+        let gcj = render_snapshot(&w, Role::Control, w.elapsed_min);
+        let gcj_rider_lat = gcj["riders"][0]["lat"].as_f64().unwrap();
+        let gcj_merchant_lat = gcj["hall"][0]["merchant_lat"].as_f64().unwrap();
+
+        w.cfg.coord_system = CoordSystem::Wgs84;
+        let wgs = render_snapshot(&w, Role::Control, w.elapsed_min);
+        let wgs_rider_lat = wgs["riders"][0]["lat"].as_f64().unwrap();
+        let wgs_merchant_lat = wgs["hall"][0]["merchant_lat"].as_f64().unwrap();
+
+        assert!(
+            (gcj_rider_lat - wgs_rider_lat).abs() > 0.001,
+            "切换到 WGS-84 后骑手坐标应去偏"
+        );
+        assert!(
+            (gcj_merchant_lat - wgs_merchant_lat).abs() > 0.001,
+            "订单里的商户坐标也应去偏"
+        );
+        assert_eq!(wgs["config"]["coord_system"], "wgs84");
+
+        // 事件出口走同一道转换，否则骑手图标会在两种坐标间跳。
+        let ev = crate::sim::scheduler::state_event(&w, 1).unwrap();
+        let other = render(&w, &ev, Role::Rider(2), w.elapsed_min).unwrap();
+        let ev_lat = other["rider"]["lat"].as_f64().unwrap();
+        let internal_lat = w.rider(1).unwrap().pos().lat;
+        assert!(
+            (ev_lat - internal_lat).abs() > 0.001,
+            "事件里的骑手坐标也应去偏"
+        );
+
+        // 世界内部状态不受影响：切回来必须还原。
+        w.cfg.coord_system = CoordSystem::Gcj02;
+        let back = render_snapshot(&w, Role::Control, w.elapsed_min);
+        assert_eq!(back["riders"][0]["lat"].as_f64().unwrap(), gcj_rider_lat);
     }
 }

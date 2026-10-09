@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sim::{OrderId, RiderId, rider::SpeedMode};
+use crate::sim::{OrderId, RiderId, geo::CoordSystem, rider::SpeedMode};
 
 /// 协议版本。客户端版本不一致时服务端拒绝并返回 `PROTOCOL_MISMATCH`。
 pub use crate::PROTOCOL_VERSION;
@@ -158,6 +158,9 @@ pub struct ConfigPatch {
     /// 每日单量上限，0 = 不限。
     #[serde(default)]
     pub max_orders_per_day: Option<u32>,
+    /// 下发坐标的坐标系。内部始终 GCJ-02，这里只影响出口转换。
+    #[serde(default)]
+    pub coord_system: Option<CoordSystem>,
 }
 
 // ---------------------------------------------------------------------------

@@ -993,6 +993,10 @@ impl App {
         if let Some(v) = p.max_orders_per_day {
             cfg.max_orders_per_day = v;
         }
+        // 只影响下发时的坐标转换，世界状态不动。
+        if let Some(v) = p.coord_system {
+            cfg.coord_system = v;
+        }
 
         let mut changed = self.world.enforce_speed_policy();
         if let Some(n) = p.sim_rider_count {

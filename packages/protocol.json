@@ -70,12 +70,30 @@
       "roles": ["control"],
       "fields": { "order_id": "u32", "rider_id": "u32" }
     },
-    { "type": "set_llm_enabled", "roles": ["control"], "fields": { "enabled": "bool" } }
+    { "type": "set_llm_enabled", "roles": ["control"], "fields": { "enabled": "bool" } },
+    {
+      "type": "set_config",
+      "roles": ["control"],
+      "fields": {
+        "claim_window_secs": "u32 (1..10)",
+        "allow_speeding": "bool",
+        "allow_unrestricted": "bool",
+        "backorder_enabled": "bool",
+        "backorder_max": "u32 (1..5)",
+        "discriminative_commission": "bool",
+        "show_expected_value": "bool",
+        "sim_rider_count": "u32 (0..8)",
+        "ai_batch_enabled": "bool",
+        "max_orders_per_day": "u32 (0=不限)",
+        "coord_system": "gcj02 | wgs84"
+      },
+      "comment": "局部更新：只处理出现的字段，越界值服务端夹取。coord_system 只影响下发时的坐标转换，世界内部状态始终是 GCJ-02。"
+    }
   ],
   "server_events": {
     "transport": {
       "welcome": "握手成功。payload: { protocol_version, role, rider_id, rider_key, tick_interval_ms, server_minute, snapshot }",
-      "snapshot": "完整世界快照。payload: { day, sim_minute, elapsed_min, weather, config, riders, hall, active_orders, merchants, stats, claim_window_ms }",
+      "snapshot": "完整世界快照。payload: { day, sim_minute, elapsed_min, weather, config, riders, hall, active_orders, merchants, stats, claim_window_ms }。config.coord_system 决定所有下发坐标的坐标系。",
       "ack": "动作应答。payload: { action, ok, code?, message?, data? }",
       "error": "传输层错误。payload: { code, message }",
       "pong": "心跳应答。payload: { elapsed_min }",

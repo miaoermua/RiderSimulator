@@ -10,7 +10,7 @@ use super::{
     config::SimConfig,
     economy,
     event::{DayLedger, RiderBrief},
-    geo::{LatLng, bearing_deg, haversine_m},
+    geo::{CoordSystem, LatLng, bearing_deg, haversine_m},
     merchant::Merchant,
     order::{ExtraTask, Order, OrderStatus, OrderTier},
     rider::{Phase, Rider, RiderKind, SpeedMode},
@@ -65,6 +65,8 @@ pub struct ConfigView {
     pub base_fee_cents: i64,
     pub insurance_per_day_cents: i64,
     pub backorder_late_buffer_min: u32,
+    /// 下发坐标的坐标系（方案 A：内部始终 GCJ-02，这里只决定出口转换）。
+    pub coord_system: CoordSystem,
 }
 
 /// 商户精简信息。
@@ -674,6 +676,7 @@ impl World {
             base_fee_cents: self.cfg.fee.base_fee_cents,
             insurance_per_day_cents: self.cfg.fine.insurance_per_day_cents,
             backorder_late_buffer_min: self.cfg.backorder.late_buffer_min,
+            coord_system: self.cfg.coord_system,
         }
     }
 

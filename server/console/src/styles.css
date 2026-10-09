@@ -1,0 +1,165 @@
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: #0f1218;
+  color: #e6e9ef;
+}
+
+/* ---------------- 布局 ---------------- */
+
+.console-sider .ant-tabs {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.console-sider .ant-tabs-content-holder {
+  overflow: auto;
+  min-height: 0;
+}
+
+.console-sider .ant-tabs-nav {
+  margin: 0;
+}
+
+.console-sider .ant-tabs-tab {
+  flex: 1;
+  justify-content: center;
+}
+
+.console-map {
+  height: 100%;
+  width: 100%;
+  background: #1b1f27;
+}
+
+.console-scroll {
+  overflow: auto;
+  height: 100%;
+  padding: 12px;
+}
+
+/* ---------------- Leaflet 深色适配 ---------------- */
+
+.leaflet-container {
+  background: #1b1f27;
+  font: inherit;
+  color: #e6e9ef;
+}
+
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  background: #171b23;
+  color: #e6e9ef;
+}
+
+.leaflet-bar a {
+  background: #171b23;
+  color: #e6e9ef;
+  border-color: #262c38;
+}
+
+/* 骑手头像：Leaflet divIcon 里是拼接出来的 HTML，只能用全局样式。 */
+.rider-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+
+.rider-icon.off {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+
+.rider-label {
+  background: rgba(15, 18, 24, 0.85);
+  color: #fff;
+  border: 0;
+  box-shadow: none;
+  padding: 1px 5px;
+  font-size: 11px;
+}
+
+.rider-label::before {
+  display: none;
+}
+
+/* ---------------- 统计卡 ---------------- */
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.stat-cell {
+  background: #10141b;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.stat-cell b {
+  display: block;
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-cell span {
+  color: #8a93a6;
+  font-size: 11px;
+}
+
+/* ---------------- 设置行 ---------------- */
+
+.set-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px dashed #262c38;
+}
+
+.set-row.stack {
+  grid-template-columns: 1fr;
+}
+
+.set-ctl {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.set-row.stack .set-ctl {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+}
+
+/* ---------------- 日志 ---------------- */
+
+.log-item {
+  padding: 4px 0;
+  border-bottom: 1px solid #1d222c;
+  font-size: 12px;
+}
+
+.log-time {
+  margin-right: 6px;
+  font-variant-numeric: tabular-nums;
+}

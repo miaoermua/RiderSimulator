@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::geo::CoordSystem;
+
 /// 实时档下一个 tick 的真实时长：1 模拟分钟 = 真实 60 秒。
 ///
 /// 这是「真实时间」与「1 分钟 1 秒」两个模式的分界：倍率档位压缩真实时间，
@@ -148,6 +150,9 @@ pub struct SimConfig {
     /// 打开时 [`SimConfig::tick_interval_ms`] 返回 [`REALTIME_TICK_MS`]，
     /// `speed_multiplier` 只保留「是否暂停」的语义（0 = 暂停）。
     pub realtime: bool,
+    /// 下发坐标的坐标系。内部世界状态永远是 GCJ-02，这里只决定出口转换。
+    #[serde(default)]
+    pub coord_system: CoordSystem,
 }
 
 impl Default for SimConfig {
@@ -234,6 +239,7 @@ impl Default for SimConfig {
             order_spawn_interval_min: 3,
             speed_multiplier: 1,
             realtime: false,
+            coord_system: CoordSystem::Gcj02,
         }
     }
 }

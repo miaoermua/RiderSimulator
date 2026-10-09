@@ -3,6 +3,8 @@
 //! 契约铁律：坐标永远是**独立字段** `lat` / `lng`，绝不用数组。
 //! 高德用 `[lng, lat]`，GeoJSON 用 `[lat, lng]`，混用是最容易出的 bug。
 
+use std::f64::consts::PI;
+
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
@@ -40,6 +42,90 @@ impl LatLng {
 
     pub fn is_valid(&self) -> bool {
         self.lat.abs() <= 90.0 && self.lng.abs() <= 180.0 && (self.lat != 0.0 || self.lng != 0.0)
+    }
+}
+
+/// 坐标系。
+///
+/// **方案 A**：服务端内部一律 GCJ-02（因为高德 geocode / route 只吃 GCJ-02），
+/// 只在下发快照与事件时按此设置转换为 WGS-84。世界状态本身永远不变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoordSystem {
+    /// 火星坐标，高德 / 腾讯 / 国内底图。
+    #[default]
+    Gcj02,
+    /// 国际标准，GPS / OpenStreetMap。
+    Wgs84,
+}
+
+// ---- GCJ-02 ↔ WGS-84 转换（公开算法，纯数学，不依赖网络）----
+//
+// 只在中国境内生效；境外坐标原样返回，否则会被平白加偏。
+
+/// 克拉索夫斯基椭球长半轴（米）。
+const GCJ_A: f64 = 6_378_245.0;
+/// 第一偏心率平方。
+const GCJ_EE: f64 = 0.006_693_421_622_965_943;
+
+/// 是否在中国境外（含港澳台之外的粗略国境框）。
+fn out_of_china(lat: f64, lng: f64) -> bool {
+    !(73.66..135.05).contains(&lng) || !(3.86..53.55).contains(&lat)
+}
+
+fn transform_lat(x: f64, y: f64) -> f64 {
+    let mut ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * x.abs().sqrt();
+    ret += (20.0 * (6.0 * x * PI).sin() + 20.0 * (2.0 * x * PI).sin()) * 2.0 / 3.0;
+    ret += (20.0 * (y * PI).sin() + 40.0 * (y / 3.0 * PI).sin()) * 2.0 / 3.0;
+    ret += (160.0 * (y / 12.0 * PI).sin() + 320.0 * (y * PI / 30.0).sin()) * 2.0 / 3.0;
+    ret
+}
+
+fn transform_lng(x: f64, y: f64) -> f64 {
+    let mut ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * x.abs().sqrt();
+    ret += (20.0 * (6.0 * x * PI).sin() + 20.0 * (2.0 * x * PI).sin()) * 2.0 / 3.0;
+    ret += (20.0 * (x * PI).sin() + 40.0 * (x / 3.0 * PI).sin()) * 2.0 / 3.0;
+    ret += (150.0 * (x / 12.0 * PI).sin() + 300.0 * (x / 30.0 * PI).sin()) * 2.0 / 3.0;
+    ret
+}
+
+/// WGS-84 处的加偏量（度）。
+fn gcj_delta(lat: f64, lng: f64) -> (f64, f64) {
+    let mut d_lat = transform_lat(lng - 105.0, lat - 35.0);
+    let mut d_lng = transform_lng(lng - 105.0, lat - 35.0);
+    let rad_lat = lat / 180.0 * PI;
+    let magic = 1.0 - GCJ_EE * rad_lat.sin().powi(2);
+    let sqrt_magic = magic.sqrt();
+    d_lat = (d_lat * 180.0) / ((GCJ_A * (1.0 - GCJ_EE)) / (magic * sqrt_magic) * PI);
+    d_lng = (d_lng * 180.0) / (GCJ_A / sqrt_magic * rad_lat.cos() * PI);
+    (d_lat, d_lng)
+}
+
+/// WGS-84 → GCJ-02（境外原样返回）。
+pub fn wgs84_to_gcj02(p: LatLng) -> LatLng {
+    if out_of_china(p.lat, p.lng) {
+        return p;
+    }
+    let (d_lat, d_lng) = gcj_delta(p.lat, p.lng);
+    LatLng::new(p.lat + d_lat, p.lng + d_lng)
+}
+
+/// GCJ-02 → WGS-84（境外原样返回）。
+///
+/// 用 GCJ 点处的加偏量做近似反解，误差在米级——对「换底图对齐」足够。
+pub fn gcj02_to_wgs84(p: LatLng) -> LatLng {
+    if out_of_china(p.lat, p.lng) {
+        return p;
+    }
+    let (d_lat, d_lng) = gcj_delta(p.lat, p.lng);
+    LatLng::new(p.lat - d_lat, p.lng - d_lng)
+}
+
+/// 按目标坐标系转换：内部是 GCJ-02，只有要 WGS-84 时才去偏。
+pub fn to_coord_system(p: LatLng, target: CoordSystem) -> LatLng {
+    match target {
+        CoordSystem::Gcj02 => p,
+        CoordSystem::Wgs84 => gcj02_to_wgs84(p),
     }
 }
 
@@ -236,5 +322,36 @@ mod tests {
     fn angle_between_wraps() {
         assert!((angle_between(350.0, 10.0) - 20.0).abs() < 1e-3);
         assert!((angle_between(0.0, 180.0) - 180.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn gcj_conversion_is_significant_and_roundtrips() {
+        // 成都，境内
+        let wgs = LatLng::new(30.66, 104.06);
+        let gcj = wgs84_to_gcj02(wgs);
+        let drift = haversine_m(wgs, gcj);
+        assert!(
+            (300.0..900.0).contains(&drift),
+            "境内偏移应数百米，实际 {drift:.1}m"
+        );
+
+        // 反解回 WGS-84 误差应在米级
+        let back = gcj02_to_wgs84(gcj);
+        let err = haversine_m(wgs, back);
+        assert!(err < 2.0, "往返误差应小于 2m，实际 {err:.3}m");
+    }
+
+    #[test]
+    fn gcj_conversion_leaves_overseas_untouched() {
+        let ny = LatLng::new(40.7128, -74.0060);
+        assert_eq!(wgs84_to_gcj02(ny), ny);
+        assert_eq!(gcj02_to_wgs84(ny), ny);
+    }
+
+    #[test]
+    fn to_coord_system_only_offsets_wgs84() {
+        let p = LatLng::new(30.66, 104.06);
+        assert_eq!(to_coord_system(p, CoordSystem::Gcj02), p);
+        assert_ne!(to_coord_system(p, CoordSystem::Wgs84), p);
     }
 }
