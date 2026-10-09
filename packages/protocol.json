@@ -1,0 +1,141 @@
+{
+  "protocol_version": "1.0",
+  "_note": "服务端与客户端共用的 WebSocket 契约。以 server/src/net/protocol.rs 为准；本文件供客户端代码生成与联调对照。",
+  "transport": {
+    "ws_path": "/ws",
+    "health_path": "/healthz",
+    "frame": "text (JSON)",
+    "max_frame_bytes": 65536,
+    "tick_interval_ms_at_1x": 1000,
+    "comment": "服务端 1x 时 1 个 tick = 1 个模拟分钟 = 1 秒；倍率 10/60 时相应缩短。客户端据此做平滑插值。"
+  },
+  "roles": {
+    "rider": "真人骑手：只收到公开信息 + 自己的财务/任务对话",
+    "control": "控制端：收到全部信息（含隐藏属性），可下发控制指令",
+    "spectator": "观战：只收公开信息，无任何收入字段"
+  },
+  "client_messages": [
+    {
+      "type": "hello",
+      "required": true,
+      "comment": "必须是连接后的第一条消息，否则服务端返回 HELLO_REQUIRED 并断开。",
+      "fields": {
+        "token": {
+          "type": "string?",
+          "comment": "缺省=观战/控制端（受 RIDER_SIM_ALLOW_CONTROL 约束）；rider:<id>=绑定骑手；new:<昵称>=现场建号。"
+        },
+        "protocol_version": { "type": "string?", "comment": "不一致则返回 PROTOCOL_MISMATCH 并断开。" }
+      }
+    },
+    { "type": "resync", "comment": "重新拉一份完整快照（断线重连）。服务端回 snapshot。" },
+    { "type": "ping", "comment": "心跳。服务端回 pong。" },
+
+    {
+      "type": "claim",
+      "roles": ["rider", "control"],
+      "fields": { "order_id": "u32", "back_order": "bool = false" }
+    },
+    { "type": "reject", "roles": ["rider", "control"], "fields": { "order_id": "u32" } },
+    { "type": "urge", "roles": ["rider", "control"], "fields": { "order_id": "u32" } },
+    { "type": "arrive_shop", "roles": ["rider", "control"], "fields": { "order_id": "u32" } },
+    { "type": "arrive_customer", "roles": ["rider", "control"], "fields": { "order_id": "u32" } },
+    { "type": "deliver", "roles": ["rider", "control"], "fields": { "order_id": "u32" } },
+
+    { "type": "set_online", "roles": ["rider", "control"], "fields": { "online": "bool" } },
+    {
+      "type": "set_speed_mode",
+      "roles": ["rider", "control"],
+      "fields": { "mode": "compliant | tolerant | unrestricted" }
+    },
+
+    {
+      "type": "task_message",
+      "roles": ["rider"],
+      "fields": { "order_id": "u32", "text": "string" },
+      "comment": "立刻回 ack(status=judging)，判定结果稍后以 task_message 事件下发。"
+    },
+
+    { "type": "set_paused", "roles": ["control"], "fields": { "paused": "bool" } },
+    { "type": "set_speed_multiplier", "roles": ["control"], "fields": { "multiplier": "u32 (1|2|4|8|10|60)" } },
+    {
+      "type": "set_weather",
+      "roles": ["control"],
+      "fields": {
+        "weather": "clear | cloudy | overcast | fog | light_rain | moderate_rain | heavy_rain | windy | snow | rainstorm"
+      }
+    },
+    { "type": "set_commission_rate", "roles": ["control"], "fields": { "rate": "f32 (0.0..0.30)" } },
+    {
+      "type": "force_assign",
+      "roles": ["control"],
+      "fields": { "order_id": "u32", "rider_id": "u32" }
+    },
+    { "type": "set_llm_enabled", "roles": ["control"], "fields": { "enabled": "bool" } }
+  ],
+  "server_events": {
+    "transport": {
+      "welcome": "握手成功。payload: { protocol_version, role, rider_id, rider_key, tick_interval_ms, server_minute, snapshot }",
+      "snapshot": "完整世界快照。payload: { day, sim_minute, elapsed_min, weather, config, riders, hall, active_orders, merchants, stats, claim_window_ms }",
+      "ack": "动作应答。payload: { action, ok, code?, message?, data? }",
+      "error": "传输层错误。payload: { code, message }",
+      "pong": "心跳应答。payload: { elapsed_min }",
+      "server_info": "控制端专用状态。payload: { ...stats, brain_note, brain_calls_today, llm_enabled, ... }"
+    },
+    "sim": {
+      "tick": { "audience": "public", "payload": "{ day, sim_minute, elapsed_min, speed_multiplier }" },
+      "order_broadcast": { "audience": "public", "payload": "{ order, window_ms, expires_in_ms }" },
+      "order_claimed": { "audience": "public", "payload": "{ order_id, rider_id, rider_name, quoted_fee_cents, forced }" },
+      "order_expired": { "audience": "public", "payload": "{ order_id }" },
+      "order_picked_up": { "audience": "public", "payload": "{ order_id, rider_id, prep_minutes }" },
+      "order_delivered": { "audience": "public", "payload": "{ order_id, rider_id, rider_name, late, takehome_cents, hourly_wage_cents }" },
+      "rider_state_changed": {
+        "audience": "public (本人/控制端会升级为含收入字段的版本)",
+        "payload": "{ rider_id, rider: RiderBrief }"
+      },
+      "rider_finance": { "audience": "owner+control", "payload": "{ rider_id, delta_cents, kind, reason, takehome_cents, hourly_wage_cents }" },
+      "weather_changed": { "audience": "public", "payload": "{ weather, label, speed_factor, rain_bonus_cents }" },
+      "fine_issued": { "audience": "owner+control", "payload": "{ rider_id, kind, amount_cents, reason }" },
+      "config_changed": { "audience": "public", "payload": "{ speed_multiplier, commission_rate, weather }" },
+      "ai_decision": { "audience": "public", "payload": "{ source, assignments, note }" },
+      "task_message": { "audience": "owner+control", "payload": "{ order_id, from: rider|customer|system, text, step, task_id }" },
+      "day_closed": { "audience": "public (ledgers 只保留本人/控制端可见的部分)", "payload": "{ day, ledgers, total_takehome_cents, total_orders }" }
+    }
+  },
+  "rider_brief": {
+    "public": ["id", "key", "name", "kind", "online", "injured", "frozen", "speed_mode", "level", "rating", "completed", "held", "phase", "lat", "lng"],
+    "own_adds": ["hourly_wage_cents", "takehome_cents", "cash_cents", "fines_cents"],
+    "control_adds": ["fatigue", "expected_value_cents"],
+    "comment": "收入相关字段对其他角色一律为 null，由服务端在 hub::render 里过滤。"
+  },
+  "error_codes": {
+    "transport": [
+      "BAD_REQUEST",
+      "FRAME_TOO_LARGE",
+      "HELLO_REQUIRED",
+      "PROTOCOL_MISMATCH",
+      "UNAUTHORIZED",
+      "NOT_A_RIDER",
+      "NOT_A_CONTROLLER",
+      "FEATURE_DISABLED",
+      "INTERNAL",
+      "NO_TASK",
+      "TASK_FINISHED"
+    ],
+    "business": [
+      "ORDER_NOT_FOUND",
+      "RIDER_NOT_FOUND",
+      "ALREADY_CLAIMED",
+      "ORDER_EXPIRED",
+      "RIDER_OFFLINE",
+      "RIDER_FROZEN",
+      "RIDER_INJURED",
+      "RATING_TOO_LOW",
+      "HELD_LIMIT_REACHED",
+      "BACK_ORDER_DISABLED",
+      "BACK_ORDER_DETOUR_TOO_LONG",
+      "WRONG_PHASE",
+      "NOT_ASSIGNED_TO_YOU"
+    ],
+    "comment": "客户端一律按 code 分支，不要匹配 message 文案。"
+  }
+}

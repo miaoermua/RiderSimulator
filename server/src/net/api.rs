@@ -1,0 +1,492 @@
+//! 远程控制 / 派单 HTTP 接口。
+//!
+//! 给 workbuddy 这类「不方便讲 WebSocket」的外部工具用：发一个 HTTP 请求，
+//! 主循环执行完再把结果原样吐回来。
+//!
+//! ## 不另起状态通道
+//!
+//! 请求被包成 [`RpcRequest`] 塞进与 `/ws` 同一个 [`Inbound`] 队列，排在同
+//! 一条队里执行——`&mut World` 只有一个，天然串行、天然原子。这里只做
+//! 「鉴权 + 搬运 + 等回包」，一行游戏规则都不写。
+//!
+//! ```text
+//! curl ──HTTP──▶ axum handler ──Inbound::Rpc──▶ app (World) ──oneshot──▶ 回包
+//! ```
+//!
+//! ## 鉴权
+//!
+//! 与 `/ws` 的 `hello` 同一套：`Authorization: Bearer <control token>`。
+//! 服务端没配 `RIDER_SIM_CONTROL_TOKEN` 时退化成 `RIDER_SIM_ALLOW_CONTROL`
+//! ——开着就放行，关着就 403。
+
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
+
+use super::{protocol::ConfigPatch, ws::Inbound};
+use crate::sim::{OrderId, RiderId};
+
+/// 读当前世界。
+pub const STATE_PATH: &str = "/api/state";
+/// 派单：把订单指派给骑手。
+pub const DISPATCH_PATH: &str = "/api/dispatch";
+/// 批量改控制端开关。
+pub const CONFIG_PATH: &str = "/api/config";
+/// 强制某个骑手上线 / 下线。
+pub const RIDER_ONLINE_PATH: &str = "/api/riders/{id}/online";
+
+/// 鉴权配置。由 `main.rs` 的环境变量决定。
+#[derive(Debug, Clone, Default)]
+pub struct ApiAuth {
+    /// `RIDER_SIM_CONTROL_TOKEN`。`None` = 不接受令牌方式。
+    pub token: Option<String>,
+    /// `RIDER_SIM_ALLOW_CONTROL`：没配令牌时是否放行。
+    pub allow_control: bool,
+}
+
+impl ApiAuth {
+    fn check(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        let presented = headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+
+        if let Some(expected) = &self.token {
+            return match presented {
+                Some(got) if got == expected => Ok(()),
+                _ => Err(ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "UNAUTHORIZED",
+                    "控制端令牌无效",
+                )),
+            };
+        }
+        if self.allow_control {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "CONTROL_DISABLED",
+            "服务端未开控制端：请设置 RIDER_SIM_CONTROL_TOKEN",
+        ))
+    }
+}
+
+/// 一条要交给主循环执行的指令。
+#[derive(Debug)]
+pub enum RpcRequest {
+    /// 取控制端视角的完整快照。
+    State,
+    /// 派单。整批按顺序执行，一条失败不挡后面的。
+    Dispatch(Vec<DispatchItem>),
+    /// 改开关。
+    SetConfig(ConfigPatch),
+    /// 上 / 下线。
+    SetRiderOnline { rider_id: RiderId, online: bool },
+}
+
+/// 主循环回给 HTTP 的结果。
+pub type RpcReply = Result<Value, ApiError>;
+
+/// 协议错误。`code` 与 WS 侧一样是**固定字符串枚举**。
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiError {
+    #[serde(skip)]
+    pub status: StatusCode,
+    pub code: String,
+    pub message: String,
+}
+
+impl ApiError {
+    pub fn new(status: StatusCode, code: &str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+
+    /// 业务上「不合法」但不代表服务端出错，统一 409。
+    pub fn conflict(code: &str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
+    }
+
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "BAD_REQUEST", message)
+    }
+
+    pub fn not_found(code: &str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, code, message)
+    }
+
+    /// 服务端自己的锅。
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = json!({ "error": { "code": self.code, "message": self.message } });
+        (self.status, Json(body)).into_response()
+    }
+}
+
+/// 一条派单指令。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchItem {
+    /// `3` 和 `"r3"` 都认——外部工具手里多半是从快照里抄来的 key。
+    pub rider_id: Value,
+    pub order_id: OrderId,
+    /// 派单理由，会进控制台的事件流。缺省用服务端的默认文案。
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl DispatchItem {
+    /// 解析出骑手 id；给不出就 `None`（调用方报 `RIDER_NOT_FOUND`）。
+    pub fn rider(&self) -> Option<RiderId> {
+        parse_rider_value(&self.rider_id)
+    }
+}
+
+/// 数字 `3`、字符串 `"3"`、`"r3"` 都解析成 `3`。
+fn parse_rider_value(v: &Value) -> Option<RiderId> {
+    if let Some(n) = v.as_u64() {
+        return u32::try_from(n).ok();
+    }
+    if let Some(n) = v.as_i64() {
+        return u32::try_from(n).ok();
+    }
+    let s = v.as_str()?.trim();
+    let digits = s.strip_prefix('r').unwrap_or(s);
+    digits.parse().ok()
+}
+
+/// `POST /api/dispatch` 的请求体。三种写法都收：
+///
+/// ```json
+/// {"assignments":[{"rider_id":"r3","order_id":42}]}   // 批量
+/// {"rider_id":3,"order_id":42,"reason":"顺路"}          // 单条
+/// [{"rider_id":3,"order_id":42}]                        // 裸数组
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum DispatchBody {
+    Batch { assignments: Vec<DispatchItem> },
+    Single(DispatchItem),
+    List(Vec<DispatchItem>),
+}
+
+impl DispatchBody {
+    fn into_items(self) -> Vec<DispatchItem> {
+        match self {
+            DispatchBody::Batch { assignments } => assignments,
+            DispatchBody::Single(item) => vec![item],
+            DispatchBody::List(items) => items,
+        }
+    }
+}
+
+/// 交给 axum 的共享状态。
+#[derive(Clone)]
+pub struct ApiState {
+    pub inbound: UnboundedSender<Inbound>,
+    pub auth: ApiAuth,
+}
+
+impl ApiState {
+    /// 鉴权 → 投递 → 等主循环回包。
+    async fn call(&self, headers: &HeaderMap, req: RpcRequest) -> Response {
+        if let Err(e) = self.auth.check(headers) {
+            return e.into_response();
+        }
+        let (tx, rx) = oneshot::channel();
+        if self.inbound.send(Inbound::Rpc { req, reply: tx }).is_err() {
+            return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "INTERNAL", "主循环已退出")
+                .into_response();
+        }
+        match rx.await {
+            Ok(Ok(v)) => Json(v).into_response(),
+            Ok(Err(e)) => e.into_response(),
+            Err(_) => ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "主循环没有回应",
+            )
+            .into_response(),
+        }
+    }
+}
+
+/// 组装 `/api/**` 路由。返回 `Router<()>`，可以直接 merge 进主 router。
+pub fn routes(state: ApiState) -> Router {
+    Router::new()
+        .route(STATE_PATH, get(state_route))
+        .route(DISPATCH_PATH, post(dispatch_route))
+        .route(CONFIG_PATH, post(config_route))
+        .route(RIDER_ONLINE_PATH, post(rider_online_route))
+        .with_state(state)
+}
+
+async fn state_route(State(api): State<ApiState>, headers: HeaderMap) -> Response {
+    api.call(&headers, RpcRequest::State).await
+}
+
+async fn dispatch_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let body: DispatchBody = match serde_json::from_value(body) {
+        Ok(b) => b,
+        Err(e) => {
+            return ApiError::bad_request(format!(
+                "请求体应为 {{\"assignments\":[...]}} / 单条对象 / 数组：{e}"
+            ))
+            .into_response();
+        }
+    };
+    let items = body.into_items();
+    if items.is_empty() {
+        return ApiError::bad_request("assignments 不能为空").into_response();
+    }
+    api.call(&headers, RpcRequest::Dispatch(items)).await
+}
+
+async fn config_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let patch: ConfigPatch = match serde_json::from_value(body) {
+        Ok(p) => p,
+        Err(e) => {
+            return ApiError::bad_request(format!("无法解析为 config patch：{e}")).into_response();
+        }
+    };
+    api.call(&headers, RpcRequest::SetConfig(patch)).await
+}
+
+async fn rider_online_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<u32>,
+    Json(body): Json<Value>,
+) -> Response {
+    let online = body.get("online").and_then(Value::as_bool).unwrap_or(true);
+    api.call(
+        &headers,
+        RpcRequest::SetRiderOnline {
+            rider_id: id,
+            online,
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tokio::sync::mpsc::unbounded_channel;
+    use tower::ServiceExt;
+
+    fn bearer(t: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, format!("Bearer {t}").parse().unwrap());
+        h
+    }
+
+    /// `RIDER_SIM_ALLOW_CONTROL=true`、没配令牌时的开发态。
+    fn open_auth() -> ApiAuth {
+        ApiAuth {
+            token: None,
+            allow_control: true,
+        }
+    }
+
+    #[test]
+    fn rider_value_accepts_number_and_key() {
+        assert_eq!(parse_rider_value(&json!(3)), Some(3));
+        assert_eq!(parse_rider_value(&json!("3")), Some(3));
+        assert_eq!(parse_rider_value(&json!("r3")), Some(3));
+        assert_eq!(parse_rider_value(&json!(" r7 ")), Some(7));
+        assert_eq!(parse_rider_value(&json!("rider")), None);
+        assert_eq!(parse_rider_value(&json!(null)), None);
+        assert_eq!(parse_rider_value(&json!(-1)), None);
+    }
+
+    #[test]
+    fn dispatch_body_accepts_all_three_shapes() {
+        let batch: DispatchBody =
+            serde_json::from_value(json!({"assignments":[{"rider_id":"r3","order_id":42}]}))
+                .unwrap();
+        assert_eq!(batch.into_items().len(), 1);
+
+        let single: DispatchBody =
+            serde_json::from_value(json!({"rider_id":3,"order_id":42,"reason":"顺路"})).unwrap();
+        let items = single.into_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].reason.as_deref(), Some("顺路"));
+
+        let list: DispatchBody = serde_json::from_value(
+            json!([{"rider_id":3,"order_id":1},{"rider_id":4,"order_id":2}]),
+        )
+        .unwrap();
+        assert_eq!(list.into_items().len(), 2);
+
+        assert!(serde_json::from_value::<DispatchBody>(json!({"note":"空的"})).is_err());
+    }
+
+    #[test]
+    fn token_takes_priority_over_allow_control() {
+        let auth = ApiAuth {
+            token: Some("s3cret".into()),
+            allow_control: true,
+        };
+        assert!(auth.check(&bearer("s3cret")).is_ok());
+        assert!(auth.check(&bearer("wrong")).is_err());
+        assert!(auth.check(&HeaderMap::new()).is_err());
+    }
+
+    #[test]
+    fn without_token_it_falls_back_to_allow_control() {
+        let open = ApiAuth {
+            token: None,
+            allow_control: true,
+        };
+        assert!(open.check(&HeaderMap::new()).is_ok());
+        let closed = ApiAuth {
+            token: None,
+            allow_control: false,
+        };
+        let err = closed.check(&HeaderMap::new()).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.code, "CONTROL_DISABLED");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_request_never_reaches_the_loop() {
+        let (tx, mut rx) = unbounded_channel();
+        let app = routes(ApiState {
+            inbound: tx,
+            auth: ApiAuth {
+                token: Some("s3cret".into()),
+                allow_control: false,
+            },
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(STATE_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(rx.try_recv().is_err(), "没通过鉴权就不该打扰主循环");
+    }
+
+    #[tokio::test]
+    async fn authorized_state_round_trips_into_inbound() {
+        let (tx, mut rx) = unbounded_channel();
+        let app = routes(ApiState {
+            inbound: tx,
+            auth: ApiAuth {
+                token: Some("s3cret".into()),
+                allow_control: false,
+            },
+        });
+        let app2 = app.clone();
+        let responder = tokio::spawn(async move {
+            if let Some(Inbound::Rpc { reply, .. }) = rx.recv().await {
+                let _ = reply.send(Ok(json!({"day": 1})));
+            }
+        });
+        let res = app2
+            .oneshot(
+                Request::builder()
+                    .uri(STATE_PATH)
+                    .header(AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["day"], 1);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_dispatch_is_rejected_before_queueing() {
+        let (tx, mut rx) = unbounded_channel();
+        let app = routes(ApiState {
+            inbound: tx,
+            auth: open_auth(),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(DISPATCH_PATH)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"assignments":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn rider_online_defaults_to_true() {
+        let (tx, mut rx) = unbounded_channel();
+        let app = routes(ApiState {
+            inbound: tx,
+            auth: open_auth(),
+        });
+        let responder = tokio::spawn(async move {
+            match rx.recv().await {
+                Some(Inbound::Rpc {
+                    req: RpcRequest::SetRiderOnline { rider_id, online },
+                    reply,
+                }) => {
+                    assert_eq!(rider_id, 5);
+                    assert!(online);
+                    let _ = reply.send(Ok(json!({"ok": true})));
+                }
+                other => panic!("收到了意料之外的入站消息：{other:?}"),
+            }
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/riders/5/online")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        responder.await.unwrap();
+    }
+}

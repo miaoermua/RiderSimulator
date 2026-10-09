@@ -1,0 +1,255 @@
+//! 模拟事件。tick 的唯一输出，由 net 层包装成协议事件下发。
+//!
+//! 序列化后正好是协议要求的形状：
+//! `{ "name": "order_broadcast", "payload": { ... } }`
+
+use serde::{Deserialize, Serialize};
+
+use super::{
+    OrderId, RiderId,
+    config::SimConfig,
+    order::Order,
+    rider::{Phase, Rider, RiderKind, SpeedMode},
+    weather::Weather,
+};
+
+/// 骑手对外快照。财务字段按角色决定是否填充。
+#[derive(Debug, Clone, Serialize)]
+pub struct RiderBrief {
+    pub id: RiderId,
+    /// 对外 id，形如 `r3`。
+    pub key: String,
+    pub name: String,
+    pub kind: RiderKind,
+    pub online: bool,
+    pub injured: bool,
+    pub frozen: bool,
+    pub speed_mode: SpeedMode,
+    pub level: u8,
+    pub rating: f32,
+    pub completed: u32,
+    pub held: Vec<OrderId>,
+    pub phase: Option<Phase>,
+    pub lat: f64,
+    pub lng: f64,
+    /// 只在推给本人 / 控制端时有值。
+    pub hourly_wage_cents: Option<i64>,
+    pub takehome_cents: Option<i64>,
+    pub cash_cents: Option<i64>,
+    pub fines_cents: Option<i64>,
+    /// 隐藏属性，只给控制端。
+    pub fatigue: Option<f32>,
+    pub expected_value_cents: Option<i64>,
+}
+
+impl RiderBrief {
+    fn base(r: &Rider, _cfg: &SimConfig, now_min: u64) -> Self {
+        let phase = r.held.first().map(|h| h.phase);
+        Self {
+            id: r.id,
+            key: crate::sim::rider_key(r.id),
+            name: r.name.clone(),
+            kind: r.kind,
+            online: r.online,
+            injured: r.is_injured(now_min),
+            frozen: r.is_frozen(now_min),
+            speed_mode: r.speed_mode,
+            level: r.level,
+            rating: r.rating,
+            completed: r.completed,
+            held: r.held_ids(),
+            phase,
+            lat: r.lat,
+            lng: r.lng,
+            hourly_wage_cents: None,
+            takehome_cents: None,
+            cash_cents: None,
+            fines_cents: None,
+            fatigue: None,
+            expected_value_cents: None,
+        }
+    }
+
+    /// 给其他骑手看的版本：**不含任何收入信息**（权限隔离在服务端做）。
+    pub fn public(r: &Rider, cfg: &SimConfig, now_min: u64) -> Self {
+        Self::base(r, cfg, now_min)
+    }
+
+    /// 给本人看的版本。
+    pub fn own(r: &Rider, cfg: &SimConfig, now_min: u64) -> Self {
+        let mut b = Self::base(r, cfg, now_min);
+        b.hourly_wage_cents = Some(r.hourly_wage_cents());
+        b.takehome_cents = Some(r.takehome_cents());
+        b.cash_cents = Some(r.cash_cents);
+        b.fines_cents = Some(r.fines_cents);
+        b
+    }
+
+    /// 给控制端看的版本。
+    pub fn control(r: &Rider, cfg: &SimConfig, now_min: u64) -> Self {
+        let mut b = Self::own(r, cfg, now_min);
+        b.fatigue = Some(r.fatigue);
+        if cfg.show_expected_value {
+            b.expected_value_cents = Some(r.expected_value_cents(cfg));
+        }
+        b
+    }
+}
+
+/// 日结流水。
+///
+/// 需要 `Deserialize` 是因为 `store` 会把它以 JSON 落库再读回来。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DayLedger {
+    pub rider_id: RiderId,
+    pub key: String,
+    pub name: String,
+    /// 到手（分）。
+    pub takehome_cents: i64,
+    pub gross_cents: i64,
+    pub fines_cents: i64,
+    pub insurance_cents: i64,
+    pub completed: u32,
+    pub late_count: u32,
+    pub online_minutes: u32,
+    pub hourly_wage_cents: i64,
+    pub rating: f32,
+    pub level: u8,
+    /// 欠款（分）。
+    pub debt_cents: i64,
+}
+
+/// AI 分配结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct AiAssignment {
+    pub order_id: OrderId,
+    pub rider_id: RiderId,
+    pub rider_key: String,
+    pub score: f32,
+    pub reason: String,
+}
+
+/// AI 决策来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionSource {
+    /// 贪心算法。
+    Algorithm,
+    /// 真 LLM 战术大脑。
+    Llm,
+    /// LLM 失败/被校验丢弃后回退到算法。
+    AlgorithmFallback,
+    /// 控制端手动指派。
+    Manual,
+}
+
+impl DecisionSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            DecisionSource::Algorithm => "算法贪心",
+            DecisionSource::Llm => "LLM 战术大脑",
+            DecisionSource::AlgorithmFallback => "LLM 失败，算法兜底",
+            DecisionSource::Manual => "控制端指派",
+        }
+    }
+}
+
+/// 模拟事件。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "name", content = "payload", rename_all = "snake_case")]
+pub enum SimEvent {
+    /// 时间推进。
+    Tick {
+        day: u32,
+        /// 当日 0:00 起算的模拟分钟。
+        sim_minute: u32,
+        /// 自开局起算的单调分钟。
+        elapsed_min: u64,
+        speed_multiplier: u32,
+    },
+    /// 新订单广播（含抢单窗口）。
+    OrderBroadcast {
+        order: Box<Order>,
+        window_ms: u64,
+        /// 顺路提示：与骑手当前手持单方向的夹角，由 net 层按人裁剪。
+        expires_in_ms: u64,
+    },
+    OrderClaimed {
+        order_id: OrderId,
+        rider_id: RiderId,
+        rider_name: String,
+        quoted_fee_cents: i64,
+        forced: bool,
+    },
+    OrderExpired {
+        order_id: OrderId,
+    },
+    OrderPickedUp {
+        order_id: OrderId,
+        rider_id: RiderId,
+        prep_minutes: u32,
+    },
+    OrderDelivered {
+        order_id: OrderId,
+        rider_id: RiderId,
+        rider_name: String,
+        late: bool,
+        takehome_cents: i64,
+        hourly_wage_cents: i64,
+    },
+    /// 骑手状态变化。`rider` 是**公开版**（不含收入），
+    /// net 层按收件人身份升级为本人版 / 控制端版。
+    RiderStateChanged {
+        rider_id: RiderId,
+        rider: Box<RiderBrief>,
+    },
+    /// 收入变动，只推给本人。
+    RiderFinance {
+        rider_id: RiderId,
+        delta_cents: i64,
+        kind: String,
+        reason: String,
+        takehome_cents: i64,
+        hourly_wage_cents: i64,
+    },
+    WeatherChanged {
+        weather: Weather,
+        label: &'static str,
+        speed_factor: f32,
+        rain_bonus_cents: i64,
+    },
+    FineIssued {
+        rider_id: RiderId,
+        kind: String,
+        amount_cents: i64,
+        reason: String,
+    },
+    /// 控制端手动改档 / 上下线等配置生效。
+    ConfigChanged {
+        speed_multiplier: u32,
+        commission_rate: f32,
+        weather: Weather,
+    },
+    /// AI 分配结果与理由。
+    AiDecision {
+        source: DecisionSource,
+        assignments: Vec<AiAssignment>,
+        note: String,
+    },
+    /// 任务对话（预设 / LLM 裁决）。
+    TaskMessage {
+        order_id: OrderId,
+        /// `customer` | `rider` | `system`
+        from: &'static str,
+        text: String,
+        step: usize,
+        task_id: String,
+    },
+    /// 日结。
+    DayClosed {
+        day: u32,
+        ledgers: Vec<DayLedger>,
+        total_takehome_cents: i64,
+        total_orders: u32,
+    },
+}

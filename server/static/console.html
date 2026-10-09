@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>烽火台 · 骑手模拟器控制台</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root {
+    --bg: #0f1218; --panel: #171b23; --line: #262c38; --text: #e6e9ef; --muted: #8a93a6;
+    --accent: #ff7a1a; --ok: #2ecc71; --warn: #f5b041; --bad: #e74c3c; --blue: #3d8bfd;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.45 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  button, select, input { font: inherit; color: inherit; }
+  button { background: #222836; border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.on { background: var(--accent); border-color: var(--accent); color: #111; }
+  button:disabled { opacity: .4; cursor: default; }
+  select, input[type=text], input[type=password], input[type=number] {
+    background: #10141b; border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+
+  #app { display: grid; grid-template-rows: 48px 1fr; height: 100%; }
+  header { display: flex; align-items: center; gap: 16px; padding: 0 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; color: var(--accent); letter-spacing: 2px; }
+  .clock { font-size: 20px; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .chip { padding: 2px 8px; border-radius: 10px; background: #222836; color: var(--muted); }
+  .chip.ok { color: var(--ok); } .chip.bad { color: var(--bad); } .chip.warn { color: var(--warn); }
+  header .grow { flex: 1; }
+  .speeds button { padding: 3px 8px; }
+
+  main { display: grid; grid-template-columns: 1fr 420px; min-height: 0; }
+  #map { height: 100%; background: #1b1f27; }
+  aside { display: grid; grid-template-rows: auto 1fr; min-height: 0; background: var(--panel); border-left: 1px solid var(--line); }
+  .tabs { display: flex; border-bottom: 1px solid var(--line); }
+  .tabs button { flex: 1; border: 0; border-radius: 0; background: none; padding: 10px 0; color: var(--muted); }
+  .tabs button.on { color: var(--accent); box-shadow: inset 0 -2px var(--accent); }
+  .pane { overflow: auto; padding: 12px; display: none; }
+  .pane.on { display: block; }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 12px; }
+  .stat { background: #10141b; border-radius: 6px; padding: 6px 8px; }
+  .stat b { display: block; font-size: 16px; }
+  .stat span { color: var(--muted); font-size: 11px; }
+
+  .card { background: #10141b; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+  .card.sel { border-color: var(--accent); }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .row .grow { flex: 1; min-width: 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 11px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
+  .bar { height: 4px; background: #262c38; border-radius: 2px; overflow: hidden; margin-top: 4px; }
+  .bar i { display: block; height: 100%; }
+  .tag { font-size: 11px; padding: 0 6px; border-radius: 8px; background: #262c38; color: var(--muted); }
+  .tag.ai { color: var(--blue); } .tag.human { color: var(--accent); }
+  .tag.bad { color: var(--bad); } .tag.warn { color: var(--warn); }
+  h3 { margin: 14px 0 8px; font-size: 13px; color: var(--muted); font-weight: 500; }
+  h3:first-child { margin-top: 0; }
+
+  .set { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px dashed var(--line); }
+  .set label { color: var(--text); }
+  .set .hint { display: block; color: var(--muted); font-size: 11px; }
+  .switch { width: 40px; height: 22px; border-radius: 11px; background: #333a48; position: relative; cursor: pointer; border: 0; padding: 0; }
+  .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #c9cfdb; transition: left .15s; }
+  .switch.on { background: var(--accent); }
+  .switch.on::after { left: 21px; background: #fff; }
+  .num { display: flex; align-items: center; gap: 4px; }
+  .num b { min-width: 28px; text-align: center; font-variant-numeric: tabular-nums; }
+
+  #log .item { padding: 4px 0; border-bottom: 1px solid #1d222c; font-size: 12px; }
+  #log .t { color: var(--muted); margin-right: 6px; font-variant-numeric: tabular-nums; }
+
+  #login { position: fixed; inset: 0; background: rgba(8,10,14,.85); display: flex; align-items: center; justify-content: center; z-index: 2000; }
+  #login .box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 24px; width: 360px; }
+  #login h2 { margin: 0 0 4px; color: var(--accent); }
+  #login p { color: var(--muted); margin: 0 0 16px; font-size: 12px; }
+  #login input { width: 100%; margin-bottom: 12px; padding: 8px 10px; }
+  #login button { width: 100%; padding: 8px; background: var(--accent); color: #111; border: 0; font-weight: 600; }
+  #login .err { color: var(--bad); min-height: 18px; font-size: 12px; }
+
+  #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: #222836; border: 1px solid var(--line);
+    padding: 8px 14px; border-radius: 8px; display: none; z-index: 3000; }
+  #toast.bad { border-color: var(--bad); color: var(--bad); }
+
+  .rider-icon { display: flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 50%;
+    border: 2px solid #fff; color: #fff; font-size: 11px; font-weight: 700; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
+  .rider-icon.off { opacity: .45; filter: grayscale(1); }
+  .rider-label { background: rgba(15,18,24,.85); color: #fff; border: 0; box-shadow: none; padding: 1px 5px; font-size: 11px; }
+  .rider-label::before { display: none; }
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--panel); color: var(--text); }
+  .leaflet-popup-content { margin: 10px 12px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>烽火台</h1>
+    <div class="clock" id="clock">第 - 天 --:--</div>
+    <span class="chip" id="weather">天气 -</span>
+    <span class="chip" id="peak"></span>
+    <div class="speeds" id="speeds"></div>
+    <button id="pause">暂停</button>
+    <div class="grow"></div>
+    <span class="chip" id="role">未连接</span>
+    <span class="chip" id="conn">离线</span>
+  </header>
+  <main>
+    <div id="map"></div>
+    <aside>
+      <div class="tabs" id="tabs">
+        <button data-tab="riders" class="on">骑手</button>
+        <button data-tab="orders">订单</button>
+        <button data-tab="settings">设置</button>
+        <button data-tab="log">日志</button>
+      </div>
+      <div style="min-height:0; display:grid;">
+        <section class="pane on" id="pane-riders">
+          <div class="stats" id="stats"></div>
+          <div id="riders"></div>
+        </section>
+        <section class="pane" id="pane-orders">
+          <h3>大厅待抢 <span class="muted" id="hall-count"></span></h3>
+          <div id="hall"></div>
+          <h3>在跑 <span class="muted" id="active-count"></span></h3>
+          <div id="active"></div>
+        </section>
+        <section class="pane" id="pane-settings">
+          <div id="settings"></div>
+        </section>
+        <section class="pane" id="pane-log">
+          <div id="log"></div>
+        </section>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<div id="login">
+  <div class="box">
+    <h2>烽火台</h2>
+    <p>服务端启动时设置 <code>RIDER_SIM_CONTROL_TOKEN</code>，在这里填同一个令牌。<br>
+       开发环境开了 <code>RIDER_SIM_ALLOW_CONTROL=true</code> 时可以留空。</p>
+    <input id="token" type="password" placeholder="控制端令牌（可留空）" autocomplete="current-password">
+    <div class="err" id="login-err"></div>
+    <button id="connect">进入</button>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const PROTOCOL_VERSION = "1.0";
+const SPEEDS = [1, 2, 4, 8, 10, 60];
+const WEATHERS = [
+  ["clear", "晴"], ["cloudy", "多云"], ["overcast", "阴"], ["fog", "雾"], ["light_rain", "小雨"],
+  ["moderate_rain", "中雨"], ["heavy_rain", "大雨"], ["windy", "大风"], ["snow", "雪"], ["rainstorm", "暴雨"],
+];
+const PHASE = { to_shop: "去商家", waiting_food: "等餐", to_customer: "送餐中", arrived_customer: "已到顾客" };
+const PHASE_COLOR = { to_shop: "#3d8bfd", waiting_food: "#f5b041", to_customer: "#2ecc71", arrived_customer: "#9b59b6" };
+const STATUS = { pending: "待抢", assigned: "已接单", picked_up: "配送中", delivered: "已送达", late: "超时", expired: "流单", cancelled: "取消" };
+
+const S = {
+  ws: null, token: "", role: null, snap: null, info: null,
+  riders: new Map(), selected: null, lastResync: 0, retry: 0, mapFitted: false,
+};
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const yuan = (c) => c == null ? "-" : (c / 100).toFixed(2);
+const hhmm = (m) => `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+const isControl = () => S.role === "control";
+
+function toast(msg, bad) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = bad ? "bad" : "";
+  t.style.display = "block";
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => (t.style.display = "none"), 2500);
+}
+
+function log(msg) {
+  const box = $("log");
+  const el = document.createElement("div");
+  el.className = "item";
+  const now = S.snap ? hhmm(S.snap.sim_minute) : "--:--";
+  el.innerHTML = `<span class="t">${now}</span>${msg}`;
+  box.prepend(el);
+  while (box.childElementCount > 300) box.lastChild.remove();
+}
+
+// ---------------- 连接 ----------------
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  S.ws = ws;
+  setConn("连接中", "warn");
+  ws.onopen = () => {
+    const hello = { type: "hello", protocol_version: PROTOCOL_VERSION };
+    if (S.token) hello.token = `control:${S.token}`;
+    ws.send(JSON.stringify(hello));
+  };
+  ws.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    onEvent(msg.event, msg.payload || {});
+  };
+  ws.onclose = () => {
+    setConn("离线", "bad");
+    if (S.ws !== ws) return;
+    S.retry = Math.min(S.retry + 1, 5);
+    setTimeout(connect, 1000 * S.retry);
+  };
+}
+
+function send(type, fields = {}) {
+  if (!S.ws || S.ws.readyState !== 1) return toast("未连接", true);
+  S.ws.send(JSON.stringify({ type, ...fields }));
+}
+
+function setConn(text, cls) {
+  const c = $("conn");
+  c.textContent = text;
+  c.className = `chip ${cls}`;
+}
+
+function resync() {
+  S.lastResync = performance.now();
+  send("resync");
+}
+
+// ---------------- 事件 ----------------
+
+function onEvent(name, p) {
+  switch (name) {
+    case "welcome":
+      S.role = p.role;
+      S.retry = 0;
+      setConn("在线", "ok");
+      $("role").textContent = { control: "控制端", spectator: "观战（只读）", rider: "骑手" }[p.role] || p.role;
+      $("role").className = `chip ${p.role === "control" ? "ok" : "warn"}`;
+      $("login").style.display = "none";
+      if (p.role !== "control") toast("没拿到控制权，只能观战。检查令牌或 RIDER_SIM_ALLOW_CONTROL。", true);
+      if (p.snapshot) applySnapshot(p.snapshot);
+      break;
+    case "snapshot":
+      applySnapshot(p);
+      break;
+    case "server_info":
+      S.info = p;
+      renderSettings();
+      break;
+    case "tick":
+      if (!S.snap) break;
+      Object.assign(S.snap, { day: p.day, sim_minute: p.sim_minute, elapsed_min: p.elapsed_min });
+      S.snap.config.speed_multiplier = p.speed_multiplier;
+      renderHeader();
+      // 骑手位置只在快照里完整，按墙钟节流拉新快照
+      if (performance.now() - S.lastResync > 1000) resync();
+      break;
+    case "rider_state_changed":
+      if (p.rider) {
+        S.riders.set(p.rider_id, { ...S.riders.get(p.rider_id), ...stripNulls(p.rider) });
+        renderRiders();
+        drawMap();
+      }
+      break;
+    case "order_broadcast":
+      log(`新单 #${p.order.id} ${esc(p.order.merchant_name)} → ${esc(p.order.customer_address)}，报价 ${yuan(p.order.fee.quoted_fee_cents)}`);
+      break;
+    case "order_claimed":
+      log(`#${p.order_id} 被 <b>${esc(p.rider_name)}</b> ${p.forced ? "强制指派" : "抢到"}（${yuan(p.quoted_fee_cents)}）`);
+      break;
+    case "order_expired":
+      log(`<span class="muted">#${p.order_id} 无人接，流单</span>`);
+      break;
+    case "order_picked_up":
+      log(`#${p.order_id} 已取货（出餐 ${p.prep_minutes} 分钟）`);
+      break;
+    case "order_delivered":
+      log(`#${p.order_id} ${esc(p.rider_name)} 送达${p.late ? ' <span class="tag bad">超时</span>' : ""}，到手 ${yuan(p.takehome_cents)}`);
+      break;
+    case "weather_changed":
+      log(`天气变为 <b>${esc(p.label)}</b>`);
+      resync();
+      break;
+    case "fine_issued":
+      log(`<span class="tag bad">罚款</span> ${riderName(p.rider_id)} ${esc(p.reason)} -${yuan(p.amount_cents)}`);
+      break;
+    case "config_changed":
+      resync();
+      break;
+    case "ai_decision":
+      if (p.note) log(`<span class="tag ai">${esc(p.source)}</span> ${esc(p.note)}`);
+      break;
+    case "task_message":
+      log(`任务 #${p.order_id} [${esc(p.from)}] ${esc(p.text)}`);
+      break;
+    case "day_closed":
+      log(`<b>第 ${p.day} 天结束</b>：${p.total_orders} 单，骑手合计到手 ${yuan(p.total_takehome_cents)}`);
+      break;
+    case "ack":
+      if (!p.ok) toast(`${p.action} 失败：${p.message || p.code}`, true);
+      else if (p.action !== "resync") {
+        toast(`${p.action} 成功`);
+        if (p.action === "set_config" && p.data && S.snap) { S.snap.config = p.data; renderSettings(); }
+        resync();
+      }
+      break;
+    case "error":
+      $("login-err").textContent = p.message || p.code;
+      toast(`${p.code}：${p.message}`, true);
+      if (p.code === "UNAUTHORIZED") { S.ws.onclose = null; S.ws = null; $("login").style.display = "flex"; setConn("离线", "bad"); }
+      break;
+  }
+}
+
+function stripNulls(o) {
+  const out = {};
+  for (const [k, v] of Object.entries(o)) if (v !== null && v !== undefined) out[k] = v;
+  return out;
+}
+
+function applySnapshot(snap) {
+  S.snap = snap;
+  S.riders = new Map(snap.riders.map((r) => [r.id, r]));
+  renderAll();
+}
+
+function riderName(id) {
+  const r = S.riders.get(id);
+  return r ? esc(r.name) : `#${id}`;
+}
+
+// ---------------- 地图 ----------------
+
+const map = L.map("map", { zoomControl: true, attributionControl: true }).setView([30.66, 104.06], 13);
+// 高德瓦片，坐标系 GCJ-02，和服务端的高德坐标一致，不需要纠偏
+L.tileLayer("https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}", {
+  subdomains: "1234", maxZoom: 18, attribution: "© 高德地图",
+}).addTo(map);
+
+const layers = {
+  merchants: L.layerGroup().addTo(map),
+  routes: L.layerGroup().addTo(map),
+  hall: L.layerGroup().addTo(map),
+  riders: L.layerGroup().addTo(map),
+};
+L.control.layers(null, { "商户": layers.merchants, "配送路线": layers.routes, "大厅单": layers.hall, "骑手": layers.riders }, { collapsed: true }).addTo(map);
+const riderMarkers = new Map();
+
+function riderColor(r) {
+  if (!r.online) return "#555";
+  if (r.injured) return "#e74c3c";
+  if (r.frozen) return "#7f8c8d";
+  return r.phase ? PHASE_COLOR[r.phase] : (r.kind === "human" ? "#ff7a1a" : "#8a93a6");
+}
+
+function drawMap() {
+  if (!S.snap) return;
+  if (!S.mapFitted && S.snap.merchants.length) {
+    map.fitBounds(S.snap.merchants.map((m) => [m.lat, m.lng]), { padding: [30, 30] });
+    S.mapFitted = true;
+    layers.merchants.clearLayers();
+    for (const m of S.snap.merchants) {
+      L.circleMarker([m.lat, m.lng], { radius: 4, color: "#ff7a1a", weight: 1, fillOpacity: .6 })
+        .bindTooltip(`${esc(m.name)}<br><span class="small">${esc(m.signature)} · 出餐约 ${m.avg_prep_min} 分</span>`)
+        .addTo(layers.merchants);
+    }
+  }
+
+  layers.routes.clearLayers();
+  for (const o of S.snap.active_orders) {
+    const r = S.riders.get(o.assigned_to);
+    const color = r && r.phase ? PHASE_COLOR[r.phase] : "#3d8bfd";
+    const pts = [[o.merchant_lat, o.merchant_lng], [o.customer_lat, o.customer_lng]];
+    if (r && o.status === "assigned") pts.unshift([r.lat, r.lng]);
+    if (r && o.status === "picked_up") pts.splice(0, 1, [r.lat, r.lng]);
+    L.polyline(pts, { color, weight: 2, opacity: .7, dashArray: o.status === "assigned" ? "4 6" : null }).addTo(layers.routes);
+    L.circleMarker([o.customer_lat, o.customer_lng], { radius: 4, color, weight: 2, fillColor: "#fff", fillOpacity: 1 })
+      .bindTooltip(`#${o.id} ${esc(o.customer_name)}<br>${esc(o.customer_address)}`).addTo(layers.routes);
+  }
+
+  layers.hall.clearLayers();
+  for (const o of S.snap.hall) {
+    L.circleMarker([o.merchant_lat, o.merchant_lng], { radius: 8, color: "#f5b041", weight: 2, fillOpacity: .25 })
+      .bindTooltip(`待抢 #${o.id} ${esc(o.merchant_name)}<br>报价 ${yuan(o.fee.quoted_fee_cents)} · ${(o.distance_m / 1000).toFixed(1)}km`)
+      .addTo(layers.hall);
+  }
+
+  const seen = new Set();
+  for (const r of S.riders.values()) {
+    seen.add(r.id);
+    const icon = L.divIcon({
+      className: "",
+      html: `<div class="rider-icon ${r.online ? "" : "off"}" style="background:${riderColor(r)}">${r.kind === "human" ? "人" : "AI"}</div>`,
+      iconSize: [26, 26], iconAnchor: [13, 13],
+    });
+    let m = riderMarkers.get(r.id);
+    if (!m) {
+      m = L.marker([r.lat, r.lng], { icon })
+        .bindTooltip(esc(r.name), { permanent: true, direction: "right", offset: [12, 0], className: "rider-label" })
+        .on("click", () => selectRider(r.id))
+        .addTo(layers.riders);
+      riderMarkers.set(r.id, m);
+    } else {
+      m.setLatLng([r.lat, r.lng]);
+      m.setIcon(icon);
+    }
+  }
+  for (const [id, m] of riderMarkers) if (!seen.has(id)) { m.remove(); riderMarkers.delete(id); }
+}
+
+function selectRider(id) {
+  S.selected = S.selected === id ? null : id;
+  switchTab("riders");
+  renderRiders();
+  const r = S.riders.get(id);
+  if (S.selected && r) map.panTo([r.lat, r.lng]);
+  const el = document.querySelector(`[data-rider="${id}"]`);
+  if (el) el.scrollIntoView({ block: "nearest" });
+}
+
+// ---------------- 渲染 ----------------
+
+function renderAll() {
+  renderHeader();
+  renderStats();
+  renderRiders();
+  renderOrders();
+  renderSettings();
+  drawMap();
+}
+
+function renderHeader() {
+  const s = S.snap;
+  if (!s) return;
+  $("clock").textContent = `第 ${s.day} 天 ${hhmm(s.sim_minute)}`;
+  $("weather").textContent = `${s.weather_label} ×${s.weather_speed_factor.toFixed(2)}${s.rain_bonus_cents ? ` 雨补 ${yuan(s.rain_bonus_cents)}` : ""}`;
+  const c = s.config;
+  $("peak").textContent = c.is_peak ? `高峰 ×${c.surge_multiplier.toFixed(1)}` : "平峰";
+  $("peak").className = `chip ${c.is_peak ? "warn" : ""}`;
+  $("speeds").innerHTML = SPEEDS.map((v) =>
+    `<button data-speed="${v}" class="${!c.paused && c.speed_multiplier === v ? "on" : ""}" ${isControl() ? "" : "disabled"}>${v}x</button>`).join(" ");
+  $("pause").textContent = c.paused ? "继续" : "暂停";
+  $("pause").className = c.paused ? "on" : "";
+  $("pause").disabled = !isControl();
+}
+
+function renderStats() {
+  const st = S.snap.stats;
+  const online = [...S.riders.values()].filter((r) => r.online).length;
+  const busy = [...S.riders.values()].filter((r) => r.held && r.held.length).length;
+  const items = [
+    [`${online}/${S.riders.size}`, "在线骑手"], [busy, "配送中"], [S.snap.hall.length, "大厅待抢"], [S.snap.active_orders.length, "在跑订单"],
+    [st.orders_created, "累计生成"], [st.orders_delivered, "已送达"], [st.orders_late, "超时"], [st.orders_expired, "流单"],
+  ];
+  $("stats").innerHTML = items.map(([v, k]) => `<div class="stat"><b>${v}</b><span>${k}</span></div>`).join("");
+}
+
+function renderRiders() {
+  if (!S.snap) return;
+  renderStats();
+  const list = [...S.riders.values()].sort((a, b) => (b.online - a.online) || (a.kind > b.kind ? 1 : -1) || a.id - b.id);
+  $("riders").innerHTML = list.map((r) => {
+    const tags = [
+      `<span class="tag ${r.kind === "human" ? "human" : "ai"}">${r.kind === "human" ? "真人" : "AI"}</span>`,
+      r.online ? "" : `<span class="tag">离线</span>`,
+      r.injured ? `<span class="tag bad">受伤</span>` : "",
+      r.frozen ? `<span class="tag bad">冻结</span>` : "",
+      r.speed_mode !== "compliant" ? `<span class="tag warn">${r.speed_mode === "tolerant" ? "超速" : "解限速"}</span>` : "",
+    ].join(" ");
+    const orders = (r.held || []).map((id) => {
+      const o = S.snap.active_orders.find((x) => x.id === id);
+      if (!o) return `<div class="small muted">#${id}</div>`;
+      const left = o.created_at_min + o.promised_minutes - S.snap.elapsed_min;
+      return `<div class="small">#${o.id} ${esc(o.merchant_name)} → ${esc(o.customer_address)}
+        <span class="${left < 0 ? "tag bad" : left < 10 ? "tag warn" : "muted"}">${left < 0 ? `超时 ${-left} 分` : `剩 ${left} 分`}</span></div>`;
+    }).join("");
+    const fatigue = r.fatigue ?? 0;
+    const fcolor = fatigue > 70 ? "var(--bad)" : fatigue > 40 ? "var(--warn)" : "var(--ok)";
+    return `<div class="card ${S.selected === r.id ? "sel" : ""}" data-rider="${r.id}">
+      <div class="row">
+        <span class="dot" style="background:${riderColor(r)}"></span>
+        <div class="grow"><b>${esc(r.name)}</b> <span class="muted small">${esc(r.key)} · Lv${r.level} · ★${r.rating.toFixed(2)} · ${r.completed} 单</span></div>
+        <button data-online="${r.id}" data-to="${!r.online}" ${isControl() ? "" : "disabled"}>${r.online ? "下线" : "上线"}</button>
+      </div>
+      <div class="small" style="margin:4px 0">${tags} ${r.phase ? `<span class="tag" style="color:${PHASE_COLOR[r.phase]}">${PHASE[r.phase]}</span>` : ""}</div>
+      ${S.selected === r.id || (r.held && r.held.length) ? orders : ""}
+      <div class="row small muted" style="margin-top:4px">
+        <span>时薪 <b style="color:var(--text)">${yuan(r.hourly_wage_cents)}</b></span>
+        <span>到手 ${yuan(r.takehome_cents)}</span>
+        <span>罚款 ${yuan(r.fines_cents)}</span>
+        <span>期望 ${yuan(r.expected_value_cents)}</span>
+      </div>
+      ${r.fatigue != null ? `<div class="small muted" style="margin-top:4px">疲劳 ${fatigue.toFixed(0)}</div><div class="bar"><i style="width:${Math.min(100, fatigue)}%;background:${fcolor}"></i></div>` : ""}
+    </div>`;
+  }).join("") || `<div class="muted">还没有骑手</div>`;
+}
+
+function renderOrders() {
+  const s = S.snap;
+  const candidates = [...S.riders.values()].filter((r) => r.online && !r.injured && !r.frozen);
+  $("hall-count").textContent = s.hall.length;
+  $("hall").innerHTML = s.hall.map((o) => {
+    const ttl = Number(o.claim_deadline_min) - s.elapsed_min;
+    return `<div class="card">
+      <div class="row"><div class="grow"><b>#${o.id}</b> ${esc(o.merchant_name)} <span class="muted">→ ${esc(o.customer_address)}</span></div>
+        <b style="color:var(--accent)">${yuan(o.fee.quoted_fee_cents)}</b></div>
+      <div class="small muted">${(o.distance_m / 1000).toFixed(1)}km · 承诺 ${o.promised_minutes} 分 · 抽水 ${yuan(o.fee.commission_cents)}${o.task ? ` · <span class="tag warn">任务：${esc(o.task.name)}</span>` : ""}${ttl >= 0 ? ` · 窗口剩 ${ttl} 分` : ""}</div>
+      ${isControl() ? `<div class="row" style="margin-top:6px">
+        <select data-assign-sel="${o.id}" class="grow">${candidates.map((r) => `<option value="${r.id}">${esc(r.name)}（${(r.held || []).length} 单）</option>`).join("")}</select>
+        <button data-assign="${o.id}" ${candidates.length ? "" : "disabled"}>强制指派</button></div>` : ""}
+    </div>`;
+  }).join("") || `<div class="muted small">大厅是空的</div>`;
+
+  $("active-count").textContent = s.active_orders.length;
+  $("active").innerHTML = s.active_orders.map((o) => {
+    const left = o.created_at_min + o.promised_minutes - s.elapsed_min;
+    return `<div class="card">
+      <div class="row"><div class="grow"><b>#${o.id}</b> ${esc(o.merchant_name)} <span class="muted">→ ${esc(o.customer_address)}</span></div>
+        <span class="${left < 0 ? "tag bad" : left < 10 ? "tag warn" : "tag"}">${left < 0 ? `超时 ${-left} 分` : `剩 ${left} 分`}</span></div>
+      <div class="small muted">${STATUS[o.status] || o.status} · 骑手 ${riderName(o.assigned_to)} · ${(o.distance_m / 1000).toFixed(1)}km · 到手 ${yuan(o.fee.takehome_cents)}
+        ${o.forced ? '<span class="tag warn">强制</span>' : ""}${o.back_order ? '<span class="tag">背单</span>' : ""}${o.urge_count ? `<span class="tag bad">催 ${o.urge_count}</span>` : ""}</div>
+    </div>`;
+  }).join("") || `<div class="muted small">没有在跑的单</div>`;
+}
+
+const SWITCHES = [
+  ["ai_batch_enabled", "AI 批量调度", "算法统一给 AI 骑手派单；关掉后 AI 只抢单"],
+  ["allow_speeding", "允许超速", "骑手可切到 45km/h 档"],
+  ["allow_unrestricted", "允许解除限速", "关闭时已在该档的骑手会被降回合规"],
+  ["backorder_enabled", "允许背单", "顺路时可以同时揣多单"],
+  ["discriminative_commission", "歧视性抽水", "按骑手画像差别抽成"],
+  ["show_expected_value", "给骑手显示期望值", ""],
+];
+
+function renderSettings() {
+  if (!S.snap) return;
+  const c = S.snap.config;
+  const dis = isControl() ? "" : "disabled";
+  const llm = S.info ? S.info.llm_enabled : c.llm_brain_enabled;
+  const sw = (key, on) => `<button class="switch ${on ? "on" : ""}" data-cfg="${key}" data-val="${!on}" ${dis}></button>`;
+  const num = (key, val, min, max, step = 1) => `<div class="num">
+    <button data-num="${key}" data-val="${Math.max(min, val - step)}" ${dis}>-</button><b>${val}</b>
+    <button data-num="${key}" data-val="${Math.min(max, val + step)}" ${dis}>+</button></div>`;
+
+  $("settings").innerHTML = `
+    ${isControl() ? "" : `<div class="card" style="color:var(--warn)">当前是观战身份，设置只读。</div>`}
+    <h3>AI</h3>
+    <div class="set"><label>AI 骑手数量<span class="hint">0~8；减少时手上有单的先跑完</span></label>${num("sim_rider_count", c.sim_rider_count, 0, 8)}</div>
+    <div class="set"><label>LLM 战术大脑<span class="hint">${S.info ? `今日调用 ${S.info.brain_calls_today ?? 0}/${S.info.brain_max_calls_per_day ?? "-"}${S.info.brain_note ? ` · ${esc(S.info.brain_note)}` : ""}` : "无 Key 时自动退回算法"}</span></label>
+      <button class="switch ${llm ? "on" : ""}" data-llm="${!llm}" ${dis}></button></div>
+    ${SWITCHES.slice(0, 1).map(([k, n, h]) => `<div class="set"><label>${n}<span class="hint">${h}</span></label>${sw(k, c[k])}</div>`).join("")}
+
+    <h3>世界</h3>
+    <div class="set"><label>天气</label>
+      <select id="weather-sel" ${dis}>${WEATHERS.map(([v, n]) => `<option value="${v}" ${S.snap.weather === v ? "selected" : ""}>${n}</option>`).join("")}</select></div>
+    <div class="set"><label>平台抽水<span class="hint">0%~30%，只抽配送费</span></label>
+      <div class="num"><input type="range" id="commission" min="0" max="30" step="1" value="${Math.round(c.commission_rate * 100)}" ${dis}><b id="commission-v">${Math.round(c.commission_rate * 100)}%</b></div></div>
+    <div class="set"><label>每日单量上限<span class="hint">0 = 不限</span></label>
+      <div class="num"><input type="number" id="max-orders" min="0" style="width:80px" value="${c.max_orders_per_day}" ${dis}></div></div>
+    <div class="set"><label>世界种子</label><span class="muted">${c.seed}</span></div>
+
+    <h3>规则</h3>
+    <div class="set"><label>抢单窗口（秒）</label>${num("claim_window_secs", c.claim_window_secs, 1, 10)}</div>
+    <div class="set"><label>背单上限</label>${num("backorder_max", c.backorder_max, 1, 5)}</div>
+    ${SWITCHES.slice(1).map(([k, n, h]) => `<div class="set"><label>${n}${h ? `<span class="hint">${h}</span>` : ""}</label>${sw(k, c[k])}</div>`).join("")}
+
+    ${S.info && S.info.hub ? `<h3>服务器</h3><div class="small muted">${esc(JSON.stringify(S.info.hub))}</div>` : ""}
+  `;
+}
+
+function switchTab(name) {
+  for (const b of $("tabs").children) b.classList.toggle("on", b.dataset.tab === name);
+  for (const p of document.querySelectorAll(".pane")) p.classList.toggle("on", p.id === `pane-${name}`);
+}
+
+// ---------------- 交互 ----------------
+
+$("tabs").addEventListener("click", (e) => { if (e.target.dataset.tab) switchTab(e.target.dataset.tab); });
+$("speeds").addEventListener("click", (e) => {
+  const v = e.target.dataset.speed;
+  if (!v) return;
+  if (S.snap.config.paused) send("set_paused", { paused: false });
+  send("set_speed_multiplier", { multiplier: Number(v) });
+});
+$("pause").addEventListener("click", () => send("set_paused", { paused: !S.snap.config.paused }));
+
+$("riders").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-online]");
+  if (b) return send("set_rider_online", { rider_id: Number(b.dataset.online), online: b.dataset.to === "true" });
+  const card = e.target.closest("[data-rider]");
+  if (card) selectRider(Number(card.dataset.rider));
+});
+
+$("hall").addEventListener("click", (e) => {
+  const id = e.target.dataset.assign;
+  if (!id) return;
+  const sel = document.querySelector(`[data-assign-sel="${id}"]`);
+  send("force_assign", { order_id: Number(id), rider_id: Number(sel.value) });
+});
+
+$("settings").addEventListener("click", (e) => {
+  const t = e.target;
+  if (t.disabled) return;
+  if (t.dataset.cfg) send("set_config", { [t.dataset.cfg]: t.dataset.val === "true" });
+  else if (t.dataset.num) send("set_config", { [t.dataset.num]: Number(t.dataset.val) });
+  else if (t.dataset.llm) send("set_llm_enabled", { enabled: t.dataset.llm === "true" });
+});
+$("settings").addEventListener("input", (e) => {
+  if (e.target.id === "commission") $("commission-v").textContent = `${e.target.value}%`;
+});
+$("settings").addEventListener("change", (e) => {
+  const t = e.target;
+  if (t.id === "weather-sel") send("set_weather", { weather: t.value });
+  else if (t.id === "commission") send("set_commission_rate", { rate: Number(t.value) / 100 });
+  else if (t.id === "max-orders") send("set_config", { max_orders_per_day: Math.max(0, Number(t.value) || 0) });
+});
+
+function login() {
+  S.token = $("token").value.trim();
+  $("login-err").textContent = "";
+  sessionStorage.setItem("fh_token", S.token);
+  if (S.ws) { S.ws.onclose = null; S.ws.close(); }
+  connect();
+}
+$("connect").addEventListener("click", login);
+$("token").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
+$("token").value = sessionStorage.getItem("fh_token") || "";
+
+// 窗口内的倒计时随时间变化，靠快照刷新；订单列表只在快照到来时重画以免打断下拉框
+const _apply = applySnapshot;
+</script>
+</body>
+</html>

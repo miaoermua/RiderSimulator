@@ -1,0 +1,12 @@
+{
+  "day": "随机",
+  "_note": "按模拟分钟（当日 0:00 起算）推进天气；时刻必须严格递增。开局是 6:00。",
+  "events": [
+    { "at": 420,  "to": "cloudy" },
+    { "at": 600,  "to": "light_rain" },
+    { "at": 720,  "to": "heavy_rain" },
+    { "at": 900,  "to": "moderate_rain" },
+    { "at": 1080, "to": "overcast" },
+    { "at": 1200, "to": "clear" }
+  ]
+}

@@ -1,0 +1,190 @@
+//! 订单：生命周期、费用构成、评分门槛分层。
+
+use serde::{Deserialize, Serialize};
+
+use super::{OrderId, RiderId, geo::LatLng};
+
+/// 订单状态。协议里必须是**字符串**，不用数字。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStatus {
+    /// 大厅里等人抢。
+    Pending,
+    /// 已抢 / 已指派。
+    Assigned,
+    /// 已取货，配送中。
+    PickedUp,
+    /// 已送达。
+    Delivered,
+    /// 送达超时（仍算完成，但扣钱掉分）。
+    Late,
+    /// 抢单窗口内无人接。
+    Expired,
+    /// 主动取消。
+    Cancelled,
+}
+
+impl OrderStatus {
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            OrderStatus::Pending | OrderStatus::Assigned | OrderStatus::PickedUp
+        )
+    }
+    pub fn is_finished(self) -> bool {
+        !self.is_active()
+    }
+}
+
+/// 评分门槛分层（玩法设计 §8.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderTier {
+    /// ≥4.6 可抢普通单。
+    Normal,
+    /// ≥4.8 可抢优质单（距离远、单价高）。
+    Premium,
+    /// ≥4.9 可抢急单（加价 30%）。
+    Express,
+}
+
+/// 费用明细，全部「分」。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct FeeBreakdown {
+    pub base_fee_cents: i64,
+    pub distance_extra_cents: i64,
+    pub rain_bonus_cents: i64,
+    pub level_bonus_cents: i64,
+    pub surge_multiplier: f32,
+    /// 平台抽水（只抽配送费，不抽雨补）。
+    pub commission_cents: i64,
+    /// 抢单时展示的报价 = 各项之和。
+    pub quoted_fee_cents: i64,
+    /// 到手 = 报价 - 抽水。
+    pub takehome_cents: i64,
+}
+
+/// 订单携带的附加任务（玩法设计 §6）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtraTask {
+    pub id: String,
+    pub name: String,
+    pub step: usize,
+    pub done: bool,
+    pub failed: bool,
+    pub reward_cents: i64,
+    pub penalty_cents: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Order {
+    pub id: OrderId,
+    pub merchant_id: u32,
+    pub merchant_name: String,
+    pub merchant_lat: f64,
+    pub merchant_lng: f64,
+
+    pub customer_name: String,
+    pub customer_address: String,
+    pub remark: String,
+    pub customer_lat: f64,
+    pub customer_lng: f64,
+
+    /// 路线距离，整数米。
+    pub distance_m: u32,
+    pub promised_minutes: u32,
+    pub tier: OrderTier,
+
+    /// 生成时刻（自开局起算的模拟分钟，单调）。
+    pub created_at_min: u64,
+    /// 抢单窗口截止（tick 数换算，见 SimConfig::claim_window_ticks）。
+    pub claim_deadline_min: u64,
+    pub picked_up_at_min: Option<u64>,
+    pub delivered_at_min: Option<u64>,
+
+    pub fee: FeeBreakdown,
+    pub status: OrderStatus,
+    pub assigned_to: Option<RiderId>,
+    /// 强制指派单（控制端指派，骑手端弹确认框）。
+    pub forced: bool,
+    /// 背单（绕路顺带）。
+    pub back_order: bool,
+    pub back_order_bonus_cents: i64,
+
+    pub task: Option<ExtraTask>,
+    /// 已催单次数。
+    pub urge_count: u32,
+    /// 商家实际出餐耗时（分钟），到店后确定。
+    pub prep_minutes: Option<u32>,
+}
+
+impl Order {
+    pub fn merchant_pos(&self) -> LatLng {
+        LatLng::new(self.merchant_lat, self.merchant_lng)
+    }
+    pub fn customer_pos(&self) -> LatLng {
+        LatLng::new(self.customer_lat, self.customer_lng)
+    }
+
+    /// 是否超过承诺送达时间（含背单缓冲）。
+    pub fn is_late(&self, now_min: u64, buffer_min: u32) -> bool {
+        now_min > self.created_at_min + self.promised_minutes as u64 + buffer_min as u64
+    }
+
+    /// 逾期分钟数（用于赔付系数）。
+    pub fn overdue_minutes(&self, now_min: u64, buffer_min: u32) -> u32 {
+        let deadline = self.created_at_min + self.promised_minutes as u64 + buffer_min as u64;
+        now_min.saturating_sub(deadline) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn order() -> Order {
+        Order {
+            id: 1,
+            merchant_id: 1,
+            merchant_name: "老王热干面".into(),
+            merchant_lat: 30.5,
+            merchant_lng: 114.4,
+            customer_name: "顾客".into(),
+            customer_address: "光谷一路".into(),
+            remark: String::new(),
+            customer_lat: 30.51,
+            customer_lng: 114.41,
+            distance_m: 1200,
+            promised_minutes: 30,
+            tier: OrderTier::Normal,
+            created_at_min: 100,
+            claim_deadline_min: 103,
+            picked_up_at_min: None,
+            delivered_at_min: None,
+            fee: FeeBreakdown::default(),
+            status: OrderStatus::Pending,
+            assigned_to: None,
+            forced: false,
+            back_order: false,
+            back_order_bonus_cents: 0,
+            task: None,
+            urge_count: 0,
+            prep_minutes: None,
+        }
+    }
+
+    #[test]
+    fn late_uses_buffer() {
+        let o = order();
+        assert!(!o.is_late(134, 5));
+        assert!(o.is_late(136, 5));
+        assert_eq!(o.overdue_minutes(136, 5), 1);
+    }
+
+    #[test]
+    fn status_helpers() {
+        assert!(OrderStatus::Pending.is_active());
+        assert!(OrderStatus::Delivered.is_finished());
+        assert!(!OrderStatus::Expired.is_active());
+    }
+}

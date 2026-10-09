@@ -1,0 +1,23 @@
+[package]
+name = "rider-sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+futures = "0.3.34"
+lru = "0.18.5"
+rand = "0.10.3"
+rand_chacha = "0.10.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "http2", "charset", "query"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+# 用 Router::oneshot 做无端口的路由测试；axum 自身依赖它，但需要显式声明才能 use。
+tower = { version = "0.5", features = ["util"] }

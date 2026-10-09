@@ -1,0 +1,85 @@
+{
+  "_note": "预设任务对话。判定优先走关键词（零延迟、可复现），关键词判不出来时才交给 LLM。",
+  "tasks": [
+    {
+      "id": "leave_at_door",
+      "name": "放门口",
+      "steps": [
+        {
+          "rider_prompt": "您好，我快到了，放哪个门？",
+          "customer_responses": ["放门口吧", "门口有柜子，放柜子里也行"],
+          "requires_keywords": ["门"],
+          "completion_keywords": ["放门口了", "放在门口"],
+          "reward_cents": 0,
+          "penalty_cents": 0
+        },
+        {
+          "rider_prompt": "好的，门禁密码是多少？",
+          "customer_responses": ["1234", "没有密码，直接推门"],
+          "requires_keywords": ["密码", "门禁"],
+          "completion_keywords": ["没有密码", "没密码", "不用密码"],
+          "reward_cents": 50,
+          "penalty_cents": 0
+        },
+        {
+          "rider_prompt": "已经放门口了，麻烦确认一下。",
+          "customer_responses": ["收到了，谢谢", "好的，麻烦你了"],
+          "requires_keywords": [],
+          "completion_keywords": ["谢谢", "确认", "收到"],
+          "reward_cents": 100,
+          "penalty_cents": 0
+        }
+      ],
+      "on_complete": { "rating_delta": 0.02, "penalty_cents": 0 },
+      "on_fail": { "rating_delta": -0.02, "penalty_cents": 0 }
+    },
+    {
+      "id": "knock_door",
+      "name": "敲门确认",
+      "steps": [
+        {
+          "rider_prompt": "到门口了，敲门还是放门口？",
+          "customer_responses": ["敲三下就行", "放门口就行，别敲门"],
+          "requires_keywords": ["敲", "门铃"],
+          "completion_keywords": ["放门口就行", "不敲门"],
+          "reward_cents": 0,
+          "penalty_cents": 0
+        },
+        {
+          "rider_prompt": "好的，敲三下。",
+          "customer_responses": ["谢谢师傅", "辛苦了"],
+          "requires_keywords": [],
+          "completion_keywords": ["谢谢", "好的", "辛苦"],
+          "reward_cents": 50,
+          "penalty_cents": 0
+        }
+      ],
+      "on_complete": { "rating_delta": 0.01, "penalty_cents": 0 },
+      "on_fail": { "rating_delta": -0.01, "penalty_cents": 0 }
+    },
+    {
+      "id": "buy_drinks",
+      "name": "顺路代买",
+      "steps": [
+        {
+          "rider_prompt": "需要顺路带瓶水或者饮料吗？",
+          "customer_responses": ["带瓶可乐，谢谢", "不用了谢谢"],
+          "requires_keywords": ["带", "可乐", "水", "饮料"],
+          "completion_keywords": ["不用了", "不用带"],
+          "reward_cents": 0,
+          "penalty_cents": 0
+        },
+        {
+          "rider_prompt": "好的，还有别的吗？",
+          "customer_responses": ["没有了", "就这些，谢谢"],
+          "requires_keywords": [],
+          "completion_keywords": ["没有", "就这些"],
+          "reward_cents": 80,
+          "penalty_cents": 0
+        }
+      ],
+      "on_complete": { "rating_delta": 0.03, "penalty_cents": 0 },
+      "on_fail": { "rating_delta": -0.03, "penalty_cents": 0 }
+    }
+  ]
+}
