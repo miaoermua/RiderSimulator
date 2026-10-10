@@ -10,8 +10,9 @@ library;
 /// 协议版本。与服务端不一致会被拒绝握手。
 const String kProtocolVersion = '1.0';
 
-/// 默认服务端地址。
-const String kDefaultServerUrl = 'ws://127.0.0.1:8080/ws';
+/// 默认服务端地址。端口与 `login_link.dart` 的 `kDefaultPort` 是同一个。
+const String kDefaultServerHost = '127.0.0.1';
+const String kDefaultServerUrl = 'ws://$kDefaultServerHost:8080/ws';
 
 /// 上行消息类型。
 abstract final class Msg {
@@ -26,6 +27,7 @@ abstract final class Msg {
   static const deliver = 'deliver';
   static const setOnline = 'set_online';
   static const setSpeedMode = 'set_speed_mode';
+  static const changePassword = 'change_password';
   static const taskMessage = 'task_message';
 }
 
@@ -63,6 +65,10 @@ abstract final class ErrCode {
   static const helloRequired = 'HELLO_REQUIRED';
   static const protocolMismatch = 'PROTOCOL_MISMATCH';
   static const unauthorized = 'UNAUTHORIZED';
+  /// 这个名字在烽火台还没建过号。
+  static const noAccount = 'NO_ACCOUNT';
+  /// 名字不在、或密码不对（登录时不做区分，防止被人拿去撞名字）。
+  static const badCredentials = 'BAD_CREDENTIALS';
   static const notARider = 'NOT_A_RIDER';
   static const notAController = 'NOT_A_CONTROLLER';
   static const featureDisabled = 'FEATURE_DISABLED';
@@ -100,6 +106,8 @@ abstract final class ErrCode {
         taskFinished => '任务已经做完了',
         notARider => '观战者不能跑单',
         unauthorized => '令牌无效',
+        noAccount => '这个名字还没在烽火台建号，找调度要二维码',
+        badCredentials => '名字或密码不对',
         protocolMismatch => '客户端版本与服务端不一致',
         _ => code ?? '未知错误',
       };

@@ -11,6 +11,7 @@
 //! | `day_ledger` | 每天每人的日结流水（JSON） | 历史账单、赛季统计 |
 //! | `career` | 骑手生涯累计（天数、单量、收入、评分） | 「老骑手」成长感 |
 //! | `meta` | 局级元信息（种子、当前天、已完成 tick） | 重启后接着跑 |
+//! | `account` | 骑手账号（名字 + Argon2 密码哈希） | 名字+密码登录、烽火台建号 |
 //!
 //! ## 一条原则：**存不下就当没有**
 //!
@@ -53,6 +54,18 @@ pub struct Career {
 pub struct FlushReport {
     pub ledgers: usize,
     pub careers_updated: usize,
+}
+
+/// 一个骑手账号。**故意不带密码哈希**——哈希只从 [`Store::account_hash`] 单独取，
+/// 免得它跟着账户列表、日志、控制端响应到处跑。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Account {
+    /// 账号名 = 骑手名。
+    pub name: String,
+    /// 建号时间（Unix 秒）。
+    pub created_at: i64,
+    /// 最后一次改密时间（Unix 秒）。
+    pub updated_at: i64,
 }
 
 /// SQLite 句柄。**单线程持有**（与 tick 循环同一个任务）。
@@ -125,6 +138,13 @@ impl Store {
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS account (
+                name          TEXT PRIMARY KEY,
+                password_hash TEXT    NOT NULL,
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL
             );
             "#,
         )?;
@@ -308,6 +328,111 @@ impl Store {
             .into_iter()
             .find(|l| l.rider_id == rider_id))
     }
+
+    // ---- 账号 ----
+    //
+    // 名字已经由 `auth::normalize_name` 规范化过再进来，这里不再二次清洗：
+    // 两侧都规范化会让「入库的到底是什么」变得说不清。
+
+    /// 建号。**已经存在就返回 `Ok(false)`**，不动原密码——建号接口不能变成
+    /// 「悄悄改掉别人密码」的后门。
+    pub fn create_account(&self, name: &str, password_hash: &str) -> Result<bool> {
+        let now = unix_now();
+        let inserted = self.conn.execute(
+            "INSERT INTO account (name, password_hash, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(name) DO NOTHING",
+            params![name, password_hash, now],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    /// 设 / 改密码。建号时保留 `created_at`。
+    pub fn set_account_password(&self, name: &str, password_hash: &str) -> Result<()> {
+        let now = unix_now();
+        self.conn.execute(
+            "INSERT INTO account (name, password_hash, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(name) DO UPDATE SET
+                password_hash = excluded.password_hash,
+                updated_at    = excluded.updated_at",
+            params![name, password_hash, now],
+        )?;
+        Ok(())
+    }
+
+    /// 取密码哈希。登录校验用——这是全仓唯一会读出哈希的地方。
+    pub fn account_hash(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT password_hash FROM account WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// 账号列表，按建号时间。`created_at` 只有秒级精度，**同一秒内建的按名字
+    /// 的 UTF-8 字节序**收尾——顺序必须确定，否则控制台列表会随查询计划抖。
+    pub fn accounts(&self) -> Result<Vec<Account>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, created_at, updated_at FROM account ORDER BY created_at, name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Account {
+                name: r.get(0)?,
+                created_at: r.get(1)?,
+                updated_at: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn account(&self, name: &str) -> Result<Option<Account>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT name, created_at, updated_at FROM account WHERE name = ?1",
+                params![name],
+                |r| {
+                    Ok(Account {
+                        name: r.get(0)?,
+                        created_at: r.get(1)?,
+                        updated_at: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// 改账号名。控制端给真人骑手改名时同步用——名字是账号的主键，
+    /// 只能**搬**不能「新建」，否则骑手改完名，用旧名字还能登出一具新身体。
+    ///
+    /// 目标名字已经有账号时返回 `Err`（主键冲突），调用方应当在动世界之前就拦下。
+    pub fn rename_account(&self, from: &str, to: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE account SET name = ?2 WHERE name = ?1",
+            params![from, to],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// 删号。返回是否真的删掉了一个。
+    pub fn delete_account(&self, name: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM account WHERE name = ?1", params![name])?;
+        Ok(n == 1)
+    }
+}
+
+/// 当前 Unix 秒。账号表的建号/改密时间戳用。
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// 打不开数据库时的兜底：用内存库，服务照常起来。
@@ -469,5 +594,64 @@ mod tests {
     fn career_key_matches_protocol() {
         assert_eq!(Store::career_key(3), "r3");
         assert_eq!(Store::career_key(3), rider_key(3));
+    }
+
+    #[test]
+    fn create_account_never_overwrites_an_existing_password() {
+        let s = Store::in_memory().unwrap();
+        assert!(s.create_account("张三", "hash-a").unwrap());
+        // 建号接口不能被拿来悄悄改掉别人的密码
+        assert!(!s.create_account("张三", "hash-b").unwrap());
+        assert_eq!(s.account_hash("张三").unwrap().as_deref(), Some("hash-a"));
+    }
+
+    #[test]
+    fn setting_a_password_keeps_the_creation_time() {
+        let s = Store::in_memory().unwrap();
+        s.set_account_password("张三", "hash-a").unwrap();
+        let created = s.account("张三").unwrap().unwrap().created_at;
+
+        s.set_account_password("张三", "hash-b").unwrap();
+        let after = s.account("张三").unwrap().unwrap();
+        assert_eq!(after.created_at, created, "改密不该改建号时间");
+        assert!(after.updated_at >= created);
+        assert_eq!(s.account_hash("张三").unwrap().as_deref(), Some("hash-b"));
+    }
+
+    #[test]
+    fn accounts_list_and_delete() {
+        let s = Store::in_memory().unwrap();
+        assert!(s.account("nobody").unwrap().is_none());
+        assert!(s.accounts().unwrap().is_empty());
+
+        let mut created = ["甲", "乙", "丙"];
+        for n in created {
+            s.set_account_password(n, "h").unwrap();
+        }
+        // 三次建号落在同一秒里，所以只能按名字收尾，实际顺序 = UTF-8 字节序
+        created.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let names: Vec<_> = s.accounts().unwrap().into_iter().map(|a| a.name).collect();
+        assert_eq!(names, created);
+
+        assert!(s.delete_account("乙").unwrap());
+        assert!(!s.delete_account("乙").unwrap(), "删第二次不该说删掉了");
+        assert_eq!(s.accounts().unwrap().len(), 2);
+        assert!(s.account_hash("乙").unwrap().is_none());
+    }
+
+    #[test]
+    fn accounts_survive_a_reopen() {
+        let file = std::env::temp_dir().join(format!(
+            "rider_sim_accounts_{}/db.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file);
+        {
+            let s = Store::open(&file).unwrap();
+            s.set_account_password("张三", "hash-a").unwrap();
+        }
+        let s = Store::open(&file).unwrap();
+        assert_eq!(s.account_hash("张三").unwrap().as_deref(), Some("hash-a"));
+        let _ = std::fs::remove_file(&file);
     }
 }

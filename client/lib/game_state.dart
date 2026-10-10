@@ -278,6 +278,7 @@ class GameState extends ChangeNotifier {
         Msg.urge => '已催单',
         Msg.setOnline => '在线状态已更新',
         Msg.setSpeedMode => '骑行模式已更新',
+        Msg.changePassword => '密码已改，二维码里的旧密码作废',
         Msg.taskMessage => '消息已发出，等顾客回',
         _ => '${a.action} 成功',
       };

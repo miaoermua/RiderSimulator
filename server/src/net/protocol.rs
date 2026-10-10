@@ -41,15 +41,29 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub enum ClientMessage {
     /// 握手。**必须是第一条消息**，否则连接被关闭。
     ///
-    /// 不带 `token` = 观战者；带 `rider_id` = 绑定到该骑手。
+    /// 三种进法，优先级从高到低：
+    ///
+    /// 1. **骑手名 + 密码** → 账号登录。烽火台建过号才能进（见
+    ///    [`crate::net::join`]）。这是给骑手用的正门。
+    /// 2. **`token`** → 开发后门，见下。给了 `rider_name` 时它被忽略。
+    /// 3. **都不给** → `DEV_ALLOW_CONTROL` 开着就是控制端，否则观战。
+    ///
+    /// 令牌语义：`rider:3` / `r3` 绑号、`new:<昵称>` 现场建号、
+    /// `control:<令牌>` 控制端。**后门只在开发/演示用**——它绕过账号体系，
+    /// 公网部署要靠 `RIDER_SIM_CONTROL_TOKEN` 之外的开关关掉。
     Hello {
-        /// 骑手令牌。协议层只做映射，真正的校验在 `app` 层。
-        ///
-        /// - 缺省 → 控制端 / 观战者（受 `DEV_ALLOW_CONTROL` 环境变量约束）
-        /// - `rider:<id>` → 绑定骑手 `<id>`
-        /// - `new:<昵称>` → 现场创建一个真人骑手
+        /// 骑手令牌（开发后门）。
         #[serde(default)]
         token: Option<String>,
+        /// 骑手名字，也就是烽火台建的账号名。给了它就按账号登录。
+        #[serde(default)]
+        rider_name: Option<String>,
+        /// 明文密码。只在 `rider_name` 一起给时才有意义。
+        ///
+        /// 它在网线上是什么状态取决于 `ws://` 还是 `wss://`——**局域网明文
+        /// 是接受的取舍，公网部署必须套 TLS**，否则等于把密码广播出去。
+        #[serde(default)]
+        password: Option<String>,
         /// 客户端协议版本，不一致直接拒绝。
         #[serde(default)]
         protocol_version: Option<String>,
@@ -80,6 +94,13 @@ pub enum ClientMessage {
     SetOnline { online: bool },
     /// 切速度档位。
     SetSpeedMode { mode: SpeedMode },
+
+    /// 改自己的密码。旧密码必须对——**光连上了不足以改密**，
+    /// 否则捡到一台没锁屏的手机就能改掉号。
+    ChangePassword {
+        old_password: String,
+        new_password: String,
+    },
 
     /// 骑手在任务对话里说一句话。顾客回复由服务端（LLM 或关键词）生成。
     TaskMessage { order_id: OrderId, text: String },
@@ -333,8 +354,15 @@ pub mod code {
     pub const HELLO_REQUIRED: &str = "HELLO_REQUIRED";
     /// 协议版本不一致。
     pub const PROTOCOL_MISMATCH: &str = "PROTOCOL_MISMATCH";
-    /// 令牌无效 / 骑手不存在。
+    /// 令牌无效 / 骑手不存在 /**密码不对**。
     pub const UNAUTHORIZED: &str = "UNAUTHORIZED";
+    /// 骑手还没有账号——得先去烽火台建号。
+    ///
+    /// 与 `UNAUTHORIZED` 分开，是为了让骑手分得清「密码打错了」和
+    /// 「我还没被建号」：后者该去找管理端，不是接着试密码。
+    pub const NO_ACCOUNT: &str = "NO_ACCOUNT";
+    /// 名字或密码不合规范（长度、字符）。密码太短走这里。
+    pub const BAD_CREDENTIALS: &str = "BAD_CREDENTIALS";
     /// 没绑定骑手却发了骑手动作。
     pub const NOT_A_RIDER: &str = "NOT_A_RIDER";
     /// 非控制端发了控制指令。
@@ -398,6 +426,8 @@ mod tests {
             m,
             ClientMessage::Hello {
                 token: None,
+                rider_name: None,
+                password: None,
                 protocol_version: None
             }
         ));

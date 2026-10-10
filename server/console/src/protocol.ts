@@ -318,6 +318,56 @@ export interface AckPayload {
   data?: Record<string, unknown>;
 }
 
+// ---------------- 骑手账号（HTTP `/api/accounts`） ----------------
+//
+// 账号是**管理动作**，走一次性 HTTP 而不是 16ms 的 WS 帧流：服务端把明文
+// 密码只放在那一份响应里（库里只有 Argon2 哈希），WS 那条路上根本没有它。
+
+/** 一条账号记录。**故意没有密码字段**——哈希只在服务端单独取。 */
+export interface Account {
+  /** 账号名 = 骑手名。 */
+  name: string;
+  /** 建号时间（Unix 秒）。 */
+  created_at: number;
+  /** 最后一次改密时间（Unix 秒）。 */
+  updated_at: number;
+  /** 这一局里有没有对应的真人身体；没登录过就是 null。 */
+  rider_id: number | null;
+  rider_key: string | null;
+  /** 有身体时才有值。 */
+  online: boolean | null;
+}
+
+/**
+ * 一条「扫码即登录」的全部材料。
+ *
+ * `qr_svg` 是服务端画好的 SVG 文本——控制台不用再引二维码库。
+ * `uri` 里带着**明文密码**，见 `server/src/net/join.rs` 的取舍说明。
+ */
+export interface JoinInfo {
+  ws_url: string;
+  /** `ridersim://login?host=&port=&name=&password=` 连接串。二维码内容就是它。 */
+  uri: string;
+  /** 画不出来时为 null（内容编不成码，极少见）。 */
+  qr_svg: string | null;
+}
+
+/** 建号 / 改密的响应。`password` 是**全系统唯一一次**能看到明文的地方。 */
+export interface AccountJoin {
+  name: string;
+  password: string;
+  join: JoinInfo | null;
+  hosts: string[];
+  primary_host: string | null;
+}
+
+/** `GET /api/accounts`：名单 + 手机可达地址。 */
+export interface AccountList {
+  accounts: Account[];
+  hosts: string[];
+  primary_host: string | null;
+}
+
 /** 服务端事件的载荷形状，按事件名索引。 */
 export interface EventPayloads {
   welcome: {

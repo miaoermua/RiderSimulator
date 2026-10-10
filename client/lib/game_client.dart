@@ -24,17 +24,43 @@ class GameClient {
 
   String _url = kDefaultServerUrl;
   String? _token;
+  String? _riderName;
+  String? _password;
+
+  /// 名字 / 密码被服务端拒了。重试多少次都一样，得停下来让用户改。
+  bool _rejected = false;
+  String? _rejectReason;
+
+  /// 握手成功了（收到 `welcome`）。登录页据此才肯放进主界面。
+  bool _welcomed = false;
+
+  /// 账号被拒时回调一次。登录页据此把错误留在屏幕上，而不是默默重连。
+  void Function(String reason)? onAuthError;
+
+  /// 握手成功时回调一次。
+  void Function()? onWelcome;
 
   /// 连接并在成功后自动发送 `hello`。失败会自动重试。
-  void connect(String url, {String? token}) {
+  ///
+  /// 两种身份二选一：`riderName` + `password`（烽火台建的号，正常路径），
+  /// 或 `token`（`rider:<id>` / `new:<昵称>`，**开发后门**，会绕过账号表）。
+  void connect(String url, {String? token, String? riderName, String? password}) {
     _url = url;
     _token = (token == null || token.trim().isEmpty) ? null : token.trim();
+    _riderName = (riderName == null || riderName.trim().isEmpty) ? null : riderName.trim();
+    _password = _riderName == null ? null : password;
+    _rejected = false;
+    _rejectReason = null;
+    _welcomed = false;
     _attempt = 0;
     _open();
   }
 
   /// 主动重连（用户点「重连」时用）。
   void reconnect() {
+    // 用户改完名字 / 密码再来一次，就别再卡在「上次被拒」上。
+    _rejected = false;
+    _rejectReason = null;
     _closeSocket();
     _open();
   }
@@ -61,7 +87,15 @@ class GameClient {
         cancelOnError: true,
       );
 
-      _send({ 'type': Msg.hello, 'token': _token, 'protocol_version': kProtocolVersion });
+      // 只带上真正有的字段：服务端用「有没有 rider_name」决定走账号登录
+      // 还是走令牌后门，塞个 null 进去会让它以为你想用账号登录。
+      _send({
+        'type': Msg.hello,
+        'protocol_version': kProtocolVersion,
+        if (_token != null) 'token': _token,
+        if (_riderName != null) 'rider_name': _riderName,
+        if (_password != null) 'password': _password,
+      });
 
       _pingTimer?.cancel();
       _pingTimer = Timer.periodic(const Duration(seconds: 20), (_) {
@@ -83,12 +117,41 @@ class GameClient {
     }
     final frame = parseFrame(decoded);
     if (frame == null) return;
+
+    final wasWelcomed = _welcomed;
+    _rememberReject(frame);
     state.applyFrame(frame);
+    if (!wasWelcomed && _welcomed) onWelcome?.call();
+  }
+
+  /// 分辨「握手被拒」与「连上之后的运行期报错」。
+  ///
+  /// 规则：`welcome` 之前来的 `error` 一律当握手失败——那时能出的错
+  /// （HELLO_REQUIRED / PROTOCOL_MISMATCH / UNAUTHORIZED / NO_ACCOUNT /
+  /// BAD_CREDENTIALS…）重试都不会变好。`welcome` 之后的报错是跑单过程中的
+  /// 正常反馈（手慢了、没上线…），不该把用户踢下线。
+  void _rememberReject(ServerFrame frame) {
+    if (frame.event == Ev.welcome) {
+      _welcomed = true;
+      return;
+    }
+    if (frame.event != Ev.error || _welcomed) return;
+    _rejected = true;
+    _rejectReason = ErrCode.humanize(reqStr(frame.payload['code']));
   }
 
   void _fail(String why) {
     if (_disposed) return;
     _closeSocket();
+
+    if (_rejected) {
+      // 名字 / 密码不对，重连一万次也是同样的结果，停下来让用户改。
+      // 错误本身已经由 `applyFrame` 记进日志了，这里不再重复记一条。
+      state.setStatus(ConnStatus.closed);
+      onAuthError?.call(_rejectReason ?? why);
+      return;
+    }
+
     state.setStatus(ConnStatus.retrying);
     state.note('$why，即将重连…', kind: LogKind.bad);
 
@@ -136,6 +199,13 @@ class GameClient {
       _send({ 'type': Msg.setOnline, 'online': online });
   void setSpeedMode(SpeedMode mode) =>
       _send({ 'type': Msg.setSpeedMode, 'mode': mode.wire });
+
+  /// 改自己的密码。旧密码必须对——这是把二维码里的明文密码作废的唯一办法。
+  void changePassword(String oldPassword, String newPassword) => _send({
+        'type': Msg.changePassword,
+        'old_password': oldPassword,
+        'new_password': newPassword,
+      });
   void sendTaskMessage(int orderId, String text) =>
       _send({ 'type': Msg.taskMessage, 'order_id': orderId, 'text': text });
 

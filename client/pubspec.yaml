@@ -12,6 +12,15 @@ dependencies:
     sdk: flutter
   # WebSocket 客户端。协议见 ../packages/protocol.json
   web_socket_channel: ^3.0.1
+  # 扫码登录：扫烽火台生成的 `ridersim://login?...` 二维码。
+  #
+  # 相机是原生能力，所以 **必须先 `flutter create . --platforms=android,ios`
+  # 生成原生工程**，否则 Android Studio / 真机上跑不起来（本机没有 Flutter，
+  # 这一步还没做，见 client/README.md）。
+  #
+  # 上界卡在 7.0：7.x 起 `MobileScanner` 必须传 controller，这里只想用最朴素的
+  # 用法（见 screens/scan_login_page.dart）。
+  mobile_scanner: ">=5.2.3 <7.0.0"
 
 dev_dependencies:
   flutter_test:

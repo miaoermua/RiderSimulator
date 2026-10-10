@@ -3,6 +3,7 @@
 //! ```text
 //! protocol.rs  消息定义、固定错误码、角色      纯数据，零 IO，可单测
 //! hub.rs       连接注册表 + 按角色过滤下发     纯数据结构，可单测
+//! join.rs      骑手接入：可达地址 + 二维码      纯计算，可单测
 //! api.rs       远程控制 / 派单 HTTP 接口       鉴权 + 搬运，不含规则
 //! ws.rs        axum 接入，字节流 ⇄ Inbound     唯一碰 tokio/axum 的地方
 //! ```
@@ -14,6 +15,7 @@
 
 pub mod api;
 pub mod hub;
+pub mod join;
 pub mod protocol;
 pub mod ws;
 

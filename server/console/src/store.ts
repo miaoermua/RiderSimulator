@@ -2,6 +2,8 @@ import {
   PROTOCOL_VERSION,
   SOURCE_LABEL,
   isLlmSource,
+  type AccountJoin,
+  type AccountList,
   type AiOpBrief,
   type AiState,
   type ConfigView,
@@ -256,6 +258,72 @@ class ConsoleStore {
   /** 人工否决一条决策。 */
   rejectAi(decisionId: number) {
     this.send("reject_ai", { decision_id: decisionId });
+  }
+
+  // ---------------- 骑手账号（HTTP） ----------------
+
+  /**
+   * 打一发同源的 `/api/**`。
+   *
+   * 与 WS 用**同一套鉴权**：带上控制令牌。服务端没配令牌、只开了
+   * `RIDER_SIM_ALLOW_CONTROL` 时，不带令牌也放行。
+   */
+  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const headers: Record<string, string> = {};
+    if (this.token) headers.Authorization = `Bearer ${this.token}`;
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+
+    const res = await fetch(path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+
+    const text = await res.text();
+    let data: unknown = null;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = null;
+      }
+    }
+    if (!res.ok) {
+      const err = (data as { error?: { code?: string; message?: string } } | null)?.error;
+      throw new Error(err?.message || err?.code || `HTTP ${res.status}`);
+    }
+    return data as T;
+  }
+
+  /** 拉账号名单 + 手机可达地址。 */
+  listAccounts(): Promise<AccountList> {
+    return this.request<AccountList>("GET", "/api/accounts");
+  }
+
+  /** 建号。`password` 缺省 = 服务端生成一个，响应里回显明文 + 二维码。 */
+  createAccount(name: string, password?: string): Promise<AccountJoin> {
+    const body: Record<string, string> = { name };
+    if (password) body.password = password;
+    return this.request<AccountJoin>("POST", "/api/accounts", body);
+  }
+
+  /** 改 / 重置密码。`password` 缺省 = 服务端生成一个。 */
+  setAccountPassword(name: string, password?: string): Promise<AccountJoin> {
+    const body: Record<string, string> = {};
+    if (password) body.password = password;
+    return this.request<AccountJoin>(
+      "POST",
+      `/api/accounts/${encodeURIComponent(name)}/password`,
+      body,
+    );
+  }
+
+  /** 删号。返回是否真的删掉了一条。 */
+  deleteAccount(name: string): Promise<{ name: string; deleted: boolean }> {
+    return this.request<{ name: string; deleted: boolean }>(
+      "DELETE",
+      `/api/accounts/${encodeURIComponent(name)}`,
+    );
   }
 
   // ---------------- 事件分发 ----------------

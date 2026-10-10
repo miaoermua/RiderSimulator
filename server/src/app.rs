@@ -24,7 +24,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use serde_json::json;
+use axum::http::StatusCode;
+use serde_json::{Value, json};
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     watch,
@@ -46,6 +47,8 @@ use crate::sim::{
     economy,
     event::{AiOpBrief, DecisionSource, SimEvent},
     host::{self, HostMode},
+    rider::RiderKind,
+    rider_key,
     scheduler::{self, ClaimError},
     station::{Station, StationKpi},
     tick::{self, TickInput},
@@ -73,6 +76,14 @@ pub struct AppOptions {
     pub autosave_every_min: u64,
     /// 每多少 tick 给控制端推一次服务器状态。
     pub server_info_every_ticks: u64,
+    /// 烽火台告诉骑手「连哪个地址」时该用哪个（`主机` 或 `主机:端口`）。
+    ///
+    /// 缺省时按 [`crate::net::join::reachable_hosts`] 的规则自己推：显式配置 >
+    /// 监听地址 > 探测到的局域网 IP > 回环兜底。
+    ///
+    /// **开着代理 / VPN 的机器必须显式配它**：那种环境下默认路由指向虚拟网卡，
+    /// 探测出来的是 fake-ip 段，骑手照着连必然超时。
+    pub public_addr: Option<String>,
 }
 
 impl Default for AppOptions {
@@ -84,6 +95,7 @@ impl Default for AppOptions {
             llm_enabled: false,
             autosave_every_min: 60,
             server_info_every_ticks: 60,
+            public_addr: None,
         }
     }
 }
@@ -127,6 +139,11 @@ pub struct App {
     pub hub: Hub,
     pub store: Store,
     pub opts: AppOptions,
+    /// 实际绑定的监听地址，[`App::serve`] 回填。
+    ///
+    /// 烽火台要拿它拼「手机的扫码地址」，所以不能在 `new` 里写死——
+    /// 端口 0 只有在 `bind` 之后才知道最后落到哪儿。
+    bound: Option<SocketAddr>,
 
     brain: TacticalBrain,
     judge: TaskJudge,
@@ -261,8 +278,9 @@ impl App {
             world,
             hub: Hub::new(),
             store,
-            layer_models,
             opts,
+            bound: None,
+            layer_models,
             brain,
             judge,
             director,
@@ -309,9 +327,11 @@ impl App {
     }
 
     /// 绑定端口 + 跑主循环。Ctrl-C 或监听失败时退出。
-    pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
+    pub async fn serve(mut self, addr: SocketAddr) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr().unwrap_or(addr);
+        self.bound = Some(bound);
+        let join_hosts = crate::net::join::reachable_hosts(bound, self.opts.public_addr.as_deref());
         tracing::info!(
             addr = %bound,
             ws = %format!("ws://{bound}{}", crate::net::WS_PATH),
@@ -322,6 +342,14 @@ impl App {
             llm = self.llm_enabled(),
             "骑手模拟器已启动"
         );
+        match join_hosts.first() {
+            Some(h) if bound.ip().is_loopback() => tracing::warn!(
+                join = %h,
+                "只监听了回环地址，手机连不上——要让骑手扫码进来，请设 RIDER_SIM_ADDR=0.0.0.0:8080"
+            ),
+            Some(h) => tracing::info!(join = %h, "骑手扫码地址（烽火台面板里也能看到）"),
+            None => {}
+        }
 
         let router = crate::net::router(
             self.inbound(),
@@ -1044,7 +1072,167 @@ impl App {
             RpcRequest::AiState => Ok(self.ai_state()),
             RpcRequest::SetAi(patch) => self.rpc_set_ai(&patch),
             RpcRequest::RejectAi { decision_id } => self.rpc_reject_ai(decision_id),
+            RpcRequest::Accounts => Ok(self.rpc_accounts()),
+            RpcRequest::CreateAccount { name, password } => {
+                self.rpc_create_account(&name, password)
+            }
+            RpcRequest::SetAccountPassword { name, password } => {
+                self.rpc_set_account_password(&name, password)
+            }
+            RpcRequest::DeleteAccount { name } => self.rpc_delete_account(&name),
         }
+    }
+
+    /// 烽火台「骑手接入」面板要的全部东西：名单 + 手机可达地址。
+    ///
+    /// 一次给全，因为面板打开就要用——分两个接口只会多一次往返，还会出现
+    /// 「名单新、地址旧」的中间态。
+    fn rpc_accounts(&self) -> Value {
+        let accounts: Vec<Value> = self
+            .store
+            .accounts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| {
+                let body = self.world.human_rider_named(&a.name);
+                json!({
+                    "name": a.name,
+                    "created_at": a.created_at,
+                    "updated_at": a.updated_at,
+                    // 有身体 = 这一局里进过场；在线 = 身体在场上跑
+                    "rider_id": body,
+                    "rider_key": body.map(rider_key),
+                    "online": body.and_then(|id| self.world.rider(id)).map(|r| r.online),
+                })
+            })
+            .collect();
+        self.with_join_hosts(json!({ "accounts": accounts }))
+    }
+
+    /// 建号。`password` 缺省就生成一个——管理员不该被迫想密码。
+    ///
+    /// 返回里带**明文密码和二维码**：库里只有哈希，所以这是唯一一次机会。
+    /// 骑手改完密码后旧二维码就失效了（密码变了），不用额外的撤销机制。
+    fn rpc_create_account(&mut self, raw_name: &str, password: Option<String>) -> RpcReply {
+        let Some(name) = crate::auth::normalize_name(raw_name) else {
+            return Err(ApiError::bad_request("骑手名字不能是空的"));
+        };
+        let password = match password.filter(|p| !p.is_empty()) {
+            Some(p) => {
+                crate::auth::check_password(&p).map_err(ApiError::bad_request)?;
+                p
+            }
+            None => crate::auth::random_password(),
+        };
+        let hash = crate::auth::hash_password(&password)
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, code::INTERNAL, e))?;
+
+        let created = self
+            .store
+            .create_account(&name, &hash)
+            .map_err(|e| Self::db_error("建号", e))?;
+        if !created {
+            return Err(ApiError::conflict(
+                code::BAD_CREDENTIALS,
+                format!("「{name}」已经有号了；要改密码就点重置"),
+            ));
+        }
+        tracing::info!(%name, "烽火台建了号");
+        Ok(self.account_join_payload(&name, &password))
+    }
+
+    /// 改 / 重置密码。账号必须已经存在——建号请走 [`App::rpc_create_account`]。
+    fn rpc_set_account_password(&mut self, raw_name: &str, password: Option<String>) -> RpcReply {
+        let Some(name) = crate::auth::normalize_name(raw_name) else {
+            return Err(ApiError::bad_request("骑手名字不能是空的"));
+        };
+        if self.store.account(&name).unwrap_or(None).is_none() {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                code::NO_ACCOUNT,
+                format!("「{name}」还没有号"),
+            ));
+        }
+        let password = match password.filter(|p| !p.is_empty()) {
+            Some(p) => {
+                crate::auth::check_password(&p).map_err(ApiError::bad_request)?;
+                p
+            }
+            None => crate::auth::random_password(),
+        };
+        let hash = crate::auth::hash_password(&password)
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, code::INTERNAL, e))?;
+        self.store
+            .set_account_password(&name, &hash)
+            .map_err(|e| Self::db_error("改密码", e))?;
+        tracing::info!(%name, "烽火台重置了密码");
+        Ok(self.account_join_payload(&name, &password))
+    }
+
+    fn rpc_delete_account(&mut self, raw_name: &str) -> RpcReply {
+        // 账号名按规范化后的形式存。建号 / 改密都规范化了，删号不规范化就会
+        // 出现「建了删不掉」——名字里多个空格就删不着。
+        let name = crate::auth::normalize_name(raw_name).unwrap_or_else(|| raw_name.to_string());
+        let deleted = self
+            .store
+            .delete_account(&name)
+            .map_err(|e| Self::db_error("删号", e))?;
+        if deleted {
+            tracing::info!(%name, "烽火台删了号");
+        }
+        Ok(json!({ "name": name, "deleted": deleted }))
+    }
+
+    /// 一条「扫码即登录」的全部材料：地址 + 连接串 + 二维码。
+    fn account_join_payload(&self, name: &str, password: &str) -> Value {
+        let mut payload = json!({ "name": name, "password": password });
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("join".to_string(), self.join_info(name, password));
+        }
+        self.with_join_hosts(payload)
+    }
+
+    fn join_info(&self, name: &str, password: &str) -> Value {
+        let Some((host, port)) = self.primary_join_addr() else {
+            return Value::Null;
+        };
+        let info = crate::net::join::JoinInfo::new(host, port, name, password);
+        match info.qr_svg() {
+            Ok(svg) => json!({
+                "ws_url": info.ws_url(),
+                "uri": info.login_uri(),
+                "qr_svg": svg,
+            }),
+            Err(e) => {
+                tracing::warn!(%name, "二维码没画出来：{e}");
+                json!({ "ws_url": info.ws_url(), "uri": info.login_uri(), "qr_svg": Value::Null })
+            }
+        }
+    }
+
+    /// 手机可达地址列表，主推的排第一。
+    ///
+    /// 还没 `serve()` 起来时（单测里的 App）没有监听地址，按 `127.0.0.1:8080` 算。
+    fn join_hosts(&self) -> Vec<String> {
+        let bound = self
+            .bound
+            .unwrap_or_else(|| "127.0.0.1:8080".parse().expect("字面量地址"));
+        crate::net::join::reachable_hosts(bound, self.opts.public_addr.as_deref())
+    }
+
+    fn primary_join_addr(&self) -> Option<(String, u16)> {
+        let host = self.join_hosts().into_iter().next()?;
+        let (h, p) = host.rsplit_once(':')?;
+        Some((h.to_string(), p.parse().ok()?))
+    }
+
+    fn with_join_hosts(&self, mut payload: Value) -> Value {
+        let hosts = self.join_hosts();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("hosts".to_string(), json!(hosts));
+            obj.insert("primary_host".to_string(), json!(hosts.first()));
+        }
+        payload
     }
 
     /// 控制端视角的完整快照 + 服务器上下文。外部工具靠它挑人挑单。
@@ -1182,8 +1370,10 @@ impl App {
             return match msg {
                 M::Hello {
                     token,
+                    rider_name,
+                    password,
                     protocol_version,
-                } => self.do_hello(conn_id, token, protocol_version),
+                } => self.do_hello(conn_id, token, rider_name, password, protocol_version),
                 _ => self
                     .hub
                     .send_error(conn_id, code::HELLO_REQUIRED, "第一条消息必须是 hello"),
@@ -1268,6 +1458,13 @@ impl App {
                     self.finish_simple(conn_id, "set_speed_mode", r)
                 }
                 None => self.not_a_rider(conn_id, "set_speed_mode"),
+            },
+            M::ChangePassword {
+                old_password,
+                new_password,
+            } => match role.rider_id() {
+                Some(rid) => self.do_change_password(conn_id, rid, old_password, new_password),
+                None => self.not_a_rider(conn_id, "change_password"),
             },
             M::TaskMessage { order_id, text } => match role.rider_id() {
                 Some(rid) => self.do_task_message(conn_id, rid, order_id, text),
@@ -1397,18 +1594,30 @@ impl App {
                     "tick_interval_ms": app.world.cfg.tick_interval_ms(),
                 }))
             }),
-            M::RenameRider { rider_id, name } => {
-                self.control(conn_id, role, "rename_rider", |app| {
-                    let changed = app.world.rename_rider(rider_id, &name);
-                    if changed {
-                        if let Some(ev) = scheduler::state_event(&app.world, rider_id) {
-                            app.outbox.push(ev);
+            M::RenameRider { rider_id, name } => match self.account_rename_plan(rider_id, &name) {
+                Err(reason) => {
+                    self.ack_fail(conn_id, "rename_rider", code::BAD_CREDENTIALS, &reason)
+                }
+                Ok(account_move) => {
+                    self.control(conn_id, role, "rename_rider", move |app| {
+                        let changed = app.world.rename_rider(rider_id, &name);
+                        if changed {
+                            // 账号名是主键，改了名就得跟着搬，否则旧名字还能登进一具新身体
+                            if let Some((from, to)) = &account_move
+                                && let Err(e) = app.store.rename_account(from, to)
+                            {
+                                // 重名在前面已经拦过，走到这儿只可能是库出了问题
+                                tracing::warn!(%from, %to, "账号改名没落库：{e}");
+                            }
+                            if let Some(ev) = scheduler::state_event(&app.world, rider_id) {
+                                app.outbox.push(ev);
+                            }
+                            app.persist_rider_names();
                         }
-                        app.persist_rider_names();
-                    }
-                    Some(json!({ "changed": changed, "rider_id": rider_id }))
-                })
-            }
+                        Some(json!({ "changed": changed, "rider_id": rider_id }))
+                    })
+                }
+            },
             M::SetRiderNames { names } => self.control(conn_id, role, "set_rider_names", |app| {
                 let changed = app.world.apply_rider_names(&names);
                 for id in &changed {
@@ -1658,7 +1867,14 @@ impl App {
     }
 
     /// 握手。
-    fn do_hello(&mut self, conn_id: ConnId, token: Option<String>, proto: Option<String>) {
+    fn do_hello(
+        &mut self,
+        conn_id: ConnId,
+        token: Option<String>,
+        rider_name: Option<String>,
+        password: Option<String>,
+        proto: Option<String>,
+    ) {
         if let Some(v) = proto.as_deref()
             && v != PROTOCOL_VERSION
         {
@@ -1671,57 +1887,70 @@ impl App {
             return;
         }
 
-        let (role, name) = match token.as_deref() {
-            None => {
-                if self.opts.allow_control {
-                    (Role::Control, "控制端".to_string())
-                } else {
-                    (Role::Spectator, "观战".to_string())
-                }
-            }
-            Some(t) => match parse_token(t) {
-                Some(Token::Control(secret)) => match self.opts.control_token.as_deref() {
-                    Some(expected) if !expected.is_empty() && expected == secret => {
-                        (Role::Control, "控制端".to_string())
-                    }
-                    _ => {
-                        self.hub
-                            .send_error(conn_id, code::UNAUTHORIZED, "控制端令牌无效");
-                        self.hub.unregister(conn_id);
-                        return;
-                    }
-                },
-                Some(Token::Rider(id)) => match self.world.rider(id) {
-                    Some(r) => (Role::Rider(id), r.name.clone()),
-                    None => {
-                        self.hub.send_error(
-                            conn_id,
-                            code::UNAUTHORIZED,
-                            &format!("骑手 {} 不存在", crate::sim::rider_key(id)),
-                        );
-                        self.hub.unregister(conn_id);
-                        return;
-                    }
-                },
-                Some(Token::New(nick)) => {
-                    let nick = nick.trim();
-                    let nick = if nick.is_empty() { "新骑手" } else { nick };
-                    let id = self.world.spawn_human_rider(nick);
-                    let name = self
-                        .world
-                        .rider(id)
-                        .map(|r| r.name.clone())
-                        .unwrap_or_else(|| nick.to_string());
-                    tracing::info!(rider_id = id, %name, "新骑手接入");
-                    (Role::Rider(id), name)
-                }
-                None => {
-                    self.hub
-                        .send_error(conn_id, code::UNAUTHORIZED, "无法识别的令牌");
+        // 正门：骑手名 + 密码。给了名字就**不再看令牌**——两者同时生效会出现
+        // 「密码是对的，但令牌把人绑到了另一个骑手」这种说不清、也查不出的状态。
+        let (role, name) = if let Some(raw) = rider_name.as_deref() {
+            match self.login_with_password(raw, password.as_deref().unwrap_or_default()) {
+                Ok(v) => v,
+                Err((c, msg)) => {
+                    self.hub.send_error(conn_id, c, &msg);
                     self.hub.unregister(conn_id);
                     return;
                 }
-            },
+            }
+        } else {
+            match token.as_deref() {
+                None => {
+                    if self.opts.allow_control {
+                        (Role::Control, "控制端".to_string())
+                    } else {
+                        (Role::Spectator, "观战".to_string())
+                    }
+                }
+                Some(t) => match parse_token(t) {
+                    Some(Token::Control(secret)) => match self.opts.control_token.as_deref() {
+                        Some(expected) if !expected.is_empty() && expected == secret => {
+                            (Role::Control, "控制端".to_string())
+                        }
+                        _ => {
+                            self.hub
+                                .send_error(conn_id, code::UNAUTHORIZED, "控制端令牌无效");
+                            self.hub.unregister(conn_id);
+                            return;
+                        }
+                    },
+                    Some(Token::Rider(id)) => match self.world.rider(id) {
+                        Some(r) => (Role::Rider(id), r.name.clone()),
+                        None => {
+                            self.hub.send_error(
+                                conn_id,
+                                code::UNAUTHORIZED,
+                                &format!("骑手 {} 不存在", crate::sim::rider_key(id)),
+                            );
+                            self.hub.unregister(conn_id);
+                            return;
+                        }
+                    },
+                    Some(Token::New(nick)) => {
+                        let nick = nick.trim();
+                        let nick = if nick.is_empty() { "新骑手" } else { nick };
+                        let id = self.world.spawn_human_rider(nick);
+                        let name = self
+                            .world
+                            .rider(id)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_else(|| nick.to_string());
+                        tracing::info!(rider_id = id, %name, "新骑手接入");
+                        (Role::Rider(id), name)
+                    }
+                    None => {
+                        self.hub
+                            .send_error(conn_id, code::UNAUTHORIZED, "无法识别的令牌");
+                        self.hub.unregister(conn_id);
+                        return;
+                    }
+                },
+            }
         };
 
         self.hub.set_role(conn_id, role, name);
@@ -1752,6 +1981,121 @@ impl App {
             self.publish(&events);
         }
         self.push_server_info();
+    }
+
+    /// 名字 + 密码登录（烽火台建的号）。
+    ///
+    /// 失败给的是**协议错误码 + 一句给骑手看的话**：「密码不对」和「还没建号」
+    /// 必须分得开，否则骑手会一直重试密码，而其实该去找管理端要二维码。
+    fn login_with_password(
+        &mut self,
+        raw_name: &str,
+        password: &str,
+    ) -> Result<(Role, String), (&'static str, String)> {
+        let Some(name) = crate::auth::normalize_name(raw_name) else {
+            return Err((code::BAD_CREDENTIALS, "骑手名字不能是空的".into()));
+        };
+
+        // 查库失败按「没有这个号」处理——登录这条路宁可拒绝也不放行。
+        // 库真挂了会在启动日志里有 warn，不会没人知道。
+        let Some(stored) = self.store.account_hash(&name).unwrap_or(None) else {
+            return Err((
+                code::NO_ACCOUNT,
+                format!("「{name}」还没建号，去烽火台要一张二维码"),
+            ));
+        };
+        if !crate::auth::verify_password(&stored, password) {
+            return Err((code::UNAUTHORIZED, "密码不对".into()));
+        }
+
+        // 复用世界里的同名身体：账号是长期身份，骑手只是这一局里的一具身体。
+        // 服务端一重启身体就没了、账号还在，所以找不到就现建一具——这也是
+        // 「重启后老账号还能登」的全部实现。
+        let id = match self.world.human_rider_named(&name) {
+            Some(id) => id,
+            None => {
+                let id = self.world.spawn_human_rider(&name);
+                tracing::info!(rider_id = id, %name, "账号登录：这个号在本局还没有身体，建一具");
+                id
+            }
+        };
+        Ok((Role::Rider(id), name))
+    }
+
+    /// 骑手改自己的密码。**旧密码必须对**——连上了不等于能改这个号，
+    /// 否则捡到一台没锁屏的手机就能把号改走。
+    fn do_change_password(
+        &mut self,
+        conn_id: ConnId,
+        rid: RiderId,
+        old_password: String,
+        new_password: String,
+    ) {
+        let Some(name) = self.world.rider(rid).map(|r| r.name.clone()) else {
+            return self.ack_fail(conn_id, "change_password", code::UNAUTHORIZED, "骑手不存在");
+        };
+        if let Err(why) = crate::auth::check_password(&new_password) {
+            return self.ack_fail(conn_id, "change_password", code::BAD_CREDENTIALS, &why);
+        }
+        let Some(stored) = self.store.account_hash(&name).unwrap_or(None) else {
+            return self.ack_fail(
+                conn_id,
+                "change_password",
+                code::NO_ACCOUNT,
+                "这个骑手没有账号，改密码得先让烽火台建号",
+            );
+        };
+        if !crate::auth::verify_password(&stored, &old_password) {
+            return self.ack_fail(conn_id, "change_password", code::UNAUTHORIZED, "旧密码不对");
+        }
+
+        let result = crate::auth::hash_password(&new_password).and_then(|h| {
+            self.store
+                .set_account_password(&name, &h)
+                .map_err(|e| e.to_string())
+        });
+        match result {
+            Ok(()) => {
+                tracing::info!(%name, "骑手改了自己的密码");
+                self.hub.send_ack(conn_id, &Ack::ok("change_password"));
+            }
+            Err(e) => self.ack_fail(conn_id, "change_password", code::INTERNAL, &e),
+        }
+    }
+
+    /// 真人骑手改名时账号要不要跟着搬。
+    ///
+    /// - `Ok(None)` → 不用搬：模拟骑手，或者这位真人骑手还没有账号。
+    /// - `Ok(Some((from, to)))` → 得把账号从 `from` 搬到 `to`。
+    /// - `Err` → **整个改名都不要做**。目标是别人已有的账号名时，世界改了名字、
+    ///   账号却没搬，等于把那个账号的登录指向了一具陌生的身体。
+    fn account_rename_plan(
+        &self,
+        rider_id: RiderId,
+        new_name: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        let Some(rider) = self.world.rider(rider_id) else {
+            return Ok(None);
+        };
+        if rider.kind != RiderKind::Human {
+            return Ok(None);
+        }
+        let old = rider.name.clone();
+        // 名字不合法世界那边自己会拒，这里不用重复报错
+        let Some(new) = World::sanitize_rider_name(new_name) else {
+            return Ok(None);
+        };
+        if old == new {
+            return Ok(None);
+        }
+        if self.store.account(&new).unwrap_or(None).is_some() {
+            return Err(format!("「{new}」已经是某个骑手的账号名了，换一个"));
+        }
+        Ok(if self.store.account(&old).unwrap_or(None).is_some() {
+            Some((old, new))
+        } else {
+            None
+        })
     }
 
     fn send_snapshot(&mut self, conn_id: ConnId, role: Role) {
@@ -1805,6 +2149,23 @@ impl App {
     fn ack_err(&mut self, conn_id: ConnId, action: &str, e: ClaimError) {
         self.hub
             .send_ack(conn_id, &Ack::err(action, claim_code(&e), e.message()));
+    }
+
+    /// 给一条「协议错误码 + 中文原因」的 ack。给不来自 [`ClaimError`] 的失败用
+    /// （账号、密码这类）。
+    fn ack_fail(&mut self, conn_id: ConnId, action: &str, code: &'static str, msg: &str) {
+        self.hub.send_ack(conn_id, &Ack::err(action, code, msg));
+    }
+
+    /// 账号表写库失败。**只有这里会 500**——账号是管理动作，失败必须让烽火台
+    /// 看见，不能像模拟数据那样悄悄咽掉。
+    fn db_error(action: &str, e: impl std::fmt::Display) -> ApiError {
+        tracing::warn!(action, "账号表写库失败：{e}");
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            code::INTERNAL,
+            format!("{action}失败：{e}"),
+        )
     }
 
     /// 处理 `Result<Vec<SimEvent>, ClaimError>`：成功就广播 + ack。
@@ -2270,6 +2631,8 @@ mod tests {
             id,
             ClientMessage::Hello {
                 token: token.map(str::to_string),
+                rider_name: None,
+                password: None,
                 protocol_version: Some(PROTOCOL_VERSION.to_string()),
             },
         );
@@ -2312,6 +2675,8 @@ mod tests {
             1,
             ClientMessage::Hello {
                 token: None,
+                rider_name: None,
+                password: None,
                 protocol_version: Some("0.0".into()),
             },
         );
@@ -2333,6 +2698,8 @@ mod tests {
             1,
             ClientMessage::Hello {
                 token: Some("rider:999".into()),
+                rider_name: None,
+                password: None,
                 protocol_version: None,
             },
         );
@@ -3421,5 +3788,359 @@ mod tests {
             event(&msgs, "config_changed").is_some(),
             "配置改动必须广播，否则控制台停在旧值"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // 账号体系：烽火台建号 → 扫码 / 手填登录
+    // -----------------------------------------------------------------
+
+    /// 名字 + 密码握手。返回出站队列，welcome / error 由调用方自己判。
+    fn hello_with_password(
+        app: &mut App,
+        id: ConnId,
+        name: &str,
+        password: &str,
+    ) -> UnboundedReceiver<String> {
+        let rx = open(app, id);
+        send(
+            app,
+            id,
+            ClientMessage::Hello {
+                token: None,
+                rider_name: Some(name.to_string()),
+                password: Some(password.to_string()),
+                protocol_version: None,
+            },
+        );
+        rx
+    }
+
+    fn create_account(app: &mut App, name: &str, password: Option<&str>) -> serde_json::Value {
+        rpc(
+            app,
+            RpcRequest::CreateAccount {
+                name: name.to_string(),
+                password: password.map(str::to_string),
+            },
+        )
+        .expect("建号本身不该失败")
+    }
+
+    #[test]
+    fn create_account_returns_a_one_time_password_and_a_scannable_qr() {
+        let mut app = control_app();
+        let v = create_account(&mut app, " 张师傅 ", Some("pass1234"));
+
+        assert_eq!(v["name"].as_str(), Some("张师傅"), "名字要规范化");
+        assert_eq!(v["password"].as_str(), Some("pass1234"));
+        let uri = v["join"]["uri"].as_str().expect("要给连接串");
+        assert!(
+            uri.starts_with("ridersim://login?"),
+            "扫码走自定义 scheme：{uri}"
+        );
+        assert!(uri.contains("host=") && uri.contains("name=") && uri.contains("password="));
+        assert!(v["join"]["qr_svg"].is_string(), "二维码就该画出来了");
+        assert!(
+            v["hosts"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "至少要给一个手机可达地址"
+        );
+    }
+
+    #[test]
+    fn creating_an_account_without_a_password_mints_one() {
+        let mut app = control_app();
+        let v = create_account(&mut app, "李师傅", None);
+        let pw = v["password"].as_str().expect("管理员不想密码时服务端生成");
+        assert!(
+            crate::auth::check_password(pw).is_ok(),
+            "生成的密码必须合规"
+        );
+
+        // 生成的那个密码要真能登：库里存的哈希必须对得上
+        let mut rx = hello_with_password(&mut app, 1, "李师傅", pw);
+        assert!(event(&drain(&mut rx), "welcome").is_some());
+    }
+
+    #[test]
+    fn account_login_reuses_the_body_across_reconnects() {
+        let mut app = control_app();
+        create_account(&mut app, "张师傅", Some("pass1234"));
+
+        let mut rx1 = hello_with_password(&mut app, 1, "张师傅", "pass1234");
+        let msgs = drain(&mut rx1);
+        let w1 = event(&msgs, "welcome").expect("正确的账号密码该放行");
+        assert_eq!(w1["payload"]["role"].as_str(), Some("rider"));
+        let rid = w1["payload"]["rider_id"].as_u64().expect("骑手要有个身体");
+
+        close(&mut app, 1);
+
+        let mut rx2 = hello_with_password(&mut app, 2, "张师傅", "pass1234");
+        let msgs = drain(&mut rx2);
+        let w2 = event(&msgs, "welcome").expect("重连还得能进");
+        assert_eq!(
+            w2["payload"]["rider_id"].as_u64(),
+            Some(rid),
+            "重连必须复用同一具身体，不能再长一具"
+        );
+        assert_eq!(
+            app.world
+                .riders
+                .iter()
+                .filter(|r| r.kind == RiderKind::Human && r.name == "张师傅")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn account_login_tells_missing_account_apart_from_wrong_password() {
+        let mut app = control_app();
+
+        // 没建号：要让骑手知道该去烽火台要二维码，而不是一直重试密码
+        let mut rx = hello_with_password(&mut app, 1, "查无此人", "whatever");
+        let msgs = drain(&mut rx);
+        let err = event(&msgs, "error").expect("没建号就该拒");
+        assert_eq!(err["payload"]["code"].as_str(), Some(code::NO_ACCOUNT));
+        assert!(!app.hub.contains(1), "拒绝后要踢掉连接");
+
+        create_account(&mut app, "张师傅", Some("rightpass"));
+
+        let mut rx = hello_with_password(&mut app, 2, "张师傅", "wrongpass");
+        let msgs = drain(&mut rx);
+        let err = event(&msgs, "error").expect("密码错就该拒");
+        assert_eq!(err["payload"]["code"].as_str(), Some(code::UNAUTHORIZED));
+        assert!(!app.hub.contains(2));
+    }
+
+    #[test]
+    fn creating_the_same_account_again_conflicts_and_keeps_the_old_password() {
+        let mut app = control_app();
+        create_account(&mut app, "张师傅", Some("oldpass1"));
+
+        let err = rpc(
+            &mut app,
+            RpcRequest::CreateAccount {
+                name: "张师傅".into(),
+                password: Some("newpass1".into()),
+            },
+        )
+        .expect_err("重名建号必须被拒，否则老二维码会莫名失效");
+        assert_eq!(err.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(err.code, code::BAD_CREDENTIALS);
+
+        // 老密码还在：冲突不能顺手把密码覆盖了
+        let mut rx = hello_with_password(&mut app, 1, "张师傅", "oldpass1");
+        assert!(event(&drain(&mut rx), "welcome").is_some());
+    }
+
+    #[test]
+    fn too_short_passwords_are_rejected_at_creation() {
+        let mut app = control_app();
+        let err = rpc(
+            &mut app,
+            RpcRequest::CreateAccount {
+                name: "张师傅".into(),
+                password: Some("123".into()),
+            },
+        )
+        .expect_err("太短的密码该在服务端就被拦下");
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn change_password_needs_the_old_one_then_swaps_it() {
+        let mut app = control_app();
+        create_account(&mut app, "张师傅", Some("oldpass1"));
+        let mut rx = hello_with_password(&mut app, 1, "张师傅", "oldpass1");
+        drain(&mut rx); // welcome
+
+        // 旧密码错：光连上了不足以改密
+        send(
+            &mut app,
+            1,
+            ClientMessage::ChangePassword {
+                old_password: "nope".into(),
+                new_password: "newpass1".into(),
+            },
+        );
+        let msgs = drain(&mut rx);
+        let ack = event(&msgs, "ack").expect("改密要回 ack");
+        assert_eq!(ack["payload"]["ok"].as_bool(), Some(false));
+        assert_eq!(ack["payload"]["code"].as_str(), Some(code::UNAUTHORIZED));
+
+        // 旧密码对
+        send(
+            &mut app,
+            1,
+            ClientMessage::ChangePassword {
+                old_password: "oldpass1".into(),
+                new_password: "newpass1".into(),
+            },
+        );
+        let msgs = drain(&mut rx);
+        let ack = event(&msgs, "ack").expect("改密要回 ack");
+        assert_eq!(ack["payload"]["ok"].as_bool(), Some(true));
+        assert_eq!(ack["payload"]["action"].as_str(), Some("change_password"));
+
+        // 新密码能登、旧密码不能
+        close(&mut app, 1);
+        let mut rx2 = hello_with_password(&mut app, 2, "张师傅", "newpass1");
+        assert!(event(&drain(&mut rx2), "welcome").is_some(), "新密码该能进");
+        let mut rx3 = hello_with_password(&mut app, 3, "张师傅", "oldpass1");
+        let msgs = drain(&mut rx3);
+        let err = event(&msgs, "error").expect("旧密码该失效");
+        assert_eq!(err["payload"]["code"].as_str(), Some(code::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn resetting_a_password_on_a_missing_account_is_a_404() {
+        let mut app = control_app();
+        let err = rpc(
+            &mut app,
+            RpcRequest::SetAccountPassword {
+                name: "查无此人".into(),
+                password: None,
+            },
+        )
+        .expect_err("没有这个号就不该有密码");
+        assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(err.code, code::NO_ACCOUNT);
+    }
+
+    #[test]
+    fn resetting_a_password_invalidates_the_old_qr() {
+        let mut app = control_app();
+        create_account(&mut app, "张师傅", Some("oldpass1"));
+
+        let v = rpc(
+            &mut app,
+            RpcRequest::SetAccountPassword {
+                name: "张师傅".into(),
+                password: None,
+            },
+        )
+        .expect("重置不该失败");
+        let fresh = v["password"].as_str().expect("重置要回一次新明文");
+
+        let mut rx = hello_with_password(&mut app, 1, "张师傅", "oldpass1");
+        assert!(
+            event(&drain(&mut rx), "error").is_some(),
+            "旧二维码里的密码必须失效"
+        );
+        let mut rx2 = hello_with_password(&mut app, 2, "张师傅", fresh);
+        assert!(event(&drain(&mut rx2), "welcome").is_some());
+    }
+
+    #[test]
+    fn rpc_accounts_marks_who_is_on_the_field() {
+        let mut app = control_app();
+        create_account(&mut app, "张师傅", Some("pass1234"));
+        create_account(&mut app, "李师傅", Some("pass1234"));
+
+        let before = rpc(&mut app, RpcRequest::Accounts).expect("取名单不该失败");
+        let list = before["accounts"].as_array().expect("要有账号列表");
+        assert_eq!(list.len(), 2);
+        assert!(
+            list.iter().all(|a| a["rider_id"].is_null()),
+            "还没登录就不该有身体"
+        );
+
+        let _rx = hello_with_password(&mut app, 1, "张师傅", "pass1234");
+
+        let after = rpc(&mut app, RpcRequest::Accounts).unwrap();
+        let zhang = after["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"].as_str() == Some("张师傅"))
+            .expect("张师傅该在名单里");
+        assert!(zhang["rider_id"].is_number(), "登录后烽火台要看到身体");
+        assert_eq!(zhang["online"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn deleting_an_account_stops_the_login() {
+        let mut app = control_app();
+        create_account(&mut app, "张师傅", Some("pass1234"));
+        let v = rpc(
+            &mut app,
+            RpcRequest::DeleteAccount {
+                name: "张师傅".into(),
+            },
+        )
+        .expect("删号不该失败");
+        assert_eq!(v["deleted"].as_bool(), Some(true));
+
+        let mut rx = hello_with_password(&mut app, 1, "张师傅", "pass1234");
+        let msgs = drain(&mut rx);
+        let err = event(&msgs, "error").expect("删号后不该还能登");
+        assert_eq!(err["payload"]["code"].as_str(), Some(code::NO_ACCOUNT));
+    }
+
+    #[test]
+    fn renaming_a_rider_moves_their_account_name() {
+        let mut app = control_app();
+        create_account(&mut app, "张师傅", Some("pass1234"));
+        let mut rx = hello_with_password(&mut app, 1, "张师傅", "pass1234");
+        drain(&mut rx); // welcome
+        let rid = app
+            .world
+            .human_rider_named("张师傅")
+            .expect("登录后该有身体");
+
+        let (mut ctrl, _w) = hello(&mut app, 2, None);
+        send(
+            &mut app,
+            2,
+            ClientMessage::RenameRider {
+                rider_id: rid,
+                name: "张三".into(),
+            },
+        );
+        drain(&mut ctrl);
+
+        assert!(
+            app.store.account("张三").unwrap().is_some(),
+            "账号名要跟着骑手名一起搬"
+        );
+        assert!(
+            app.store.account("张师傅").unwrap().is_none(),
+            "旧名字不该还留着账号"
+        );
+    }
+
+    #[test]
+    fn renaming_onto_an_existing_account_is_refused_whole() {
+        let mut app = control_app();
+        create_account(&mut app, "张师傅", Some("pass1234"));
+        create_account(&mut app, "李师傅", Some("pass1234"));
+        let mut rx = hello_with_password(&mut app, 1, "张师傅", "pass1234");
+        drain(&mut rx);
+        let rid = app.world.human_rider_named("张师傅").unwrap();
+
+        let (mut ctrl, _w) = hello(&mut app, 2, None);
+        send(
+            &mut app,
+            2,
+            ClientMessage::RenameRider {
+                rider_id: rid,
+                name: "李师傅".into(),
+            },
+        );
+        let msgs = drain(&mut ctrl);
+        let ack = event(&msgs, "ack").expect("改名要回 ack");
+        assert_eq!(ack["payload"]["ok"].as_bool(), Some(false));
+
+        // 关键：不能世界改了名、账号却没搬——那会把李师傅的号指向张师傅的身体
+        assert_eq!(
+            app.world.rider(rid).unwrap().name,
+            "张师傅",
+            "改成别人已有的账号名时，整个改名都不该发生"
+        );
+        assert!(app.store.account("张师傅").unwrap().is_some());
+        assert!(app.store.account("李师傅").unwrap().is_some());
     }
 }

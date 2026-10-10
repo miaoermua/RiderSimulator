@@ -314,6 +314,18 @@ impl World {
         self.add_rider(RiderKind::Human, name, home)
     }
 
+    /// 找一具**已经存在的**同名真人骑手。
+    ///
+    /// 账号登录靠它复用身体：账号是长期身份，骑手只是这一局里的一具身体，
+    /// 服务端一重启身体就没了、账号还在。所以「同一个人重连」应当是找到旧身体，
+    /// 而不是再长出一具同名的来。模拟骑手不算——它们不登录。
+    pub fn human_rider_named(&self, name: &str) -> Option<RiderId> {
+        self.riders
+            .iter()
+            .find(|r| r.kind == RiderKind::Human && r.name == name)
+            .map(|r| r.id)
+    }
+
     /// 骑手名的字符上限。够写「张三」「AI-小队长」，再长卡片就换行。
     pub const MAX_RIDER_NAME_CHARS: usize = 12;
 

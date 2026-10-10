@@ -17,6 +17,7 @@
 // 分阶段编译：已落地的模块先接上，其余仍在实现中。
 pub mod amap;
 pub mod app;
+pub mod auth;
 pub mod content;
 pub mod llm;
 pub mod net;

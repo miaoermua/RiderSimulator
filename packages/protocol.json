@@ -18,11 +18,16 @@
     {
       "type": "hello",
       "required": true,
-      "comment": "必须是连接后的第一条消息，否则服务端返回 HELLO_REQUIRED 并断开。",
+      "comment": "必须是连接后的第一条消息，否则服务端返回 HELLO_REQUIRED 并断开。**有 rider_name 就走账号登录**（烽火台建的号），否则看 token。两者都没有 = 观战。",
       "fields": {
+        "rider_name": {
+          "type": "string?",
+          "comment": "账号名 = 骑手名。服务端按 normalize_name 规范化后查 account 表：查不到回 NO_ACCOUNT，密码不对回 BAD_CREDENTIALS，两种都在断开前发 error。同名真人骑手会被复用同一具身体（重连不会长出第二个自己）。"
+        },
+        "password": { "type": "string?", "comment": "账号密码。明文，但只在局域网内、且服务端只存 Argon2 哈希。" },
         "token": {
           "type": "string?",
-          "comment": "缺省=观战/控制端（受 RIDER_SIM_ALLOW_CONTROL 约束）；rider:<id>=绑定骑手；new:<昵称>=现场建号。"
+          "comment": "**开发后门**：rider:<id>=绑定骑手；new:<昵称>=现场建号（绕过账号表，不查重）；留空=观战/控制端（受 RIDER_SIM_ALLOW_CONTROL 约束）。"
         },
         "protocol_version": { "type": "string?", "comment": "不一致则返回 PROTOCOL_MISMATCH 并断开。" }
       }
@@ -40,6 +45,13 @@
     { "type": "arrive_shop", "roles": ["rider", "control"], "fields": { "order_id": "u32" } },
     { "type": "arrive_customer", "roles": ["rider", "control"], "fields": { "order_id": "u32" } },
     { "type": "deliver", "roles": ["rider", "control"], "fields": { "order_id": "u32" } },
+
+    {
+      "type": "change_password",
+      "roles": ["rider", "control"],
+      "fields": { "old_password": "string", "new_password": "string" },
+      "comment": "改自己的密码。old_password 错回 UNAUTHORIZED。这是把二维码里那份明文密码作废的唯一手段——密码一变，旧码当场失效。"
+    },
 
     { "type": "set_online", "roles": ["rider", "control"], "fields": { "online": "bool" } },
     {
@@ -132,6 +144,30 @@
     "control_adds": ["fatigue", "expected_value_cents"],
     "comment": "收入相关字段对其他角色一律为 null，由服务端在 hub::render 里过滤。"
   },
+  "login_uri": {
+    "_note": "二维码内容，也是骑手端手填表单要的三样东西。权威实现在 server/src/net/join.rs 的 JoinInfo::login_uri，客户端解析在 client/lib/login_link.dart，两边必须一致。",
+    "format": "ridersim://login?host=<host>&port=<port>&name=<name>&password=<password>",
+    "example": "ridersim://login?host=192.168.1.7&port=8080&name=%E5%BC%A0%E4%B8%89&password=abc123",
+    "encoding": "百分号编码，只放过 RFC 3986 的 unreserved（A-Za-z0-9-._~）；中文名字必须编。",
+    "fields": {
+      "host": "手机可达的主机（IPv4 或域名，不含端口）。绝不能是 127.0.0.1——到了手机上那指的是手机自己。",
+      "port": "u16",
+      "name": "骑手名 = 账号名",
+      "password": "**明文**。见下方 tradeoff。"
+    },
+    "tradeoff": "明文密码直接躺在码里，是有意的取舍（2026-10-11 定）：扫码即登录，不依赖服务端状态、不依赖票据过期。代价是这张码能截图、能打印、发出去收不回来——要作废只能去烽火台重置该骑手密码，旧码会因密码变更当场失效。",
+    "ws_url": "客户端最终连的是 ws://<host>:<port>/ws"
+  },
+  "http_api": {
+    "_note": "给控制台与外部工具（workbuddy 等）的一次性 HTTP 接口。鉴权与 /ws 的 hello 同一套：Authorization: Bearer <RIDER_SIM_CONTROL_TOKEN>；没配令牌时退化成 RIDER_SIM_ALLOW_CONTROL。错误体一律 {\"error\":{\"code\",\"message\"}}。",
+    "accounts": {
+      "GET /api/accounts": "账号名单 + 手机可达地址。响应：{ accounts: [{name, created_at, updated_at, rider_id?, rider_key?, online?}], hosts: [string], primary_host: string? }。**不含密码**。",
+      "POST /api/accounts": "建号。请求 { name, password? }；password 缺省 = 服务端生成。重名回 409 BAD_CREDENTIALS（**不覆盖原密码**，否则已发出去的二维码会莫名失效）。密码太短回 400。响应 { name, password, join, hosts, primary_host }，其中 password 是**全系统唯一一次**能看到明文的地方。",
+      "POST /api/accounts/{name}/password": "改 / 重置密码。请求 { password? }，缺省 = 服务端生成。账号不存在回 404 NO_ACCOUNT。响应同建号。",
+      "DELETE /api/accounts/{name}": "删号。响应 { name, deleted }。名字按 normalize_name 规范化后删。"
+    },
+    "join": "join 字段 = { ws_url, uri, qr_svg }，即上方的 login_uri 与它的 SVG 二维码（控制台直接塞进 DOM，不用引前端二维码库）。qr_svg 在内容编不成码时为 null。"
+  },
   "error_codes": {
     "transport": [
       "BAD_REQUEST",
@@ -139,6 +175,8 @@
       "HELLO_REQUIRED",
       "PROTOCOL_MISMATCH",
       "UNAUTHORIZED",
+      "NO_ACCOUNT",
+      "BAD_CREDENTIALS",
       "NOT_A_RIDER",
       "NOT_A_CONTROLLER",
       "FEATURE_DISABLED",

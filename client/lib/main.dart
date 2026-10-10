@@ -18,12 +18,45 @@ class RiderApp extends StatefulWidget {
 class _RiderAppState extends State<RiderApp> {
   final GameState _state = GameState();
   GameClient? _client;
+
+  /// 已经发起了连接（等着握手结果）。
   bool _entered = false;
 
-  void _enter(String url, String? token) {
-    _client ??= GameClient(_state);
-    _client!.connect(url, token: token);
-    setState(() => _entered = true);
+  /// 握手成功。**只有到这一步才放进主界面**——名字 / 密码不对时服务端会拒绝，
+  /// 那时得把人留在登录页上看到原因，而不是丢进一个没有数据的骑手首页。
+  bool _welcomed = false;
+
+  /// 上一次登录被拒的原因。
+  String? _loginError;
+
+  void _enter(LoginRequest req) {
+    final client = _client ??= GameClient(_state);
+
+    client.onWelcome = () {
+      if (!mounted) return;
+      setState(() => _welcomed = true);
+    };
+    client.onAuthError = (reason) {
+      if (!mounted) return;
+      // 退回登录页，并把服务端给的原因留在那儿。
+      setState(() {
+        _entered = false;
+        _welcomed = false;
+        _loginError = reason;
+      });
+    };
+
+    client.connect(
+      req.url,
+      token: req.token,
+      riderName: req.riderName,
+      password: req.password,
+    );
+    setState(() {
+      _entered = true;
+      _welcomed = false;
+      _loginError = null;
+    });
   }
 
   @override
@@ -42,9 +75,9 @@ class _RiderAppState extends State<RiderApp> {
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1976D2)),
         useMaterial3: true,
       ),
-      home: _entered
+      home: (_entered && _welcomed)
           ? RiderHomePage(state: _state, client: _client!)
-          : LoginPage(onEnter: _enter),
+          : LoginPage(onEnter: _enter, error: _loginError),
     );
   }
 }

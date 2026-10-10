@@ -24,7 +24,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -52,6 +52,15 @@ pub const AI_STATE_PATH: &str = "/api/ai/state";
 pub const AI_CONFIG_PATH: &str = "/api/ai/config";
 /// 人工否决一条 AI 决策。
 pub const AI_REJECT_PATH: &str = "/api/ai/reject";
+/// 骑手账号：`GET` 列名单（含手机可达地址），`POST` 建号。
+///
+/// 建号的响应里带**明文密码**和二维码——这是全系统唯一一次能看到明文的
+/// 机会（库只存 Argon2 哈希），见 [`crate::net::join`] 的取舍说明。
+pub const ACCOUNTS_PATH: &str = "/api/accounts";
+/// `POST` 改 / 重置某个账号的密码。`password` 缺省时服务端生成一个并回显。
+pub const ACCOUNT_PASSWORD_PATH: &str = "/api/accounts/{name}/password";
+/// `DELETE` 删账号。
+pub const ACCOUNT_PATH: &str = "/api/accounts/{name}";
 
 /// 鉴权配置。由 `main.rs` 的环境变量决定。
 #[derive(Debug, Clone, Default)]
@@ -109,6 +118,20 @@ pub enum RpcRequest {
     SetAi(super::protocol::AiPatch),
     /// 人工否决一条决策。
     RejectAi { decision_id: u64 },
+    /// 账号名单 + 手机可达的接入地址。
+    Accounts,
+    /// 建号。`password` 缺省 = 服务端生成一个（响应里回显明文 + 二维码）。
+    CreateAccount {
+        name: String,
+        password: Option<String>,
+    },
+    /// 改 / 重置密码。`password` 缺省 = 服务端生成一个（响应里回显）。
+    SetAccountPassword {
+        name: String,
+        password: Option<String>,
+    },
+    /// 删号。
+    DeleteAccount { name: String },
 }
 
 /// 主循环回给 HTTP 的结果。
@@ -256,7 +279,61 @@ pub fn routes(state: ApiState) -> Router {
         .route(AI_STATE_PATH, get(ai_state_route))
         .route(AI_CONFIG_PATH, post(ai_config_route))
         .route(AI_REJECT_PATH, post(ai_reject_route))
+        .route(
+            ACCOUNTS_PATH,
+            get(accounts_route).post(create_account_route),
+        )
+        .route(ACCOUNT_PASSWORD_PATH, post(account_password_route))
+        .route(ACCOUNT_PATH, delete(account_delete_route))
         .with_state(state)
+}
+
+async fn accounts_route(State(api): State<ApiState>, headers: HeaderMap) -> Response {
+    api.call(&headers, RpcRequest::Accounts).await
+}
+
+async fn create_account_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(name) = body.get("name").and_then(Value::as_str) else {
+        return ApiError::bad_request("需要 name").into_response();
+    };
+    let password = body
+        .get("password")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    api.call(
+        &headers,
+        RpcRequest::CreateAccount {
+            name: name.to_string(),
+            password,
+        },
+    )
+    .await
+}
+
+async fn account_password_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let password = body
+        .get("password")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    api.call(&headers, RpcRequest::SetAccountPassword { name, password })
+        .await
+}
+
+async fn account_delete_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    api.call(&headers, RpcRequest::DeleteAccount { name }).await
 }
 
 async fn ai_state_route(State(api): State<ApiState>, headers: HeaderMap) -> Response {

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { App as AntApp, Layout, Tabs, theme } from "antd";
 import { useStore } from "./hooks";
+import { AccessPanel } from "./components/AccessPanel";
 import { AiPanel } from "./components/AiPanel";
 import { LoginGate } from "./components/LoginGate";
 import { LogPanel } from "./components/LogPanel";
@@ -32,6 +33,7 @@ export function App() {
     { key: "riders", label: "骑手", children: <RidersPanel selected={selected} onSelect={pickRider} /> },
     { key: "orders", label: "订单", children: <OrdersPanel /> },
     { key: "ai", label: "AI", children: <AiPanel /> },
+    { key: "access", label: "骑手接入", children: <AccessPanel /> },
     { key: "settings", label: "设置", children: <SettingsPanel /> },
     { key: "log", label: "日志", children: <LogPanel /> },
   ];
