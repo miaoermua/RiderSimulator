@@ -150,7 +150,7 @@ pub fn assign_forced(
     if rider.is_injured(now) {
         return Err(ClaimError::RiderInjured);
     }
-    if rider.held.len() as u32 >= world.cfg.backorder.max_held {
+    if rider.held.len() as u32 >= rider.effective_max_held(&world.cfg) {
         return Err(ClaimError::HeldLimitReached);
     }
 
@@ -180,7 +180,7 @@ pub fn claim_extra(
         let a = try_claim(world, order_id, rider_id)?;
         return Ok((a, 0));
     }
-    if rider.held.len() as u32 >= world.cfg.backorder.max_held {
+    if rider.held.len() as u32 >= rider.effective_max_held(&world.cfg) {
         return Err(ClaimError::HeldLimitReached);
     }
     check_claimable(world, order_id, rider_id)?;
@@ -356,7 +356,7 @@ pub fn arrive_shop(
     if held.phase != Phase::ToShop {
         return Err(ClaimError::WrongPhase);
     }
-    held.phase = Phase::WaitingFood;
+    held.set_leg(Phase::WaitingFood, 1);
     held.awaiting_ack = false;
     held.remaining_min = 0;
     held.wait_started_min = now;
@@ -377,7 +377,7 @@ pub fn arrive_customer(
     if held.phase != Phase::ToCustomer {
         return Err(ClaimError::WrongPhase);
     }
-    held.phase = Phase::ArrivedCustomer;
+    held.set_leg(Phase::ArrivedCustomer, 1);
     held.awaiting_ack = false;
     held.remaining_min = 0;
     Ok(state_event(world, rider_id).into_iter().collect())

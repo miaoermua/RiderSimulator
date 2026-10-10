@@ -404,17 +404,20 @@ impl World {
 
     /// 关掉超速 / 解限速开关后，把不再允许的档位降回合规。返回被降档的骑手。
     pub fn enforce_speed_policy(&mut self) -> Vec<RiderId> {
-        let allowed = |m: SpeedMode, cfg: &SimConfig| match m {
-            SpeedMode::Compliant => true,
-            SpeedMode::Tolerant => cfg.allow_speeding,
-            SpeedMode::Unrestricted => cfg.allow_unrestricted,
-        };
+        let allowed = |m: SpeedMode, cfg: &SimConfig| cfg.speed_mode_allowed(m);
         let cfg = &self.cfg;
         let mut changed = Vec::new();
         for r in &mut self.riders {
             if !allowed(r.speed_mode, cfg) || !allowed(r.strategy.speed_mode, cfg) {
                 r.speed_mode = SpeedMode::Compliant;
                 r.strategy.speed_mode = SpeedMode::Compliant;
+                changed.push(r.id);
+            }
+            // LLM 下过档位覆盖的，开关关掉后同样要撤回——否则它会绕过 enforce
+            if let Some(m) = r.policy_override.mode_override
+                && !allowed(m, cfg)
+            {
+                r.policy_override.mode_override = None;
                 changed.push(r.id);
             }
         }
@@ -468,12 +471,20 @@ impl World {
 
     /// 生成 1 单。商户按评分加权抽取（评分高的店单量多）。
     pub fn generate_order(&mut self) -> Option<OrderId> {
-        let candidates: Vec<(u32, String, LatLng, f32, u32)> = self
+        let candidates: Vec<(u32, String, LatLng, f32, u32, u8)> = self
             .merchants
             .iter()
             .filter_map(|m| {
-                m.coords()
-                    .map(|c| (m.id, m.name.clone(), c, m.rating, m.avg_prep_min))
+                m.coords().map(|c| {
+                    (
+                        m.id,
+                        m.name.clone(),
+                        c,
+                        m.rating,
+                        m.avg_prep_min,
+                        m.walk_difficulty.min(2),
+                    )
+                })
             })
             .collect();
         if candidates.is_empty() {
@@ -492,7 +503,16 @@ impl World {
                 break;
             }
         }
-        let (merchant_id, merchant_name, merchant_pos, _rating, prep) = candidates[idx].clone();
+        let (merchant_id, merchant_name, merchant_pos, _rating, prep, shop_walk) =
+            candidates[idx].clone();
+
+        // 顾客端步行难度：大多送到楼下，少数要上楼 / 进深巷。
+        // 属于物理量，随世界种子确定，运行期不变。
+        let cust_walk = match self.rng.random_range(0..100u32) {
+            0..=59 => 0u8,
+            60..=89 => 1,
+            _ => 2,
+        };
 
         // 顾客位置：0.5~4.5km，随机方向
         let dist_m = self.rng.random_range(500.0f64..4500.0);
@@ -572,6 +592,8 @@ impl World {
             distance_m: road_distance_m,
             promised_minutes,
             tier,
+            merchant_walk_difficulty: shop_walk,
+            customer_walk_difficulty: cust_walk,
             created_at_min: now,
             claim_deadline_min: now + self.cfg.claim_window_ticks() as u64,
             picked_up_at_min: None,
@@ -863,6 +885,12 @@ pub fn synth_merchants(seed: u64, n: u32) -> Vec<Merchant> {
                 rating: rng.random_range(4.0f32..5.0),
                 avg_prep_min: rng.random_range(5..25),
                 signature: format!("招牌{}", KIND[(ki + 1) % 8]),
+                // 合成数据没有人工标注，按「路边店为主、少数商场店」的分布给档
+                walk_difficulty: match rng.random_range(0..100u32) {
+                    0..=64 => 0,
+                    65..=89 => 1,
+                    _ => 2,
+                },
             }
         })
         .collect()
@@ -1028,7 +1056,10 @@ mod tests {
             w.expire_stale_orders();
         }
         assert!(w.pending_orders().is_empty(), "投满上限后不该再留在池子");
-        assert_eq!(w.order(ids[0]).expect("订单还在").status, OrderStatus::Expired);
+        assert_eq!(
+            w.order(ids[0]).expect("订单还在").status,
+            OrderStatus::Expired
+        );
     }
 
     #[test]
@@ -1045,7 +1076,11 @@ mod tests {
         crate::sim::scheduler::reject_order(&mut w, rider_id, order_id).expect("取消失败");
 
         let o = w.order(order_id).expect("订单还在");
-        assert_eq!(o.status, OrderStatus::Pending, "被取消的单要退回大厅而非作废");
+        assert_eq!(
+            o.status,
+            OrderStatus::Pending,
+            "被取消的单要退回大厅而非作废"
+        );
         assert!(o.assigned_to.is_none());
         assert_eq!(o.redispatch_count, 1);
         assert!(o.surcharge_cents > 0, "重投要加价");

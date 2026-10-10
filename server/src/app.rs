@@ -31,7 +31,11 @@ use tokio::sync::{
 };
 use tokio::time::{Instant, sleep_until};
 
-use crate::llm::{LlmConfig, PlanFetch, PreparedPlan, TacticalBrain, TaskJudge, TaskRuling};
+use crate::llm::{
+    AiLayer, AiOrchestrator, DirectorBrain, LayerKey, LayerModels, LlmConfig, PlanFetch,
+    PreparedPlan, PreparedWorldPlan, TacticalBrain, TaskJudge, TaskRuling, ValidatedWorldOp,
+    WorldFetch,
+};
 use crate::net::{
     Ack, ApiAuth, ApiError, ClientMessage, ConnId, DispatchItem, Envelope, Hub, Inbound,
     PROTOCOL_VERSION, Role, RpcReply, RpcRequest, code, render_snapshot, server_info,
@@ -40,8 +44,10 @@ use crate::sim::{
     OrderId, RiderId,
     ai::LlmPlan,
     economy,
-    event::{DecisionSource, SimEvent},
+    event::{AiOpBrief, DecisionSource, SimEvent},
+    host::{self, HostMode},
     scheduler::{self, ClaimError},
+    station::{Station, StationKpi},
     tick::{self, TickInput},
     world::World,
 };
@@ -93,8 +99,17 @@ struct PendingRuling {
     ruling: TaskRuling,
 }
 
-/// 后台任务送回来的一轮 LLM 结果。
-type PlanResult = (PreparedPlan, PlanFetch);
+/// 后台任务送回来的一轮 AI 结果。
+///
+/// 三层**共用同一条通道**：编排器保证同一时刻只有一个在飞请求，
+/// 所以回来的必定是当时占坑的那一层。
+#[derive(Debug)]
+enum AiInbound {
+    /// 骑手层：一批动作 + 策略。`u64` 是决策 id。
+    Rider(u64, PreparedPlan, PlanFetch),
+    /// 烽火台层：世界参数调整 + 旁白。`u64` 是决策 id。
+    Director(u64, PreparedWorldPlan, WorldFetch),
+}
 
 /// 主循环。
 pub struct App {
@@ -105,22 +120,42 @@ pub struct App {
 
     brain: TacticalBrain,
     judge: TaskJudge,
+    /// 烽火台大脑（世界导演）。只碰世界参数，不碰具体的人和单。
+    director: DirectorBrain,
+    /// 三层 LLM 的统一出口。**由它决定「这一 tick 轮到哪一层」。**
+    orchestrator: AiOrchestrator,
     /// LLM 接入配置（Key / Base URL / 模型）。控制台可改，落库后重启仍生效。
     ///
     /// **绝不下发**：任何给客户端的地方都只报「配没配」，不报内容。
     llm_config: LlmConfig,
+    /// 分层模型（成本优化）。全空 = 三层共用全局模型。
+    layer_models: LayerModels,
 
     inbound_tx: UnboundedSender<Inbound>,
     inbound_rx: Option<UnboundedReceiver<Inbound>>,
     ruling_tx: UnboundedSender<PendingRuling>,
     ruling_rx: Option<UnboundedReceiver<PendingRuling>>,
-    plan_tx: UnboundedSender<PlanResult>,
-    plan_rx: Option<UnboundedReceiver<PlanResult>>,
+    plan_tx: UnboundedSender<AiInbound>,
+    plan_rx: Option<UnboundedReceiver<AiInbound>>,
 
     /// 已占坑、正在后台打 HTTP 的那一轮。`None` = 没有在途请求。
     inflight_since: Option<Instant>,
+    /// 在飞的是哪一层（用于超时兜底时把编排器的坑还回去）。
+    inflight_layer: Option<AiLayer>,
     /// 已经拿到、等下一个 tick 消费的计划。
     pending_plan: Option<LlmPlan>,
+    /// 已经校验、等下一 tick 落地的世界操作（烽火台）。
+    pending_world_ops: Vec<ValidatedWorldOp>,
+    /// 烽火台自己的操作史，写进下一轮 prompt（「别反复横跳」）。
+    world_history: Vec<String>,
+    /// 真人在线时允许 AI 代管的模式（见 `sim::host`）。
+    host_mode: HostMode,
+    /// 下一个 AI 决策 id（人工否决用它点名）。
+    next_decision_id: u64,
+    /// 已产出、**尚未落地**、因此还能被人工否决的那一条决策：`(id, layer)`。
+    pending_decision: Option<(u64, &'static str)>,
+    /// 人工否决记录（新的在前）。控制台展示，也留给后续决策参考。
+    reject_log: Vec<serde_json::Value>,
     /// 暂停前的倍率，恢复时用。
     paused_multiplier: u32,
     /// 节拍需要重排。切档 / 对齐时钟后置位，让主循环从现在重新计时。
@@ -160,14 +195,30 @@ impl App {
                 LlmConfig::default()
             }
         });
-        let (brain, judge) = if llm_config.has_key() {
+        // 分层模型：骑手层高频要便宜，烽火台层低频可以贵一点。
+        // 没配（默认）时三层都用全局模型，行为与从前逐字节一致。
+        let layer_models = LayerModels::from_env();
+        let (brain, judge, director) = if llm_config.has_key() {
             (
-                TacticalBrain::from_config(&llm_config),
+                TacticalBrain::from_config(&llm_config.for_layer(&layer_models, LayerKey::Rider)),
                 TaskJudge::from_config(&llm_config),
+                DirectorBrain::from_config(
+                    &llm_config.for_layer(&layer_models, LayerKey::Director),
+                ),
             )
         } else {
-            (TacticalBrain::disabled(), TaskJudge::disabled())
+            (
+                TacticalBrain::disabled(),
+                TaskJudge::disabled(),
+                DirectorBrain::disabled(),
+            )
         };
+
+        // 三层编排器：系统里唯一的 LLM 调用出口。没 Key 就是关闭状态。
+        let mut orchestrator = AiOrchestrator::from_config(&llm_config);
+        // 站长层的决策（限单 / 强派）目前**搭骑手层那一轮的车**一起下发
+        // （见 `llm::protocol` 的 `station_ops`），所以编排器里不再单独占坑。
+        orchestrator.set_layer_enabled(AiLayer::Station, false);
 
         let mut opts = opts;
         // 「允许调用 LLM」= 命令行开过，或控制台配过 Key。
@@ -193,9 +244,12 @@ impl App {
             world,
             hub: Hub::new(),
             store,
+            layer_models,
             opts,
             brain,
             judge,
+            director,
+            orchestrator,
             llm_config,
             inbound_tx,
             inbound_rx: Some(inbound_rx),
@@ -204,7 +258,14 @@ impl App {
             plan_tx,
             plan_rx: Some(plan_rx),
             inflight_since: None,
+            inflight_layer: None,
             pending_plan: None,
+            pending_world_ops: Vec::new(),
+            world_history: Vec::new(),
+            host_mode: HostMode::default(),
+            next_decision_id: 1,
+            pending_decision: None,
+            reject_log: Vec::new(),
             paused_multiplier,
             beat_reset: false,
             last_brain_note: String::new(),
@@ -291,7 +352,7 @@ impl App {
                     }
                 }
                 Some(r) = rulings.recv() => self.on_ruling(r),
-                Some((p, f)) = plans.recv() => self.on_plan(p, f),
+                Some(ai) = plans.recv() => self.on_ai(ai),
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         break;
@@ -320,10 +381,31 @@ impl App {
         {
             tracing::warn!("LLM 计划超时未归，放弃这一轮");
             self.inflight_since = None;
+            if let Some(layer) = self.inflight_layer.take() {
+                self.orchestrator.record_fallback(layer);
+                self.orchestrator.finish(layer);
+            }
+        }
+
+        // 烽火台上一轮拿到的世界操作，在这一 tick 前落地。
+        self.apply_pending_world_ops();
+        if matches!(self.pending_decision, Some((_, "director"))) {
+            self.pending_decision = None; // 已落地，不能再撤
         }
 
         let plan = self.pending_plan.take();
-        let events = tick::tick(&mut self.world, TickInput { llm_plan: plan });
+        if plan.is_some() && matches!(self.pending_decision, Some((_, "rider"))) {
+            self.pending_decision = None; // 已交给 tick，不能再撤
+        }
+        let events = tick::tick(
+            &mut self.world,
+            TickInput {
+                llm_plan: plan,
+                host_mode: self.host_mode,
+                // 每 tick 现算，**不缓存**：玩家断线要立刻让 AI 接手。
+                live_riders: self.hub.live_rider_ids(),
+            },
+        );
         self.tick_count += 1;
         self.publish(&events);
 
@@ -359,6 +441,139 @@ impl App {
         }
     }
 
+    /// 三层 AI 的完整状态。控制台 AI Tab（`server_info.ai`）与
+    /// `GET /api/ai` 共用这一份口径，避免两边各说各话。
+    ///
+    /// **不含任何 Key**，只报「配没配」。
+    fn ai_state(&self) -> serde_json::Value {
+        let station = Station::for_world(&self.world);
+        let kpi = StationKpi::compute(&self.world, &station);
+        let bs = self.brain.stats();
+        let cache_total = bs.cached_hits + bs.calls;
+        let hit_rate = if cache_total == 0 {
+            0.0
+        } else {
+            bs.cached_hits as f64 / cache_total as f64
+        };
+        json!({
+            "llm_configured": self.llm_config.has_key(),
+            "llm_model": self.llm_config.model,
+            "llm_base_url": self.llm_config.base_url,
+            "brain_enabled": self.world.cfg.llm_brain_enabled,
+            "host_mode": self.host_mode.key(),
+            // 成本优化：三层各用什么模型 + 指纹缓存命中率。
+            "models": LayerKey::ALL.iter().map(|&l| {
+                (l.key().to_string(), json!(self.llm_config.model_for(&self.layer_models, l)))
+            }).collect::<serde_json::Map<_, _>>(),
+            "cache": {
+                "hits": bs.cached_hits,
+                "calls": bs.calls,
+                "hit_rate": hit_rate,
+            },
+            "budget": {
+                "calls_today": self.orchestrator.calls_today(self.world.day),
+                "max_calls_per_day": self.orchestrator.max_calls_per_day(),
+                "inflight": self.orchestrator.inflight().map(|l| l.key()),
+            },
+            "layers": AiLayer::ALL.iter().map(|&l| {
+                let s = self.orchestrator.stats(l);
+                json!({
+                    "layer": l.key(),
+                    "enabled": self.orchestrator.layer_enabled(l),
+                    "interval_min": l.min_interval_min(),
+                    "calls": s.calls,
+                    "failures": s.failures,
+                    "applied": s.applied,
+                    "dropped": s.dropped,
+                    "fallbacks": s.fallbacks,
+                })
+            }).collect::<Vec<_>>(),
+            "station": {
+                "id": station.id,
+                "name": station.name,
+                "rider_count": station.rider_ids.len(),
+                "kpi": kpi,
+            },
+            // 还能撤的那一条决策（控制台据此亮「否决」按钮）。
+            "rejectable": self.pending_decision.map(|(id, layer)| json!({
+                "decision_id": id,
+                "layer": layer,
+            })),
+            "reject_log": self.reject_log,
+        })
+    }
+
+    /// `POST /api/ai`：改开关与托管模式。**只改给出的字段**。
+    fn rpc_set_ai(&mut self, patch: &crate::net::AiPatch) -> RpcReply {
+        if let Some(on) = patch.enabled {
+            self.world.cfg.llm_brain_enabled = on;
+        }
+        for (layer, flag) in [
+            (AiLayer::Rider, patch.rider),
+            (AiLayer::Station, patch.station),
+            (AiLayer::Director, patch.director),
+        ] {
+            if let Some(on) = flag {
+                // 站长层搭骑手层的车（`station_ops`），不单独发请求：开了它只是
+                // 让「站长该决策了」这一轮到点时也顺带跑一轮骑手（见 `maybe_start_plan`）。
+                self.orchestrator.set_layer_enabled(layer, on);
+            }
+        }
+        if let Some(mode) = patch.host_mode.as_deref() {
+            let Some(m) = HostMode::from_key(mode) else {
+                return Err(ApiError::bad_request(format!(
+                    "未知托管模式：{mode}（可选 simulated_only / autopilot / off）"
+                )));
+            };
+            self.host_mode = m;
+        }
+        Ok(self.ai_state())
+    }
+
+    /// `POST /api/ai/reject`：人工否决。
+    ///
+    /// 只有**还没落地**的决策撤得掉（骑手层的待指派、烽火台的待生效世界操作）。
+    /// 已经生效的（策略、已经派出去的单）撤不回来，但会记进否决台账——
+    /// 控制台看得见「人否决了什么」，后续 AI 也会读到这份记录。
+    fn rpc_reject_ai(&mut self, decision_id: u64) -> RpcReply {
+        let layer = match self.pending_decision {
+            Some((id, layer)) if id == decision_id => {
+                match layer {
+                    "rider" => {
+                        self.pending_plan = None;
+                    }
+                    "director" => {
+                        self.pending_world_ops.clear();
+                    }
+                    _ => {}
+                }
+                self.pending_decision = None;
+                self.reject_log.insert(
+                    0,
+                    json!({ "decision_id": decision_id, "layer": layer, "result": "reverted" }),
+                );
+                Some(layer)
+            }
+            _ => {
+                self.reject_log.insert(
+                    0,
+                    json!({ "decision_id": decision_id, "layer": "unknown", "result": "already_applied" }),
+                );
+                None
+            }
+        };
+        // 台账只留最近 20 条。
+        self.reject_log.truncate(20);
+
+        Ok(json!({
+            "ok": layer.is_some(),
+            "rejected": layer.is_some(),
+            "decision_id": decision_id,
+            "layer": layer,
+            "reason": if layer.is_some() { "已撤销，未落地" } else { "该决策已生效或不存在，仅记入台账" },
+        }))
+    }
+
     /// 给控制端推一份服务器状态（不含任何 Key）。
     fn push_server_info(&mut self) {
         let mut info = server_info(&self.world, &self.hub.stats(), self.llm_enabled(), false);
@@ -369,12 +584,11 @@ impl App {
                 "brain_max_calls_per_day".into(),
                 json!(self.brain.max_calls_per_day()),
             );
+            // 三层 AI 的统一口径：开关、预算、各层统计、站点 KPI、否决记录。
+            obj.insert("ai".into(), self.ai_state());
             // 只发给控制端（send_to_control），所以可以回模型信息；
             // **Key 永远不出现在这里**，只报「配没配」。
-            obj.insert(
-                "llm_configured".into(),
-                json!(self.llm_config.has_key()),
-            );
+            obj.insert("llm_configured".into(), json!(self.llm_config.has_key()));
             obj.insert("llm_base_url".into(), json!(self.llm_config.base_url));
             obj.insert("llm_model".into(), json!(self.llm_config.model));
         }
@@ -398,7 +612,10 @@ impl App {
     // LLM 两段式
     // -----------------------------------------------------------------
 
-    /// 如果条件允许，占一个时段坑并把 HTTP 丢给后台。
+    /// 如果条件允许，占一层坑并把 HTTP 丢给后台。
+    ///
+    /// 「轮到哪一层」全交给 [`AiOrchestrator::next_due`]：它统一管预算、间隔、
+    /// 并发（同一时刻只有一个在飞）。这里只负责按层的类型组装请求。
     fn maybe_start_plan(&mut self) {
         if self.inflight_since.is_some() {
             return;
@@ -406,46 +623,184 @@ impl App {
         if !self.llm_enabled() || !self.world.cfg.llm_brain_enabled {
             return;
         }
-        let idle = self.world.idle_riders();
-        let pending = self.world.pending_orders();
-        match self.brain.prepare(&self.world, &idle, &pending) {
-            Ok(prepared) => {
-                let tx = self.plan_tx.clone();
-                self.inflight_since = Some(Instant::now());
-                tokio::spawn(async move {
-                    let fetched = prepared.request().await;
-                    if tx.send((prepared, fetched)).is_err() {
-                        tracing::debug!("主循环已退出，丢弃这一轮 LLM 结果");
-                    }
-                });
+        // 托管模式「全停机」：连 LLM 都不调了，纯手动跑单。
+        if self.host_mode == HostMode::Off {
+            return;
+        }
+        match self.orchestrator.next_due(&self.world) {
+            Some(AiLayer::Director) => self.start_director(),
+            Some(AiLayer::Rider) => self.start_rider(),
+            // 站长层**搭骑手层的车**：限单 / 强派这些 `station_ops` 跟着骑手层那一轮
+            // 请求一起下发（见 `llm::protocol`），站长自己不单独发请求。
+            //
+            // 但得记掉它的间隔——否则它会永远「到期」，`next_due` 每次都返回它，
+            // 骑手层再也轮不上（控制台把站长开关打开就会踩到）。下一 tick 自然轮到骑手。
+            Some(AiLayer::Station) => {
+                self.orchestrator
+                    .skip_interval(AiLayer::Station, &self.world);
+                self.start_rider();
             }
-            Err(outcome) => {
-                // Disabled / Throttled 都属于「正常不调」，只记不给客户端刷屏
-                self.last_brain_note = outcome.note;
-            }
+            None => {}
         }
     }
 
-    fn on_plan(&mut self, prepared: PreparedPlan, fetched: PlanFetch) {
-        self.inflight_since = None;
-        let idle = self.world.idle_riders();
+    /// 骑手层该给谁派单。
+    ///
+    /// 名单由 [`host::ai_idle_riders`] 决定：**在线的真人一律让位**（玩家在操作），
+    /// 掉线的真人只有在 AutoPilot 下才由 AI 接手。LLM 的 prompt 和算法兜底共用
+    /// 同一份名单，否则「LLM 推荐的人」和「校验时合法的人」会对不上。
+    fn ai_roster(&self) -> Vec<RiderId> {
+        host::ai_idle_riders(&self.world, self.host_mode, |id| {
+            self.hub.rider_conn_count(id) > 0
+        })
+    }
+
+    /// 占骑手层的坑，组装一批动作 + 策略的请求。
+    fn start_rider(&mut self) {
+        let idle = self.ai_roster();
         let pending = self.world.pending_orders();
-        let (outcome, plan) = self
-            .brain
-            .finish(prepared, fetched, &self.world, &idle, &pending);
+        let prepared = match self.brain.prepare(&self.world, &idle, &pending) {
+            Ok(p) => p,
+            Err(outcome) => {
+                // Disabled / Throttled 都属于「正常不调」，只记不给客户端刷屏
+                self.last_brain_note = outcome.note;
+                return;
+            }
+        };
+        // 先占坑再发请求：万一超时，这一档也不会重试到天亮。
+        if !self.orchestrator.begin(AiLayer::Rider, &self.world) {
+            return;
+        }
+        let tx = self.plan_tx.clone();
+        let id = self.take_decision_id();
+        self.inflight_since = Some(Instant::now());
+        self.inflight_layer = Some(AiLayer::Rider);
+        tokio::spawn(async move {
+            let fetched = prepared.request().await;
+            if tx.send(AiInbound::Rider(id, prepared, fetched)).is_err() {
+                tracing::debug!("主循环已退出，丢弃这一轮 LLM 结果");
+            }
+        });
+    }
+
+    /// 占烽火台层的坑，组装世界参数请求。
+    fn start_director(&mut self) {
+        let history = self.world_history.clone();
+        let prepared = match self.director.prepare(&self.world, &history) {
+            Ok(p) => p,
+            Err(outcome) => {
+                self.last_brain_note = outcome.note;
+                return;
+            }
+        };
+        if !self.orchestrator.begin(AiLayer::Director, &self.world) {
+            return;
+        }
+        let tx = self.plan_tx.clone();
+        let id = self.take_decision_id();
+        self.inflight_since = Some(Instant::now());
+        self.inflight_layer = Some(AiLayer::Director);
+        tokio::spawn(async move {
+            let fetched = prepared.request().await;
+            if tx.send(AiInbound::Director(id, prepared, fetched)).is_err() {
+                tracing::debug!("主循环已退出，丢弃这一轮 LLM 结果");
+            }
+        });
+    }
+
+    /// 分配一个决策 id。**单调递增**，控制台凭它否决某一条具体决策。
+    fn take_decision_id(&mut self) -> u64 {
+        let id = self.next_decision_id;
+        self.next_decision_id += 1;
+        id
+    }
+
+    /// 后台结果回来的统一入口，按层分发。
+    fn on_ai(&mut self, ai: AiInbound) {
+        match ai {
+            AiInbound::Rider(id, p, f) => self.on_plan(id, p, f),
+            AiInbound::Director(id, p, f) => self.on_world_plan(id, p, f),
+        }
+    }
+
+    fn on_plan(&mut self, decision_id: u64, prepared: PreparedPlan, fetched: PlanFetch) {
+        self.inflight_since = None;
+        self.inflight_layer = None;
+        self.orchestrator.finish(AiLayer::Rider);
+        // 校验必须针对**当下**的名单：这几秒里玩家可能刚连上线（AI 该让位），
+        // 也可能刚掉线（AutoPilot 下该接手）。
+        let idle = self.ai_roster();
+        let pending = self.world.pending_orders();
+        let (outcome, plan) =
+            self.brain
+                .finish(prepared, fetched, &mut self.world, &idle, &pending);
         self.last_brain_note = format!("[{}] {}", outcome.source.as_str(), outcome.note);
+
+        // 编排器统一记账：回退、采纳、丢弃。
+        if outcome.source == crate::llm::BrainSource::Fallback {
+            self.orchestrator.record_fallback(AiLayer::Rider);
+        }
+        self.orchestrator.record_verdict(
+            AiLayer::Rider,
+            outcome.verdict.assignments.len() as u64,
+            outcome.verdict.dropped as u64,
+        );
 
         if outcome.source != crate::llm::BrainSource::Disabled {
             let stats = self.brain.stats();
+            // 策略下发也一并推给控制端：这是「骑手行为为什么变了」的唯一解释
+            let policies: Vec<_> = outcome
+                .policies
+                .iter()
+                .map(|p| {
+                    json!({
+                        "rider": crate::sim::rider_key(p.rider),
+                        "price": p.price.key(),
+                        "cap": p.cap,
+                        "mode": p.mode.map(|m| m.index()),
+                        "why": p.why,
+                    })
+                })
+                .collect();
+            // 站长指令摘要：这是「为什么某个骑手被限单 / 下线了」的唯一解释
+            let station_ops: Vec<_> = outcome
+                .station_ops
+                .iter()
+                .map(|o| {
+                    json!({
+                        "op": o.op,
+                        "rider": o.rider,
+                        "detail": o.detail,
+                        "why": o.why,
+                    })
+                })
+                .collect();
             self.hub.send_to_control(&Envelope::new(
                 "llm_brain",
                 json!({
+                    "decision_id": decision_id,
+                    "layer": "rider",
                     "source": outcome.source.as_str(),
                     "note": outcome.note,
                     "model": outcome.model,
                     "latency_ms": outcome.latency_ms,
                     "assignments": outcome.verdict.assignments.len(),
                     "dropped": outcome.verdict.dropped,
+                    "policies": policies,
+                    "station_ops": station_ops,
+                    "fingerprint": format!("{:016x}", outcome.fingerprint),
+                    // 指纹命中：这一轮没花钱，决策复用了上一轮。
+                    "cached": outcome.source == crate::llm::BrainSource::Cache,
+                    "prompt": {
+                        "riders": outcome.prompt_riders,
+                        "orders": outcome.prompt_orders,
+                        "bytes": outcome.prompt_bytes,
+                    },
+                    "trim": {
+                        "riders": outcome.trim.trimmed_riders,
+                        "orders": outcome.trim.trimmed_orders,
+                        "remarks": outcome.trim.truncated_remarks,
+                    },
                     "calls_today": self.brain.calls_today(),
                     "max_calls_per_day": self.brain.max_calls_per_day(),
                     "stats": {
@@ -453,15 +808,167 @@ impl App {
                         "failures": stats.failures,
                         "applied": stats.applied,
                         "dropped": stats.dropped,
+                        "cached_hits": stats.cached_hits,
+                        "policies_applied": stats.policies_applied,
                     },
                 }),
             ));
         }
 
-        if plan.is_some() {
+        if let Some(mut plan) = plan {
+            plan.decision_id = decision_id;
             // tick 里的 run_ai 会再校验一次，然后把它变成真实指派。
-            self.pending_plan = plan;
+            self.pending_plan = Some(plan);
+            // 还没落地 —— 控制台在下一 tick 之前否决，这单就真不派了。
+            self.pending_decision = Some((decision_id, "rider"));
         }
+
+        // 站长的运营指令已经生效（cap / 下线 / 召回），推一条事件进统一决策流，
+        // 让所有角色都看得见「站长今天在管什么」，也让人能顺手否决它。
+        // 决策 id 用同一轮的：站长指令是搭骑手层这一轮车下来的。
+        if !outcome.station_ops.is_empty() {
+            let ops = outcome
+                .station_ops
+                .iter()
+                .map(|o| AiOpBrief {
+                    op: o.op,
+                    target: o.rider.clone(),
+                    detail: o.detail.clone(),
+                    why: o.why.clone(),
+                })
+                .collect();
+            self.publish(&[SimEvent::AiDecision {
+                source: DecisionSource::Llm,
+                layer: "station",
+                assignments: Vec::new(),
+                ops,
+                decision_id,
+                note: outcome.note.clone(),
+            }]);
+        }
+    }
+
+    /// 烽火台一轮回来了：校验通过的世界操作攒到下一 tick 落地。
+    fn on_world_plan(
+        &mut self,
+        decision_id: u64,
+        prepared: PreparedWorldPlan,
+        fetched: WorldFetch,
+    ) {
+        self.inflight_since = None;
+        self.inflight_layer = None;
+        self.orchestrator.finish(AiLayer::Director);
+
+        let outcome = self.director.finish(prepared, fetched, &self.world);
+        self.last_brain_note = format!("[{}] {}", outcome.source.as_str(), outcome.note);
+
+        if outcome.source == crate::llm::BrainSource::Fallback {
+            self.orchestrator.record_fallback(AiLayer::Director);
+        }
+        let changes = outcome
+            .ops
+            .iter()
+            .filter(|o| !matches!(o, ValidatedWorldOp::Narrate(_)))
+            .count() as u64;
+        self.orchestrator
+            .record_verdict(AiLayer::Director, changes, outcome.dropped as u64);
+
+        if outcome.source != crate::llm::BrainSource::Disabled {
+            let ops: Vec<_> = outcome
+                .ops
+                .iter()
+                .map(|o| match o {
+                    ValidatedWorldOp::SetWeather { weather, why } => json!({
+                        "op": "set_weather",
+                        "v": weather.code(),
+                        "label": weather.label(),
+                        "why": why,
+                    }),
+                    ValidatedWorldOp::SetCommission { rate, why } => json!({
+                        "op": "set_commission",
+                        "v": rate,
+                        "why": why,
+                    }),
+                    ValidatedWorldOp::Narrate(text) => json!({
+                        "op": "narrate",
+                        "text": text,
+                    }),
+                })
+                .collect();
+            self.hub.send_to_control(&Envelope::new(
+                "llm_world",
+                json!({
+                    "decision_id": decision_id,
+                    "layer": "director",
+                    "source": outcome.source.as_str(),
+                    "note": outcome.note,
+                    "model": outcome.model,
+                    "latency_ms": outcome.latency_ms,
+                    "ops": ops,
+                    "narrate": outcome.narrate,
+                    "dropped": outcome.dropped,
+                }),
+            ));
+        }
+
+        if !outcome.ops.is_empty() {
+            self.pending_world_ops = outcome.ops;
+            // 世界操作下一 tick 才落地 —— 之前都还能撤。
+            self.pending_decision = Some((decision_id, "director"));
+        }
+    }
+
+    /// 把上一轮烽火台拿到的世界操作落地。
+    ///
+    /// **这是烽火台唯一能改到世界的地方**——它只动全局参数（天气 / 佣金）与旁白，
+    /// 永远碰不到具体的人和单。
+    fn apply_pending_world_ops(&mut self) {
+        if self.pending_world_ops.is_empty() {
+            return;
+        }
+        let ops = std::mem::take(&mut self.pending_world_ops);
+        let mut events: Vec<SimEvent> = Vec::new();
+
+        for op in ops {
+            match op {
+                ValidatedWorldOp::SetWeather { weather, why } => {
+                    if self.world.set_weather(weather) {
+                        events.push(SimEvent::WeatherChanged {
+                            weather,
+                            label: weather.label(),
+                            speed_factor: weather.speed_factor(),
+                            rain_bonus_cents: weather.rain_bonus_cents(),
+                        });
+                        self.world_history
+                            .push(format!("set_weather={} ({why})", weather.code()));
+                    }
+                }
+                ValidatedWorldOp::SetCommission { rate, why } => {
+                    self.world.cfg.commission_rate = rate;
+                    events.push(SimEvent::ConfigChanged {
+                        speed_multiplier: self.world.cfg.speed_multiplier,
+                        commission_rate: rate,
+                        weather: self.world.weather,
+                    });
+                    self.world_history
+                        .push(format!("set_commission={rate:.2} ({why})"));
+                }
+                ValidatedWorldOp::Narrate(text) => {
+                    events.push(SimEvent::Narration {
+                        layer: "director",
+                        text,
+                    });
+                }
+            }
+        }
+
+        // 历史只留最近 12 条，够下一轮 prompt 参考即可。
+        if self.world_history.len() > 12 {
+            let drop = self.world_history.len() - 12;
+            self.world_history.drain(0..drop);
+        }
+
+        self.publish(&events);
     }
 
     // -----------------------------------------------------------------
@@ -513,6 +1020,9 @@ impl App {
             RpcRequest::SetRiderOnline { rider_id, online } => {
                 self.rpc_set_online(rider_id, online)
             }
+            RpcRequest::AiState => Ok(self.ai_state()),
+            RpcRequest::SetAi(patch) => self.rpc_set_ai(&patch),
+            RpcRequest::RejectAi { decision_id } => self.rpc_reject_ai(decision_id),
         }
     }
 
@@ -583,7 +1093,10 @@ impl App {
         if !decisions.is_empty() {
             events.push(SimEvent::AiDecision {
                 source: DecisionSource::Manual,
+                layer: "manual",
                 assignments: decisions,
+                ops: Vec::new(),
+                decision_id: 0,
                 note: "外部接口派单".to_string(),
             });
         }
@@ -661,9 +1174,7 @@ impl App {
         };
 
         match msg {
-            M::Hello { .. } => {
-                self.hub.send_error(conn_id, code::BAD_REQUEST, "重复握手")
-            }
+            M::Hello { .. } => self.hub.send_error(conn_id, code::BAD_REQUEST, "重复握手"),
             M::Resync => self.send_snapshot(conn_id, role),
             M::Ping => {
                 let t = self.world.elapsed_min;
@@ -783,17 +1294,18 @@ impl App {
                 }
                 Some(json!({ "weather": weather.label() }))
             }),
-            M::SetCommissionRate { rate } => self.control(conn_id, role, "set_commission_rate", |app| {
-                let r = rate.clamp(0.0, 0.30);
-                app.world.cfg.commission_rate = r;
-                Some(json!({ "commission_rate": r }))
-            }),
-            M::ForceAssign { order_id, rider_id } => {
-                self.control(conn_id, role, "force_assign", |app| match scheduler::assign_forced(
-                    &mut app.world,
-                    order_id,
-                    rider_id,
-                ) {
+            M::SetCommissionRate { rate } => {
+                self.control(conn_id, role, "set_commission_rate", |app| {
+                    let r = rate.clamp(0.0, 0.30);
+                    app.world.cfg.commission_rate = r;
+                    Some(json!({ "commission_rate": r }))
+                })
+            }
+            M::ForceAssign { order_id, rider_id } => self.control(
+                conn_id,
+                role,
+                "force_assign",
+                |app| match scheduler::assign_forced(&mut app.world, order_id, rider_id) {
                     Ok(assignment) => {
                         let events = app.claim_events(&assignment);
                         app.outbox.extend(events);
@@ -803,8 +1315,8 @@ impl App {
                         app.outbox_err = Some(e);
                         None
                     }
-                })
-            }
+                },
+            ),
             M::SetLlmEnabled { enabled } => self.control(conn_id, role, "set_llm_enabled", |app| {
                 let actual = enabled && app.brain.is_enabled();
                 app.opts.llm_enabled = actual;
@@ -820,20 +1332,21 @@ impl App {
                 }
                 serde_json::to_value(app.world.config_view()).ok()
             }),
-            M::SetRiderOnline { rider_id, online } => {
-                self.control(conn_id, role, "set_rider_online", |app| {
-                    match scheduler::set_online(&mut app.world, rider_id, online) {
-                        Ok(events) => {
-                            app.outbox.extend(events);
-                            Some(json!({ "rider_id": rider_id, "online": online }))
-                        }
-                        Err(e) => {
-                            app.outbox_err = Some(e);
-                            None
-                        }
+            M::SetRiderOnline { rider_id, online } => self.control(
+                conn_id,
+                role,
+                "set_rider_online",
+                |app| match scheduler::set_online(&mut app.world, rider_id, online) {
+                    Ok(events) => {
+                        app.outbox.extend(events);
+                        Some(json!({ "rider_id": rider_id, "online": online }))
                     }
-                })
-            }
+                    Err(e) => {
+                        app.outbox_err = Some(e);
+                        None
+                    }
+                },
+            ),
             M::SetRealtime {
                 enabled,
                 wall_minute,
@@ -902,7 +1415,34 @@ impl App {
                     "model": app.llm_config.model,
                 }))
             }),
+            M::AiQuery => self.control(conn_id, role, "ai_query", |app| {
+                let state = app.ai_state();
+                app.push_ai_state();
+                Some(state)
+            }),
+            M::SetAi(patch) => self.control(conn_id, role, "set_ai", |app| {
+                let out = match app.rpc_set_ai(&patch) {
+                    Ok(v) => v,
+                    Err(e) => return Some(json!({ "ok": false, "message": e.message })),
+                };
+                app.push_ai_state();
+                Some(out)
+            }),
+            M::RejectAi { decision_id } => self.control(conn_id, role, "reject_ai", |app| {
+                let out = app
+                    .rpc_reject_ai(decision_id)
+                    .unwrap_or_else(|e| json!({ "ok": false, "message": e.message }));
+                // 撤完立刻让控制端看到「还能撤什么」变了。
+                app.push_ai_state();
+                Some(out)
+            }),
         }
+    }
+
+    /// 把三层 AI 状态推给控制端（`ai_state` 是一条**控制端专用**事件）。
+    fn push_ai_state(&mut self) {
+        let state = self.ai_state();
+        self.hub.send_to_control(&Envelope::new("ai_state", state));
     }
 
     /// 应用控制台提交的 LLM 配置：改配置 → 重建 brain/judge → 落库。
@@ -935,9 +1475,23 @@ impl App {
             };
         }
 
-        // 重建客户端：战术大脑与任务判定共用同一份配置。
-        self.brain = TacticalBrain::from_config(&self.llm_config);
+        // 重建客户端：三层大脑与任务判定共用同一份配置，按层挑模型。
+        self.brain = TacticalBrain::from_config(
+            &self
+                .llm_config
+                .for_layer(&self.layer_models, LayerKey::Rider),
+        );
         self.judge = TaskJudge::from_config(&self.llm_config);
+        self.director = DirectorBrain::from_config(
+            &self
+                .llm_config
+                .for_layer(&self.layer_models, LayerKey::Director),
+        );
+        self.orchestrator = AiOrchestrator::from_config(&self.llm_config);
+        // 站长的指令搭骑手层那一轮下发，不单独占坑。
+        self.orchestrator.set_layer_enabled(AiLayer::Station, false);
+        // 换了 Key / 模型，旧的间隔记录与操作史不再适用。
+        self.world_history.clear();
 
         let has_key = self.llm_config.has_key();
         self.opts.llm_enabled = has_key;
@@ -952,7 +1506,9 @@ impl App {
     /// 把当前 LLM 配置落库。Key 明文入库——本地模拟器，不上 vault。
     fn persist_llm_config(&self) {
         let _ = self.store.set_meta("llm_api_key", &self.llm_config.api_key);
-        let _ = self.store.set_meta("llm_base_url", &self.llm_config.base_url);
+        let _ = self
+            .store
+            .set_meta("llm_base_url", &self.llm_config.base_url);
         let _ = self.store.set_meta("llm_model", &self.llm_config.model);
     }
 
@@ -1857,7 +2413,10 @@ mod tests {
         let a = ack(&v);
         assert_eq!(a["payload"]["data"]["realtime"].as_bool(), Some(true));
         assert_eq!(a["payload"]["data"]["wall_minute"].as_u64(), Some(870));
-        assert_eq!(a["payload"]["data"]["tick_interval_ms"].as_u64(), Some(60_000));
+        assert_eq!(
+            a["payload"]["data"]["tick_interval_ms"].as_u64(),
+            Some(60_000)
+        );
         // 实时档 60 秒才一个 tick，调完时钟必须立刻补一帧，否则控制台会卡住。
         assert!(event(&v, "tick").is_some(), "对齐时钟后要推一帧 tick");
 
@@ -1865,7 +2424,11 @@ mod tests {
         assert!(app.beat_reset, "切实时档后要重排节拍");
 
         // 选倍率档 = 退出实时档。
-        send(&mut app, 1, ClientMessage::SetSpeedMultiplier { multiplier: 4 });
+        send(
+            &mut app,
+            1,
+            ClientMessage::SetSpeedMultiplier { multiplier: 4 },
+        );
         assert!(!app.world.cfg.realtime);
         assert_eq!(app.world.cfg.tick_interval_ms(), 250);
         assert!(app.beat_reset, "切倍率档后也要重排");
@@ -1902,7 +2465,11 @@ mod tests {
                 names: vec!["   ".into(), "李四".into()],
             },
         );
-        assert_eq!(app.world.rider(ids[0]).unwrap().name, "张三", "空名字要跳过");
+        assert_eq!(
+            app.world.rider(ids[0]).unwrap().name,
+            "张三",
+            "空名字要跳过"
+        );
         assert_eq!(app.world.rider(ids[1]).unwrap().name, "李四");
 
         // 非法名字：changed=false，世界不变。
@@ -2089,6 +2656,33 @@ mod tests {
         assert!(app.world.rider(rid).unwrap().online, "手上有单不能下线");
     }
 
+    /// 托管名单跟着「谁连着 WS」实时变：玩家在线 AI 让位，掉线后 AutoPilot 接手。
+    #[test]
+    fn ai_roster_yields_to_a_connected_human_and_picks_him_up_when_he_drops() {
+        let mut app = app();
+        let rid = app.world.spawn_human_rider("张三");
+        let (_rx, _w) = hello(&mut app, 1, Some(&rider_token(rid)));
+
+        assert!(
+            !app.ai_roster().contains(&rid),
+            "玩家自己连着，AI 不许替他派单"
+        );
+
+        close(&mut app, 1);
+
+        app.host_mode = HostMode::SimulatedOnly;
+        assert!(
+            !app.ai_roster().contains(&rid),
+            "SimulatedOnly 该等他回来，不该替他跑"
+        );
+
+        app.host_mode = HostMode::AutoPilot;
+        assert!(
+            app.ai_roster().contains(&rid),
+            "AutoPilot 该接过掉线真人的单"
+        );
+    }
+
     #[test]
     fn connection_limit_drops_extra_clients() {
         let opts = AppOptions {
@@ -2134,6 +2728,219 @@ mod tests {
         app.maybe_start_plan();
         assert!(app.inflight_since.is_none());
         assert!(app.pending_plan.is_none());
+    }
+
+    #[test]
+    fn station_layer_stays_disabled_until_implemented() {
+        // 站长层还没实现，必须关掉，否则编排器会把额度空耗在一个不会占坑的层上，
+        // 永远轮不到骑手层。
+        let app = app();
+        assert!(!app.orchestrator.layer_enabled(AiLayer::Station));
+    }
+
+    /// 控制台可以把站长开关打开（它记的是「站长该决策了」的意图）。
+    /// 打开之后**绝不能把骑手层饿死**：站长这一轮到点时顺手把间隔记掉，
+    /// 名额留给骑手层那一轮请求（站长的限单 / 强派搭它的车下发）。
+    ///
+    /// 这个用例必须让骑手那一轮**真的走到占坑**（大厅有单 + 有可派的空闲骑手）。
+    /// 否则 `prepare` 会以「没东西可分」提前返回，压根到不了 `begin(Rider)`：
+    /// 断言看着过了，其实只是空转，饿死不饿死它根本测不出来。
+    ///
+    /// 跑在 tokio 运行时里是必需的：占上坑之后 `maybe_start_plan` 会 `tokio::spawn`
+    /// 那个请求，没有运行时会直接 panic。
+    #[tokio::test]
+    async fn an_enabled_station_layer_does_not_starve_the_rider_layer() {
+        use crate::llm::LlmClient;
+        let mut app = app();
+        let client = || LlmClient::new(LlmConfig::new("test-key")).ok();
+        app.opts.llm_enabled = true;
+        app.world.cfg.llm_brain_enabled = true;
+        app.brain = TacticalBrain::new(client());
+        app.orchestrator = AiOrchestrator::new(client());
+
+        // 前提：大厅有单、路上有空骑手。
+        app.world.generate_order_batch(4);
+        assert!(!app.world.pending_orders().is_empty(), "大厅得有单");
+        assert!(!app.ai_roster().is_empty(), "得有可派的空闲骑手");
+
+        // 让烽火台先占掉自己的间隔，于是「最优先的到期层」变成站长
+        assert!(app.orchestrator.begin(AiLayer::Director, &app.world));
+        app.orchestrator.finish(AiLayer::Director);
+        app.orchestrator.set_layer_enabled(AiLayer::Station, true);
+        assert_eq!(
+            app.orchestrator.next_due(&app.world),
+            Some(AiLayer::Station)
+        );
+
+        let budget = app.orchestrator.calls_today(app.world.day);
+        app.maybe_start_plan();
+
+        assert_eq!(
+            app.orchestrator.stats(AiLayer::Station).calls,
+            0,
+            "站长不单独发请求"
+        );
+        assert_eq!(
+            app.orchestrator.inflight(),
+            Some(AiLayer::Rider),
+            "站长这一轮必须顺手把骑手那一轮跑起来，而不是把这一档空耗掉"
+        );
+        assert_eq!(
+            app.orchestrator.stats(AiLayer::Rider).calls,
+            1,
+            "真正占坑的是骑手层"
+        );
+        assert_eq!(
+            app.orchestrator.calls_today(app.world.day),
+            budget + 1,
+            "这一轮只花掉骑手层那一次额度，站长那一次不扣"
+        );
+
+        // 站长只是被记掉了间隔，不是被关掉：再过它一个间隔就重新到期。
+        // （世界是从 06:00 开局的，所以只能相对推进，不能写成绝对分钟。）
+        app.orchestrator.finish(AiLayer::Rider);
+        app.inflight_since = None;
+        app.inflight_layer = None;
+        app.world.sim_minute += AiLayer::Station.min_interval_min();
+        assert_eq!(
+            app.orchestrator.next_due(&app.world),
+            Some(AiLayer::Station),
+            "过了站长一个间隔，它该重新到期——只是这一次被记掉，不是被永久关掉"
+        );
+    }
+
+    #[test]
+    fn director_world_ops_apply_to_the_world() {
+        use crate::sim::weather::Weather;
+        let mut app = app();
+        let target = if app.world.weather == Weather::HeavyRain {
+            Weather::Fog
+        } else {
+            Weather::HeavyRain
+        };
+        app.pending_world_ops = vec![
+            ValidatedWorldOp::SetWeather {
+                weather: target,
+                why: "测试".into(),
+            },
+            ValidatedWorldOp::SetCommission {
+                rate: 0.18,
+                why: "测试".into(),
+            },
+            ValidatedWorldOp::Narrate("天说变就变".into()),
+        ];
+
+        app.apply_pending_world_ops();
+
+        assert_eq!(app.world.weather, target, "天气要落地");
+        assert!(
+            (app.world.cfg.commission_rate - 0.18).abs() < 1e-6,
+            "佣金要落地"
+        );
+        assert!(app.pending_world_ops.is_empty(), "落地后要清空");
+        assert!(
+            app.world_history
+                .iter()
+                .any(|h| h.starts_with("set_weather=")),
+            "操作史要记下来喂下一轮 prompt"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 三层 AI：状态 / 开关 / 人工否决
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ai_state_reports_layers_budget_and_station_kpi() {
+        let app = app();
+        let st = app.ai_state();
+        let layers = st["layers"].as_array().expect("要给三层状态");
+        assert_eq!(layers.len(), 3, "骑手 / 站长 / 烽火台");
+        assert!(st["budget"]["max_calls_per_day"].as_u64().unwrap() > 0);
+        assert_eq!(st["station"]["rider_count"], app.world.riders.len());
+        assert!(st["station"]["kpi"]["total_riders"].as_u64().unwrap() > 0);
+        assert!(st["rejectable"].is_null(), "没有在途决策时不可否决");
+        assert!(!st["llm_configured"].as_bool().unwrap(), "默认没配 Key");
+    }
+
+    #[test]
+    fn ai_state_reports_layer_models_and_cache_hit_rate() {
+        let app = app();
+        let st = app.ai_state();
+        // 没配分层模型时三层都落到全局模型 —— 与旧行为一致。
+        for layer in ["rider", "station", "director"] {
+            assert_eq!(st["models"][layer], app.llm_config.model);
+        }
+        let cache = &st["cache"];
+        assert_eq!(cache["hits"], 0);
+        assert_eq!(cache["calls"], 0);
+        assert_eq!(cache["hit_rate"], 0.0, "零调用不能除出 NaN");
+    }
+
+    #[test]
+    fn set_ai_toggles_layers_and_host_mode() {
+        use crate::net::AiPatch;
+        let mut app = app();
+        let out = app
+            .rpc_set_ai(&AiPatch {
+                director: Some(false),
+                host_mode: Some("autopilot".into()),
+                enabled: Some(true),
+                ..Default::default()
+            })
+            .expect("合法 patch 不该报错");
+        let director = out["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["layer"] == "director")
+            .expect("要报出烽火台那一层");
+        assert!(!director["enabled"].as_bool().unwrap(), "烽火台被关");
+        assert_eq!(out["host_mode"], "auto_pilot");
+        assert!(app.world.cfg.llm_brain_enabled);
+
+        let err = app.rpc_set_ai(&AiPatch {
+            host_mode: Some("胡说".into()),
+            ..Default::default()
+        });
+        assert!(err.is_err(), "未知托管模式要报错");
+    }
+
+    #[test]
+    fn reject_reverts_a_plan_that_has_not_landed() {
+        let mut app = app();
+        // 手搓一条「已产出、还没被 tick 消费」的骑手计划。
+        app.pending_plan = Some(LlmPlan {
+            decision_id: 7,
+            ..Default::default()
+        });
+        app.pending_decision = Some((7, "rider"));
+
+        let out = app.rpc_reject_ai(7).unwrap();
+        assert_eq!(out["rejected"], true);
+        assert!(app.pending_plan.is_none(), "否决后不给 tick 用");
+        assert!(app.pending_decision.is_none());
+        assert_eq!(app.reject_log[0]["result"], "reverted");
+    }
+
+    #[test]
+    fn reject_reverts_pending_world_ops() {
+        let mut app = app();
+        app.pending_world_ops = vec![ValidatedWorldOp::Narrate("别下暴雨".into())];
+        app.pending_decision = Some((3, "director"));
+
+        let out = app.rpc_reject_ai(3).unwrap();
+        assert_eq!(out["rejected"], true);
+        assert!(app.pending_world_ops.is_empty(), "世界操作要撤回");
+    }
+
+    #[test]
+    fn reject_of_an_applied_decision_only_leaves_a_record() {
+        let mut app = app();
+        let out = app.rpc_reject_ai(999).unwrap();
+        assert_eq!(out["rejected"], false, "已经生效的撤不回来");
+        assert_eq!(out["reason"], "该决策已生效或不存在，仅记入台账");
+        assert_eq!(app.reject_log[0]["result"], "already_applied");
     }
 
     // -----------------------------------------------------------------

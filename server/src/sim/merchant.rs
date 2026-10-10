@@ -19,6 +19,12 @@ pub struct Merchant {
     /// 平均出餐分钟数 5~25。
     pub avg_prep_min: u32,
     pub signature: String,
+    /// 步行难度 0/1/2（路边店 / 商场内 / 高层深巷）。
+    ///
+    /// 属于**离线标注**：生成 `merchants.json` 时由 LLM 依据「店名 + 地址类型」
+    /// 批量打标（《LLM协议设计》§5.1），运行期零开销、可复现。缺省 0 = 路边店。
+    #[serde(default)]
+    pub walk_difficulty: u8,
 }
 
 impl Merchant {
@@ -62,6 +68,7 @@ mod tests {
             rating: 4.7,
             avg_prep_min: 12,
             signature: "热干面".into(),
+            walk_difficulty: 0,
         };
         assert!(m.coords().is_none());
     }

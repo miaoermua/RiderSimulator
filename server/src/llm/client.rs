@@ -20,6 +20,11 @@ pub const ENV_MODEL: &str = "LLM_MODEL";
 /// 也认这个变量名，方便直接复用现成的 OpenAI 环境。
 pub const ENV_OPENAI_KEY: &str = "OPENAI_API_KEY";
 
+/// 分层模型：骑手层高频、要便宜；烽火台层低频、可以贵一点。
+pub const ENV_MODEL_RIDER: &str = "LLM_MODEL_RIDER";
+pub const ENV_MODEL_STATION: &str = "LLM_MODEL_STATION";
+pub const ENV_MODEL_DIRECTOR: &str = "LLM_MODEL_DIRECTOR";
+
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub base_url: String,
@@ -81,8 +86,107 @@ impl LlmConfig {
         !self.api_key.trim().is_empty()
     }
 
+    /// 换一个模型名，其余照旧。用于按层挑模型。
+    pub fn with_model(&self, model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            ..self.clone()
+        }
+    }
+
+    /// 这一层实际用的模型名：有分层配置就用它，否则用全局模型。
+    pub fn model_for(&self, models: &LayerModels, layer: LayerKey) -> String {
+        models
+            .get(layer)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.model.clone())
+    }
+
+    /// 取一份「这一层专用」的配置。成本优化的全部实现就是这一行。
+    pub fn for_layer(&self, models: &LayerModels, layer: LayerKey) -> Self {
+        let model = self.model_for(models, layer);
+        self.with_model(model)
+    }
+
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+}
+
+/// 三层 AI 的名字。**故意不依赖 `AiLayer`**：配置层不该认识调度层，
+/// 否则 client → orchestrator 会绕出一个环。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKey {
+    Rider,
+    Station,
+    Director,
+}
+
+impl LayerKey {
+    pub fn key(self) -> &'static str {
+        match self {
+            LayerKey::Rider => "rider",
+            LayerKey::Station => "station",
+            LayerKey::Director => "director",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        Some(match s {
+            "rider" => LayerKey::Rider,
+            "station" => LayerKey::Station,
+            "director" => LayerKey::Director,
+            _ => return None,
+        })
+    }
+
+    pub const ALL: [LayerKey; 3] = [LayerKey::Rider, LayerKey::Station, LayerKey::Director];
+}
+
+/// 分层模型配置。全空 = 三层都用全局模型（默认行为，零配置）。
+#[derive(Debug, Clone, Default)]
+pub struct LayerModels {
+    rider: Option<String>,
+    station: Option<String>,
+    director: Option<String>,
+}
+
+impl LayerModels {
+    pub fn from_env() -> Self {
+        let read = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        Self {
+            rider: read(ENV_MODEL_RIDER),
+            station: read(ENV_MODEL_STATION),
+            director: read(ENV_MODEL_DIRECTOR),
+        }
+    }
+
+    pub fn get(&self, layer: LayerKey) -> Option<&str> {
+        match layer {
+            LayerKey::Rider => self.rider.as_deref(),
+            LayerKey::Station => self.station.as_deref(),
+            LayerKey::Director => self.director.as_deref(),
+        }
+    }
+
+    pub fn set(&mut self, layer: LayerKey, model: Option<String>) {
+        let v = model
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        match layer {
+            LayerKey::Rider => self.rider = v,
+            LayerKey::Station => self.station = v,
+            LayerKey::Director => self.director = v,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rider.is_none() && self.station.is_none() && self.director.is_none()
     }
 }
 
@@ -283,6 +387,43 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layer_models_fall_back_to_the_global_model() {
+        let base = LlmConfig::new("k").with_model("gpt-4o-mini");
+        let empty = LayerModels::default();
+        assert!(empty.is_empty());
+        for l in LayerKey::ALL {
+            assert_eq!(base.for_layer(&empty, l).model, "gpt-4o-mini");
+        }
+
+        let mut models = LayerModels::default();
+        models.set(LayerKey::Rider, Some("gpt-4o-mini".into()));
+        models.set(LayerKey::Director, Some("gpt-4o".into()));
+        assert_eq!(
+            base.for_layer(&models, LayerKey::Rider).model,
+            "gpt-4o-mini"
+        );
+        assert_eq!(base.for_layer(&models, LayerKey::Director).model, "gpt-4o");
+        // 没配的层仍然用全局模型
+        assert_eq!(
+            base.for_layer(&models, LayerKey::Station).model,
+            "gpt-4o-mini"
+        );
+
+        // 空白字符串等于没配
+        let mut blank = LayerModels::default();
+        blank.set(LayerKey::Rider, Some("   ".into()));
+        assert!(blank.is_empty());
+    }
+
+    #[test]
+    fn layer_keys_round_trip() {
+        for l in LayerKey::ALL {
+            assert_eq!(LayerKey::from_key(l.key()), Some(l));
+        }
+        assert_eq!(LayerKey::from_key("nope"), None);
+    }
 
     #[test]
     fn missing_key_disables_the_feature_without_panicking() {

@@ -16,28 +16,36 @@
 
 use std::time::Instant;
 
+use lru::LruCache;
+
 use crate::sim::{
     OrderId, RiderId,
-    ai::{self, Assignment, LlmPlan, LlmVerdict},
-    geo::haversine_m,
+    ai::{self, Assignment, LlmAssign, LlmPlan, LlmVerdict},
     world::World,
 };
 
-use super::client::{LlmClient, LlmConfig};
+use super::{
+    client::{LlmClient, LlmConfig},
+    protocol::{
+        self, BrainRequest, DecisionResponse, TrimStats, ValidatedPolicy, ValidatedStationOp,
+    },
+};
 
 /// 一天最多调用次数。设计给的硬上限。
 pub const MAX_CALLS_PER_DAY: u32 = 24;
 
-/// 塞进 prompt 的空闲骑手上限。再多没有意义——10×5 的规模贪心就够。
-const MAX_RIDERS_IN_PROMPT: usize = 8;
-/// 塞进 prompt 的待抢订单上限。
-const MAX_ORDERS_IN_PROMPT: usize = 6;
+/// 状态指纹缓存容量。1 次/时段 × 24 时段，留一倍余量。
+const FINGERPRINT_CACHE_CAP: usize = 48;
+/// 缓存的最长寿命（模拟分钟）。超过就不敢复用了——世界早就不是那个世界了。
+const CACHE_TTL_MIN: u32 = 30;
 
 /// 这一轮的计划是从哪来的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BrainSource {
     /// LLM 给了合法计划，且通过校验。
     Llm,
+    /// 状态指纹命中缓存，**没花这次调用**。
+    Cache,
     /// 没配 Key / 开关是关的。
     #[default]
     Disabled,
@@ -51,11 +59,21 @@ impl BrainSource {
     pub fn as_str(self) -> &'static str {
         match self {
             BrainSource::Llm => "llm",
+            BrainSource::Cache => "cache",
             BrainSource::Disabled => "disabled",
             BrainSource::Throttled => "throttled",
             BrainSource::Fallback => "fallback",
         }
     }
+}
+
+/// 一条已落地的站长指令摘要。`detail` 是人类可读的补充（封顶值 / 订单号）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StationOpBrief {
+    pub op: &'static str,
+    pub rider: String,
+    pub detail: String,
+    pub why: String,
 }
 
 /// 一轮大脑的输出。
@@ -67,6 +85,18 @@ pub struct BrainOutcome {
     pub note: String,
     pub model: String,
     pub latency_ms: u64,
+    /// 这一轮下发的策略调整（已钳制）。控制端用它解释「骑手行为怎么变了」。
+    pub policies: Vec<ValidatedPolicy>,
+    /// 这一轮落地的站长指令摘要（给控制端 / 事件用）。
+    pub station_ops: Vec<StationOpBrief>,
+    /// 状态指纹。相同指纹 = 相同决策输入，用于缓存与复现。
+    pub fingerprint: u64,
+    /// 请求裁剪统计。
+    pub trim: TrimStats,
+    /// 请求里塞了几个骑手 / 几单（控制端显示 prompt 规模）。
+    pub prompt_riders: usize,
+    pub prompt_orders: usize,
+    pub prompt_bytes: usize,
 }
 
 impl BrainOutcome {
@@ -84,7 +114,9 @@ impl BrainOutcome {
     }
 
     pub fn used_llm(&self) -> bool {
-        self.source == BrainSource::Llm && !self.verdict.assignments.is_empty()
+        // 指纹命中的也是「LLM 的决策」，只是这轮没再花一次调用
+        matches!(self.source, BrainSource::Llm | BrainSource::Cache)
+            && !self.verdict.assignments.is_empty()
     }
 }
 
@@ -98,6 +130,10 @@ pub struct BrainStats {
     pub applied: u64,
     /// 被校验丢弃的条数。
     pub dropped: u64,
+    /// 状态指纹命中、省下来的调用数。
+    pub cached_hits: u64,
+    /// 落地的策略调整条数。
+    pub policies_applied: u64,
 }
 
 /// 节流器：**「每时段 1 次、一天最多 24 次」这条约束的全部实现。**
@@ -110,6 +146,8 @@ pub struct Throttle {
     calls_today: u32,
     /// (天, 小时槽)。小时槽 = `sim_minute / 60`。
     last_slot: Option<(u32, u32)>,
+    /// (天, 模拟分钟)。**精确到分钟**，供多层编排器按间隔节流用。
+    last_minute: Option<(u32, u32)>,
     max_calls_per_day: u32,
 }
 
@@ -125,6 +163,7 @@ impl Throttle {
             day: 0,
             calls_today: 0,
             last_slot: None,
+            last_minute: None,
             max_calls_per_day,
         }
     }
@@ -143,6 +182,7 @@ impl Throttle {
             self.day = day;
             self.calls_today = 0;
             self.last_slot = None;
+            self.last_minute = None;
         }
     }
 
@@ -180,16 +220,45 @@ impl Throttle {
     pub fn begin(&mut self, day: u32, sim_minute: u32) {
         self.roll_to(day);
         self.last_slot = Some((day, sim_minute / 60));
+        self.last_minute = Some((day, sim_minute));
         self.calls_today += 1;
+    }
+
+    /// 记掉这一轮但**不算一次调用**。
+    ///
+    /// 给「搭车」的层用：站长层的限单 / 强派跟着骑手层那一轮请求一起下发
+    /// （见 `llm::protocol` 的 `station_ops`），站长自己没有请求要发。但它同样要
+    /// 推进间隔——否则它会永远「到期」（`minutes_since_last == u32::MAX`），
+    /// 把真正能跑的骑手层饿死。
+    pub fn skip(&mut self, day: u32, sim_minute: u32) {
+        self.roll_to(day);
+        self.last_slot = Some((day, sim_minute / 60));
+        self.last_minute = Some((day, sim_minute));
     }
 
     pub fn slot_used(&self, day: u32, sim_minute: u32) -> bool {
         self.last_slot == Some((day, sim_minute / 60))
     }
 
+    /// 距上次调用过了多少模拟分钟。**只读**，不会 roll。
+    ///
+    /// - 从没调过 → `u32::MAX`（立刻到期）；
+    /// - 跨天（`day` 比记录晚）→ `u32::MAX`（新的一天从零算起）。
+    pub fn minutes_since_last(&self, day: u32, sim_minute: u32) -> u32 {
+        match self.last_minute {
+            None => u32::MAX,
+            Some((d, m)) => match day.cmp(&d) {
+                std::cmp::Ordering::Greater => u32::MAX,
+                std::cmp::Ordering::Less => 0,
+                std::cmp::Ordering::Equal => sim_minute.saturating_sub(m),
+            },
+        }
+    }
+
     pub fn reset(&mut self) {
         self.calls_today = 0;
         self.last_slot = None;
+        self.last_minute = None;
     }
 }
 
@@ -206,8 +275,12 @@ impl Throttle {
 pub struct PreparedPlan {
     /// 发请求用的客户端（reqwest 客户端内部是 Arc，clone 很便宜）。
     pub client: LlmClient,
-    system: String,
-    user: String,
+    /// 这一轮的请求载荷。**留着它**：finish 要拿它算指纹、写缓存、给控制端展示。
+    req: BrainRequest,
+    /// 状态指纹。
+    fingerprint: u64,
+    /// 指纹命中缓存时，直接复用这份响应，**不发 HTTP、不占用今日额度**。
+    cached: Option<Box<DecisionResponse>>,
     started: Instant,
 }
 
@@ -215,6 +288,8 @@ impl std::fmt::Debug for PreparedPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedPlan")
             .field("model", &self.client.model())
+            .field("fingerprint", &self.fingerprint)
+            .field("cached", &self.cached.is_some())
             .finish()
     }
 }
@@ -224,13 +299,36 @@ impl PreparedPlan {
         self.client.model()
     }
 
+    /// 这一轮的请求载荷（只读）。控制端「AI 决策流」用它展示喂了什么。
+    pub fn request_payload(&self) -> &BrainRequest {
+        &self.req
+    }
+
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint
+    }
+
+    /// 这一次是不是走的缓存（没打 HTTP）。
+    pub fn is_cached(&self) -> bool {
+        self.cached.is_some()
+    }
+
     /// 拿提示词去打一次 HTTP。给后台任务用。
+    ///
+    /// 缓存命中时**直接把上次的响应还回来**——`async` 立刻返回，不会碰网络。
     ///
     /// **不返回 `Result`**：失败原因已经被压成字符串，一路走到
     /// [`TacticalBrain::finish`] 变成一句给控制端看的话。中间没人需要
     /// 区分「超时」还是「网络不通」——处理方式完全一样。
     pub async fn request(&self) -> PlanFetch {
-        match self.client.complete_json(&self.system, &self.user).await {
+        if let Some(cached) = &self.cached {
+            return PlanFetch::Json(
+                serde_json::to_value(cached.as_ref()).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        let system = protocol::system_prompt();
+        let user = protocol::user_prompt(&self.req);
+        match self.client.complete_json(system, &user).await {
             Ok(v) => PlanFetch::Json(v),
             Err(e) => PlanFetch::Failed(e.to_string()),
         }
@@ -246,6 +344,14 @@ pub enum PlanFetch {
     Failed(String),
 }
 
+/// 缓存里的一条决策。
+#[derive(Debug, Clone)]
+struct CachedDecision {
+    day: u32,
+    sim_minute: u32,
+    resp: DecisionResponse,
+}
+
 /// 战术大脑。持有客户端与节流状态。
 pub struct TacticalBrain {
     client: Option<LlmClient>,
@@ -253,6 +359,8 @@ pub struct TacticalBrain {
     stats: BrainStats,
     /// 最近一次失败的描述，给控制端。
     last_error: String,
+    /// 状态指纹 → 上一轮响应。命中就省一次调用（《LLM协议设计》§6.3）。
+    cache: LruCache<u64, CachedDecision>,
 }
 
 impl std::fmt::Debug for TacticalBrain {
@@ -261,6 +369,7 @@ impl std::fmt::Debug for TacticalBrain {
             .field("enabled", &self.client.is_some())
             .field("throttle", &self.throttle)
             .field("stats", &self.stats)
+            .field("cache_len", &self.cache.len())
             .finish()
     }
 }
@@ -273,7 +382,50 @@ impl TacticalBrain {
             throttle: Throttle::default(),
             stats: BrainStats::default(),
             last_error: String::new(),
+            cache: LruCache::new(
+                std::num::NonZeroUsize::new(FINGERPRINT_CACHE_CAP).expect("容量非零"),
+            ),
         }
+    }
+
+    /// 查一眼缓存。**顺带做过期检查**——过期的当作没有。
+    fn cache_lookup(
+        &self,
+        fingerprint: u64,
+        day: u32,
+        sim_minute: u32,
+    ) -> Option<DecisionResponse> {
+        let hit = self.cache.peek(&fingerprint)?;
+        if hit.day != day {
+            return None;
+        }
+        let age = sim_minute.saturating_sub(hit.sim_minute);
+        if age > CACHE_TTL_MIN {
+            return None;
+        }
+        Some(hit.resp.clone())
+    }
+
+    fn cache_store(
+        &mut self,
+        fingerprint: u64,
+        day: u32,
+        sim_minute: u32,
+        resp: &DecisionResponse,
+    ) {
+        self.cache.put(
+            fingerprint,
+            CachedDecision {
+                day,
+                sim_minute,
+                resp: resp.clone(),
+            },
+        );
+    }
+
+    /// 清空指纹缓存（换局 / 改配置时用——旧指纹对应的是旧世界）。
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
     }
 
     /// 从环境变量建。没配 Key 就是关闭状态。
@@ -360,15 +512,39 @@ impl TacticalBrain {
             return Err(BrainOutcome::skipped(BrainSource::Throttled, reason));
         }
 
+        // 组装请求（含预算裁剪）。**必须在占坑之前算指纹**——
+        // 否则命中缓存也白占了本时段的额度。
+        let req = BrainRequest::build(world, idle, pending);
+        if req.riders.is_empty() || req.orders.is_empty() {
+            self.stats.throttled += 1;
+            return Err(BrainOutcome::skipped(
+                BrainSource::Throttled,
+                "没有可放进 prompt 的骑手或订单",
+            ));
+        }
+        let fingerprint = protocol::state_fingerprint(&req);
+
+        // 状态指纹命中 → 复用上一轮响应，省钱也省延迟。
+        if let Some(resp) = self.cache_lookup(fingerprint, world.day, world.sim_minute) {
+            self.stats.cached_hits += 1;
+            return Ok(PreparedPlan {
+                client,
+                req,
+                fingerprint,
+                cached: Some(Box::new(resp)),
+                started: Instant::now(),
+            });
+        }
+
         // 先占坑再调用：万一超时，本时段也不会重试到天亮。
         self.throttle.begin(world.day, world.sim_minute);
         self.stats.calls += 1;
 
-        let (system, user) = build_prompt(world, idle, pending);
         Ok(PreparedPlan {
             client,
-            system,
-            user,
+            req,
+            fingerprint,
+            cached: None,
             started: Instant::now(),
         })
     }
@@ -385,88 +561,161 @@ impl TacticalBrain {
         &mut self,
         prepared: PreparedPlan,
         fetched: PlanFetch,
-        world: &World,
+        world: &mut World,
         idle: &[RiderId],
         pending: &[OrderId],
     ) -> (BrainOutcome, Option<LlmPlan>) {
         let latency_ms = prepared.started.elapsed().as_millis() as u64;
         let model = prepared.client.model().to_string();
-        let skip = |source: BrainSource, note: String, model: String| {
-            (
-                BrainOutcome {
-                    verdict: LlmVerdict::default(),
-                    source,
-                    note,
-                    model,
-                    latency_ms,
-                },
-                None,
-            )
-        };
+        let fingerprint = prepared.fingerprint;
+        let was_cached = prepared.is_cached();
+        let req = prepared.req;
+        let day = world.day;
+        let sim_minute = world.sim_minute;
+        let prompt_riders = req.riders.len();
+        let prompt_orders = req.orders.len();
+        let prompt_bytes = req.body_bytes();
+
+        // 统一的「这轮没计划」出口：把请求侧的元信息补齐，控制端照样能看到喂了什么。
+        macro_rules! skip {
+            ($source:expr, $note:expr) => {{
+                let note: String = $note;
+                return (
+                    BrainOutcome {
+                        verdict: LlmVerdict::default(),
+                        source: $source,
+                        note,
+                        model,
+                        latency_ms,
+                        policies: Vec::new(),
+                        station_ops: Vec::new(),
+                        fingerprint,
+                        trim: TrimStats::default(),
+                        prompt_riders,
+                        prompt_orders,
+                        prompt_bytes,
+                    },
+                    None,
+                );
+            }};
+        }
 
         let value = match fetched {
             PlanFetch::Json(v) => v,
             PlanFetch::Failed(e) => {
                 self.stats.failures += 1;
                 self.last_error = e.clone();
-                return skip(
-                    BrainSource::Fallback,
-                    format!("LLM 失败，回退算法：{e}"),
-                    model,
-                );
+                skip!(BrainSource::Fallback, format!("LLM 失败，回退算法：{e}"));
             }
         };
 
-        let mut parsed: LlmPlan = match serde_json::from_value(value) {
-            Ok(p) => p,
+        // ① 结构校验：JSON 都解不出来就整轮放弃。
+        let resp: DecisionResponse = match serde_json::from_value(value) {
+            Ok(r) => r,
             Err(e) => {
                 self.stats.failures += 1;
                 self.last_error = e.to_string();
-                return skip(
+                skip!(
                     BrainSource::Fallback,
-                    format!("LLM 输出不符合计划格式，回退算法：{e}"),
-                    model,
+                    format!("LLM 输出不符合决策协议，回退算法：{e}")
                 );
             }
         };
-        parsed.model = model.clone();
-        parsed.latency_ms = latency_ms;
 
-        // 不信任任何输出：骑手/订单必须存在，且不能重复。
-        let verdict = ai::validate_llm_plan(world, &parsed, idle, pending);
-        self.stats.applied += verdict.assignments.len() as u64;
-        self.stats.dropped += verdict.dropped as u64;
+        // ②③④ 引用 / 语义 / 钳制：全在协议层，查的是**当下**的世界。
+        let verdict = protocol::validate_decision(world, &resp);
+        self.stats.dropped += verdict.dropped() as u64;
 
-        if verdict.assignments.is_empty() {
-            // 全部被丢弃 = 等于没给计划。**必须回退算法**，
-            // 否则这一时段就白白空转了。
+        if verdict.is_empty() {
+            let why = verdict.rejected.unwrap_or_else(|| "无有效条目".into());
             self.stats.failures += 1;
-            self.last_error = format!("LLM 计划 {} 条全部被校验丢弃", parsed.assignments.len());
-            return skip(
-                BrainSource::Fallback,
-                format!(
-                    "LLM 给了 {} 条分配，全部不合法（骑手/订单不存在或重复），回退算法",
-                    parsed.assignments.len()
-                ),
-                model,
-            );
+            self.last_error = why.clone();
+            skip!(BrainSource::Fallback, format!("{why}，回退算法"));
         }
 
+        // 策略层落地（唯一一处写回世界的地方）。
+        let policies = apply_policies(world, &verdict.policies);
+        self.stats.policies_applied += policies.len() as u64;
+
+        // 站长指令落地：cap / force_offline / recall_training 立即生效。
+        let station_ops = apply_station_ops(world, &verdict.station_ops);
+
+        // 把通过校验的 claim 折成 LlmPlan，交给 tick 的 run_ai。
+        // tick 那边会**再校验一遍**（订单可能已被抢走）——这是有意的双保险。
+        let mut assignments: Vec<LlmAssign> = verdict
+            .acts
+            .iter()
+            .filter(|a| a.act == protocol::ActKind::Claim)
+            .map(|a| LlmAssign {
+                rider_id: crate::sim::rider_key(a.rider),
+                order_id: a.order,
+                reason: a.why.clone(),
+            })
+            .collect();
+        // 站长的强派也折进同一个计划——同样过 tick 的双保险校验。
+        for op in &verdict.station_ops {
+            if let ValidatedStationOp::ForceAssign { rider, order, why } = op {
+                assignments.push(LlmAssign {
+                    rider_id: crate::sim::rider_key(*rider),
+                    order_id: *order,
+                    reason: why.clone(),
+                });
+            }
+        }
+        let plan = LlmPlan {
+            assignments,
+            model: model.clone(),
+            latency_ms,
+            note: String::new(),
+            decision_id: 0, // 由 app 侧在收到结果时填上真实 id
+        };
+        let verdict_final = ai::validate_llm_plan(world, &plan, idle, pending);
+        self.stats.applied += verdict_final.assignments.len() as u64;
+        self.stats.dropped += verdict_final.dropped as u64;
+
+        // 缓存这一轮的响应（无论有没有 claim——策略也是一样可复用的）。
+        self.cache_store(fingerprint, day, sim_minute, &resp);
+        // 命中数在 `prepare` 里已经计过账，这里不能重复计。
+
+        let source = if was_cached {
+            BrainSource::Cache
+        } else {
+            BrainSource::Llm
+        };
         let note = format!(
-            "LLM 采纳 {} 条，丢弃 {} 条非法项",
-            verdict.assignments.len(),
-            verdict.dropped
+            "{}：{} 条动作（{} 条落地）、{} 条策略（{} 条落地）、{} 条站长指令、丢弃 {} 条",
+            if was_cached {
+                "指纹命中缓存"
+            } else {
+                "LLM 决策"
+            },
+            verdict.acts.len(),
+            verdict_final.assignments.len(),
+            verdict.policies.len(),
+            policies.len(),
+            station_ops.len(),
+            verdict.dropped() + verdict_final.dropped
         );
-        parsed.note = note.clone();
+
+        let mut plan = plan;
+        plan.note = note.clone();
+        let has_claim = !plan.assignments.is_empty();
         (
             BrainOutcome {
-                verdict,
-                source: BrainSource::Llm,
+                verdict: verdict_final,
+                source,
                 note,
                 model,
                 latency_ms,
+                policies,
+                station_ops,
+                fingerprint,
+                trim: TrimStats::default(),
+                prompt_riders,
+                prompt_orders,
+                prompt_bytes,
             },
-            Some(parsed),
+            if has_claim { Some(plan) } else { None },
         )
     }
 
@@ -476,7 +725,7 @@ impl TacticalBrain {
     /// tick 循环请改用 `prepare` + `finish`，别在这里等网络。
     pub async fn plan(
         &mut self,
-        world: &World,
+        world: &mut World,
         idle: &[RiderId],
         pending: &[OrderId],
     ) -> BrainOutcome {
@@ -489,88 +738,122 @@ impl TacticalBrain {
     }
 }
 
-/// 构造 (system, user) 提示词。
+/// 把校验过的策略落到骑手身上，返回真正生效的那些。
 ///
-/// 抽成纯函数是为了能单测——**这里绝对不能有 IO**。
-pub fn build_prompt(world: &World, idle: &[RiderId], pending: &[OrderId]) -> (String, String) {
-    let system = "你是外卖平台的调度大脑。只输出 JSON，禁止任何解释、前后缀或 Markdown 代码块。\n\
-         输出格式：{\"assignments\":[{\"rider_id\":\"r1\",\"order_id\":42,\"reason\":\"不超过20字的理由\"}]}\n\
-         硬性约束：\n\
-         1. rider_id 与 order_id 只能取自用户给出的两个列表，编造的会被丢弃；\n\
-         2. 每个骑手最多分 1 单，每单最多分给 1 个骑手；\n\
-         3. 宁缺毋滥：不划算的订单直接不给，assignments 允许为空数组；\n\
-         4. reason 必须引用具体数字（距离 / 报酬 / 顺路度），不要写空话。".to_string();
+/// 这是**唯一**写回世界的一处。三条约束在这里再确认一遍（协议层已钳过一次，
+/// 这里是纵深防御）：
+/// - `cap` 不超过 `cfg.backorder.max_held`；
+/// - `mode` 必须被系统开关允许，否则整个覆盖当作没提；
+/// - **基准门槛只读**：`price_tier` 只改倍率，改不了骑手自己的底线。
+///
+/// 另外：如果这轮策略和骑手现有的一模一样，就不算「生效」，
+/// 免得控制端的「策略下发」计数每天虚涨。
+fn apply_policies(world: &mut World, policies: &[ValidatedPolicy]) -> Vec<ValidatedPolicy> {
+    use crate::sim::rider::{SpeedMode, StrategyOverride};
 
-    let mut user = String::new();
-    user.push_str(&format!(
-        "当前：第 {} 天 {:02}:{:02}，天气 {}（速度×{:.2}），路况系数 {:.2}\n",
-        world.day,
-        world.sim_minute / 60,
-        world.sim_minute % 60,
-        world.weather.label(),
-        world.weather.speed_factor(),
-        if world.cfg.is_peak(world.sim_minute) {
-            1.3
-        } else {
-            1.0
-        },
-    ));
+    // 先把「上限 + 开关」读成值：下面要可变借用骑手，就不能同时借 `world.cfg`。
+    let max_held = world.cfg.backorder.max_held;
+    let allow_speeding = world.cfg.allow_speeding;
+    let allow_unrestricted = world.cfg.allow_unrestricted;
+    let sim_minute = world.sim_minute as u64;
 
-    user.push_str("空闲骑手：\n");
-    let mut shown = 0;
-    for rid in idle.iter().take(MAX_RIDERS_IN_PROMPT) {
-        let Some(r) = world.rider(*rid) else { continue };
-        user.push_str(&format!(
-            "- {} | {} | 评分{:.2} | 手持{}单 | 时薪¥{:.1} | 位置({:.5},{:.5})\n",
-            crate::sim::rider_key(r.id),
-            r.speed_mode.label(),
-            r.rating,
-            r.held.len(),
-            r.hourly_wage_cents() as f64 / 100.0,
-            r.lat,
-            r.lng,
-        ));
-        shown += 1;
+    let mut applied = Vec::new();
+    for p in policies {
+        let cap = p.cap.map(|c| c.min(max_held));
+        let mode = p.mode.filter(|m| match m {
+            SpeedMode::Compliant => true,
+            SpeedMode::Tolerant => allow_speeding,
+            SpeedMode::Unrestricted => allow_unrestricted,
+        });
+        let Some(rider) = world.rider_mut(p.rider) else {
+            continue;
+        };
+        let next = StrategyOverride {
+            price_tier: p.price,
+            cap_override: cap,
+            mode_override: mode,
+            set_at_min: sim_minute,
+            note: p.why.clone(),
+        };
+        if next.price_tier == rider.policy_override.price_tier
+            && next.cap_override == rider.policy_override.cap_override
+            && next.mode_override == rider.policy_override.mode_override
+        {
+            continue;
+        }
+        rider.policy_override = next;
+        applied.push(ValidatedPolicy {
+            rider: p.rider,
+            price: p.price,
+            cap,
+            mode,
+            why: p.why.clone(),
+        });
     }
-    if shown == 0 {
-        user.push_str("- （无）\n");
-    }
+    applied
+}
 
-    user.push_str("待分配订单：\n");
-    let mut shown_o = 0;
-    for oid in pending.iter().take(MAX_ORDERS_IN_PROMPT) {
-        let Some(o) = world.order(*oid) else { continue };
-        // 从最近的空闲骑手看这单要跑多远——LLM 需要这个数才能谈「顺路」
-        let nearest_km = idle
-            .iter()
-            .filter_map(|rid| world.rider(*rid))
-            .map(|r| {
-                haversine_m(
-                    r.pos(),
-                    crate::sim::geo::LatLng::new(o.merchant_lat, o.merchant_lng),
-                )
-            })
-            .fold(f64::INFINITY, |acc: f64, d: f64| acc.min(d));
-        let window = o.claim_deadline_min.saturating_sub(world.elapsed_min);
-        user.push_str(&format!(
-            "- #{} | {} | 送达距离{:.1}km | 报酬¥{:.2} | 承诺{}分钟 | 抢单窗口剩{}min | 最近骑手{:.2}km | 备注「{}」\n",
-            o.id,
-            o.merchant_name,
-            o.distance_m as f64 / 1000.0,
-            o.quoted_fee_cents() as f64 / 100.0,
-            o.promised_minutes,
-            window,
-            if nearest_km.is_finite() { nearest_km / 1000.0 } else { -1.0 },
-            o.remark,
-        ));
-        shown_o += 1;
-    }
-    if shown_o == 0 {
-        user.push_str("- （无）\n");
-    }
+/// 把校验过的站长指令落到世界，返回给控制端的说明。
+///
+/// 落地规则（协议层已查过引用，这里是**最后一米**）：
+/// - `cap_rider`：写进 `policy_override.cap_override`，再钳一次上限；
+/// - `force_offline`：直接把 `online` 置 false，手上单交回算法；
+/// - `recall_training`：`recall_count += 1`，只记不改即时状态；
+/// - `force_assign`：**这里不落地**——折进 `LlmPlan`，交给 tick 的双保险校验。
+fn apply_station_ops(world: &mut World, ops: &[ValidatedStationOp]) -> Vec<StationOpBrief> {
+    let max_held = world.cfg.backorder.max_held;
+    let mut applied = Vec::new();
 
-    user.push_str("请给出本轮分配计划。");
-    (system, user)
+    for op in ops {
+        let key = crate::sim::rider_key(op.rider());
+        match op {
+            ValidatedStationOp::CapRider { rider, cap, why } => {
+                let cap = (*cap).min(max_held);
+                if let Some(r) = world.rider_mut(*rider) {
+                    r.policy_override.cap_override = Some(cap);
+                    r.policy_override.note = why.clone();
+                }
+                applied.push(StationOpBrief {
+                    op: "cap_rider",
+                    rider: key,
+                    detail: format!("上限 {cap}"),
+                    why: why.clone(),
+                });
+            }
+            ValidatedStationOp::ForceOffline { rider, why } => {
+                if let Some(r) = world.rider_mut(*rider) {
+                    r.online = false;
+                }
+                applied.push(StationOpBrief {
+                    op: "force_offline",
+                    rider: key,
+                    detail: "强制下线".into(),
+                    why: why.clone(),
+                });
+            }
+            ValidatedStationOp::RecallTraining { rider, why } => {
+                if let Some(r) = world.rider_mut(*rider) {
+                    r.recall_count += 1;
+                }
+                applied.push(StationOpBrief {
+                    op: "recall_training",
+                    rider: key,
+                    detail: "召回培训".into(),
+                    why: why.clone(),
+                });
+            }
+            ValidatedStationOp::ForceAssign { order, why, .. } => {
+                // 不动世界，只汇报——真正落地交给 tick 的 validate_llm_plan。
+                applied.push(StationOpBrief {
+                    op: "force_assign",
+                    rider: key,
+                    detail: format!("强派订单 {order}"),
+                    why: why.clone(),
+                });
+            }
+        }
+    }
+    applied
 }
 
 /// 给单测用：造一个「假装调用了 LLM」的客户端不可行（需要真实 HTTP），
@@ -585,17 +868,22 @@ mod tests {
     }
 
     #[test]
-    fn prompt_contains_both_lists_and_the_json_contract() {
+    fn prompt_follows_the_decision_protocol() {
         let w = world();
         let idle = w.idle_riders();
         let pending = w.pending_orders();
-        let (system, user) = build_prompt(&w, &idle, &pending);
-        assert!(system.contains("assignments"));
-        assert!(system.contains("order_id"));
-        assert!(system.contains("rider_id"));
-        assert!(user.contains("空闲骑手"));
-        assert!(user.contains("待分配订单"));
-        assert!(user.contains("第 1 天"));
+        let req = BrainRequest::build(&w, &idle, &pending);
+        let system = protocol::system_prompt();
+        let user = protocol::user_prompt(&req);
+        // 系统提示词必须讲清 acts / policies 两个数组与白名单枚举
+        assert!(system.contains("acts"));
+        assert!(system.contains("policies"));
+        assert!(system.contains("price"));
+        assert!(system.contains("mode"));
+        // 请求里必须带上 sim 上下文与两个数组
+        assert!(user.contains("\"riders\""));
+        assert!(user.contains("\"orders\""));
+        assert!(user.contains("\"weather\""));
     }
 
     #[test]
@@ -606,20 +894,26 @@ mod tests {
         }
         let idle = w.idle_riders();
         let pending = w.pending_orders();
-        let (_, user) = build_prompt(&w, &idle, &pending);
-        let lines = user.lines().filter(|l| l.starts_with("- r")).count();
+        let req = BrainRequest::build(&w, &idle, &pending);
         assert!(
-            lines <= MAX_RIDERS_IN_PROMPT,
-            "骑手列表必须有上限，实际 {lines}"
+            req.riders.len() <= protocol::MAX_RIDERS_IN_PROMPT,
+            "骑手列表必须有上限，实际 {}",
+            req.riders.len()
+        );
+        assert!(
+            req.body_bytes() <= protocol::MAX_PROMPT_BYTES,
+            "请求体必须落在预算内，实际 {} 字节",
+            req.body_bytes()
         );
     }
 
     #[tokio::test]
     async fn disabled_brain_never_calls_out_and_says_so() {
-        let w = world();
+        let mut w = world();
         let mut brain = TacticalBrain::disabled();
         assert!(!brain.is_enabled());
-        let out = brain.plan(&w, &w.idle_riders(), &w.pending_orders()).await;
+        let (idle, pending) = (w.idle_riders(), w.pending_orders());
+        let out = brain.plan(&mut w, &idle, &pending).await;
         assert_eq!(out.source, BrainSource::Disabled);
         assert!(out.assignments().is_empty());
         assert_eq!(brain.stats().calls, 0);
@@ -627,11 +921,12 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_brain_wins_over_throttling() {
-        let w = world();
+        let mut w = world();
         let mut brain = TacticalBrain::disabled();
         brain.throttle.begin(w.day, w.sim_minute);
         assert!(brain.slot_used(w.day, w.sim_minute));
-        let out = brain.plan(&w, &w.idle_riders(), &w.pending_orders()).await;
+        let (idle, pending) = (w.idle_riders(), w.pending_orders());
+        let out = brain.plan(&mut w, &idle, &pending).await;
         // 没有客户端时优先级是 Disabled —— 连「节流」都轮不到
         assert_eq!(out.source, BrainSource::Disabled);
     }
@@ -721,5 +1016,45 @@ mod tests {
     #[test]
     fn daily_cap_is_the_documented_24() {
         assert_eq!(MAX_CALLS_PER_DAY, 24);
+    }
+
+    #[test]
+    fn apply_station_ops_caps_offlines_and_recalls() {
+        let mut w = world();
+        let ops = vec![
+            ValidatedStationOp::CapRider {
+                rider: 1,
+                cap: 99,
+                why: "暴雨".into(),
+            },
+            ValidatedStationOp::ForceOffline {
+                rider: 2,
+                why: "疲劳".into(),
+            },
+            ValidatedStationOp::RecallTraining {
+                rider: 3,
+                why: "准时率 68%".into(),
+            },
+            ValidatedStationOp::ForceAssign {
+                rider: 1,
+                order: 12345,
+                why: "积压".into(),
+            },
+        ];
+        let applied = apply_station_ops(&mut w, &ops);
+
+        let max_held = w.cfg.backorder.max_held;
+        assert_eq!(
+            w.rider(1).unwrap().policy_override.cap_override,
+            Some(max_held),
+            "cap 要再钳一次上限"
+        );
+        assert!(!w.rider(2).unwrap().online, "force_offline 要真的下线");
+        assert_eq!(w.rider(3).unwrap().recall_count, 1, "召回要记一次");
+
+        assert_eq!(applied.len(), 4);
+        assert_eq!(applied[0].op, "cap_rider");
+        assert_eq!(applied[3].op, "force_assign");
+        assert!(applied[3].detail.contains("12345"));
     }
 }

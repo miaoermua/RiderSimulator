@@ -2,7 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{OrderId, RiderId, config::SimConfig, geo::LatLng, weather::Weather};
+use super::{
+    OrderId, RiderId,
+    config::{PEAK_THRESHOLD_MULTIPLIER, SimConfig},
+    geo::LatLng,
+    weather::Weather,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,6 +101,11 @@ pub struct HeldOrder {
     pub phase: Phase,
     /// 当前行程段剩余分钟。
     pub remaining_min: u32,
+    /// 当前行程段的**总时长**（分钟）。`remaining_min` 归零时用它算进度。
+    ///
+    /// LLM 需要「骑手卡在哪一段、进度多少」才能判「这单能不能再背一单」，
+    /// 只给剩余分钟是判不出的（见《LLM协议设计》§4.2 `leg_progress`）。
+    pub leg_total_min: u32,
     /// 倒计时已归零、等骑手点按钮（真人骑手才有）。
     pub awaiting_ack: bool,
     /// 背单（多背一单）。
@@ -119,11 +129,157 @@ impl HeldOrder {
             order_id,
             phase,
             remaining_min,
+            leg_total_min: remaining_min.max(1),
             awaiting_ack: false,
             back_order,
             wait_started_min: now_min,
             wait_fined: false,
         }
+    }
+
+    /// 切换到新的行程段：总时长与剩余分钟一起重置。
+    ///
+    /// **进入新段必须走这里**，否则 `leg_progress` 会拿旧总时长算，进度失真。
+    pub fn set_leg(&mut self, phase: Phase, total_min: u32) {
+        self.phase = phase;
+        let total = total_min.max(1);
+        self.leg_total_min = total;
+        self.remaining_min = total;
+    }
+
+    /// 当前行程段进度 0.0~1.0（1.0 = 该段已走完、等待切换）。
+    pub fn leg_progress(&self) -> f32 {
+        let total = self.leg_total_min.max(1) as f32;
+        let done = (self.leg_total_min - self.remaining_min.min(self.leg_total_min)) as f32;
+        (done / total).clamp(0.0, 1.0)
+    }
+
+    /// 该段还剩多少比例（1.0 = 刚出发，0.0 = 已到点）。
+    pub fn leg_remaining_ratio(&self) -> f32 {
+        1.0 - self.leg_progress()
+    }
+}
+
+#[cfg(test)]
+mod leg_progress_tests {
+    use super::*;
+
+    #[test]
+    fn progress_tracks_remaining() {
+        let mut h = HeldOrder::new(1, Phase::ToShop, 10, false, 0);
+        assert_eq!(h.leg_total_min, 10);
+        assert!((h.leg_progress() - 0.0).abs() < 1e-6);
+        h.remaining_min = 7;
+        assert!((h.leg_progress() - 0.3).abs() < 1e-6);
+        assert!((h.leg_remaining_ratio() - 0.7).abs() < 1e-6);
+        h.set_leg(Phase::ToCustomer, 8);
+        assert_eq!(h.leg_total_min, 8);
+        assert_eq!(h.remaining_min, 8);
+        assert!((h.leg_progress() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn progress_never_divides_by_zero() {
+        let h = HeldOrder::new(1, Phase::ToShop, 0, false, 0);
+        assert_eq!(h.leg_total_min, 1);
+        // 剩余为 0 = 该段已走完
+        assert!((h.leg_progress() - 1.0).abs() < 1e-6);
+    }
+}
+
+/// 期望单价档位（《LLM协议设计》§3.4）。
+///
+/// **为什么用档位而不是「期望单价 = 850 分」**：LLM 会输出 `99999` / `-1` /
+/// `"8块5"`，钳制之后语义就没了。档位是有限集合，可精确校验、可白名单枚举；
+/// 档位到门槛的**具体倍率由代码决定**，LLM 只能在骑手自己的基准上做相对调整
+/// ——它无法通过输出极端值操纵经济系统。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceTier {
+    /// 什么单都接，冲单量。
+    Low,
+    #[default]
+    Normal,
+    /// 挑单。
+    High,
+    /// 只等高价值单。
+    Premium,
+}
+
+impl PriceTier {
+    pub const ALL: [PriceTier; 4] = [
+        PriceTier::Low,
+        PriceTier::Normal,
+        PriceTier::High,
+        PriceTier::Premium,
+    ];
+
+    /// 协议里用的短代号（与 `llm/protocol.rs` 的 `low`/`normal`/`high`/`premium` 一致）。
+    pub fn key(self) -> &'static str {
+        match self {
+            PriceTier::Low => "low",
+            PriceTier::Normal => "normal",
+            PriceTier::High => "high",
+            PriceTier::Premium => "premium",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "low" => Some(PriceTier::Low),
+            "normal" => Some(PriceTier::Normal),
+            "high" => Some(PriceTier::High),
+            "premium" => Some(PriceTier::Premium),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PriceTier::Low => "低（冲量）",
+            PriceTier::Normal => "正常",
+            PriceTier::High => "高（挑单）",
+            PriceTier::Premium => "极高",
+        }
+    }
+
+    /// 档位 → 时薪门槛倍率。基准是骑手自己的 `accept_threshold_cents_hour`。
+    pub fn multiplier(self) -> f32 {
+        match self {
+            PriceTier::Low => 0.75,
+            PriceTier::Normal => 1.00,
+            PriceTier::High => 1.30,
+            PriceTier::Premium => 1.80,
+        }
+    }
+}
+
+/// LLM 下发的策略调整，**叠加**在骑手原有策略之上（《LLM协议设计》§5.5）。
+///
+/// 三层倍率叠加语义：`基准门槛 × 高峰系数 × price_tier 倍率`。
+/// 默认值（Normal / None / None）必须是**恒等变换**——这样 LLM 关闭时
+/// 系统行为与加协议之前逐字节一致。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StrategyOverride {
+    /// 期望单价档位 → 门槛倍率。
+    pub price_tier: PriceTier,
+    /// 背单上限覆盖。`None` = 用配置默认；**永远被 `cfg.backorder.max_held` 二次钳制**。
+    pub cap_override: Option<u32>,
+    /// 速度档位覆盖。`None` = 用骑手自己设的；仍需过 `allow_speeding` 等开关。
+    pub mode_override: Option<SpeedMode>,
+    /// 这一轮策略的生效时间（模拟分钟），用于过期检查与审计。
+    pub set_at_min: u64,
+    /// 下达这轮策略的说明（≤24 字），仅用于控制端展示。
+    #[serde(default)]
+    pub note: String,
+}
+
+impl StrategyOverride {
+    /// 是否是「什么都没改」的默认覆盖。
+    pub fn is_identity(&self) -> bool {
+        self.price_tier == PriceTier::Normal
+            && self.cap_override.is_none()
+            && self.mode_override.is_none()
     }
 }
 
@@ -191,9 +347,19 @@ pub struct Rider {
     pub injured_until_min: u64,
 
     pub strategy: SimStrategy,
+    /// LLM 下发的策略覆盖（默认 = 恒等变换，即不生效）。
+    ///
+    /// 与 `strategy` 的关系：`strategy` 是骑手自己的底线，这里是**外层调整**。
+    /// 读的时候一律走 `effective_*()`，不要直接读这个字段。
+    #[serde(default)]
+    pub policy_override: StrategyOverride,
     /// 日常活动中心（用于派单距离偏好）。
     pub home_lat: f64,
     pub home_lng: f64,
+
+    /// 被站长召回培训的次数（只记不改即时状态，后续影响评级 / 派单权重）。
+    #[serde(default)]
+    pub recall_count: u32,
 
     /// 最近一次收入变动的说明，给账单用。
     pub last_ledger: Vec<LedgerEntry>,
@@ -242,8 +408,10 @@ impl Rider {
             frozen_until_min: 0,
             injured_until_min: 0,
             strategy: SimStrategy::default(),
+            policy_override: StrategyOverride::default(),
             home_lat: pos.lat,
             home_lng: pos.lng,
+            recall_count: 0,
             last_ledger: Vec::new(),
         }
     }
@@ -265,13 +433,21 @@ impl Rider {
         self.frozen_until_min > now_min
     }
 
-    /// 空闲 = 在线 + 手上没单 + 没受伤 + 没被冻结 + 没到单量上限。
-    pub fn is_idle(&self, now_min: u64, cfg: &SimConfig) -> bool {
-        self.online
-            && self.held.is_empty()
+    /// 手上没活 = 没单 + 没受伤 + 没被冻结 + 没到单量上限。
+    ///
+    /// **故意不含 `online`**：AutoPilot 下掉线的真人由 AI 代管，他本人是离线的，
+    /// 但 AI 得能给他派单（见 [`crate::sim::host::ai_idle_riders`]）。
+    /// 所以「能不能接单」和「在不在线」是两件事，前者是 `is_free`，后者是 `is_idle`。
+    pub fn is_free(&self, now_min: u64, cfg: &SimConfig) -> bool {
+        self.held.is_empty()
             && !self.is_injured(now_min)
             && !self.is_frozen(now_min)
             && !self.reached_daily_cap(cfg)
+    }
+
+    /// 空闲 = 在线 + 手上没活。
+    pub fn is_idle(&self, now_min: u64, cfg: &SimConfig) -> bool {
+        self.online && self.is_free(now_min, cfg)
     }
 
     /// 单量上限 0 表示不限。
@@ -308,6 +484,40 @@ impl Rider {
     /// 米/秒。真实骑行速度上限约 8.3 m/s（30km/h）。
     pub fn speed_mps(&self, cfg: &SimConfig, weather: Weather) -> f32 {
         self.speed_kmh(cfg, weather) / 3.6
+    }
+
+    // ---- 策略覆盖的读取口（《LLM协议设计》§5.4 / §5.5）----
+    //
+    // 一律走这几个方法，不要直接读 `policy_override`：钳制逻辑只写一遍。
+
+    /// 当前生效的接单时薪门槛（分/小时）。
+    ///
+    /// 三层倍率叠加：`骑手基准 × 高峰系数 × LLM 单价档位倍率`。
+    /// 默认档位是 `Normal`（×1.0），所以 LLM 关闭时结果与不加协议完全一致。
+    pub fn effective_threshold_cents_hour(&self, is_peak: bool) -> f32 {
+        let base = self.strategy.accept_threshold_cents_hour as f32;
+        let peak = if is_peak {
+            PEAK_THRESHOLD_MULTIPLIER
+        } else {
+            1.0
+        };
+        base * peak * self.policy_override.price_tier.multiplier()
+    }
+
+    /// 当前生效的背单上限。**永远不能超过 `cfg.backorder.max_held`。**
+    pub fn effective_max_held(&self, cfg: &SimConfig) -> u32 {
+        let hard = cfg.backorder.max_held;
+        self.policy_override.cap_override.unwrap_or(hard).min(hard)
+    }
+
+    /// 当前生效的速度档位：LLM 的覆盖必须先过系统开关（`allow_speeding` 等）。
+    ///
+    /// 没开关时返回骑手自己当前的档位——**不会因为 LLM 说 2 就解限速**。
+    pub fn effective_speed_mode(&self, cfg: &SimConfig) -> SpeedMode {
+        match self.policy_override.mode_override {
+            Some(m) if cfg.speed_mode_allowed(m) => m,
+            _ => self.speed_mode,
+        }
     }
 
     /// 在线小时数（等餐时间也算在线——这是真实骑手的痛点）。
@@ -398,5 +608,17 @@ mod tests {
         r.frozen_until_min = 10;
         assert!(!r.is_idle(5, &cfg));
         assert!(r.is_idle(10, &cfg));
+    }
+
+    #[test]
+    fn is_free_ignores_online_so_autopilot_can_pick_up_an_offline_rider() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        r.online = false;
+        assert!(!r.is_idle(0, &cfg), "离线不算空闲");
+        assert!(r.is_free(0, &cfg), "但「手上没活」，AI 可以代管");
+
+        r.frozen_until_min = 10;
+        assert!(!r.is_free(5, &cfg), "被冻结就不是没活");
     }
 }

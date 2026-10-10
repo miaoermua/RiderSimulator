@@ -109,6 +109,62 @@ pub struct LevelRules {
     pub coefficients: Vec<f32>,
 }
 
+/// 高峰期挑单系数：高峰时只接更高时薪的单（玩法设计 §5.1）。
+///
+/// 与 LLM 的「期望单价档位倍率」是**相乘**关系，两者互不替代：
+/// 这一层是系统定的，LLM 那层是骑手 AI 定的。
+pub const PEAK_THRESHOLD_MULTIPLIER: f32 = 1.15;
+
+/// 步行规则（《LLM协议设计》§5.1）。
+///
+/// 现实中骑手到商场要停车、走路进楼、找店、坐电梯——「商场单」难跑就在这里。
+/// 这些量是**物理量**：只由代码给出，绝不接受 LLM 干预（否则轨迹不可复现）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WalkRules {
+    /// 步行速度 m/s。1.2 是正常步速，负重（提餐）取 1.0。
+    pub walk_speed_mps: f32,
+    /// 按商家步行难度分档的额外步行距离（米）。
+    ///
+    /// 0 = 路边店，停车即取；1 = 商场内店，需步行进入；2 = 高层 / 深巷，电梯或长距步行。
+    pub merchant_walk_m: [u32; 3],
+    /// 电梯 / 找店的固定时间罚（秒）。
+    pub elevator_penalty_secs: u32,
+    /// 交付端（送到顾客）的步行难度分档距离（米）。**为往返距离**。
+    pub customer_walk_m: [u32; 3],
+}
+
+impl Default for WalkRules {
+    fn default() -> Self {
+        Self {
+            walk_speed_mps: 1.2,
+            merchant_walk_m: [0, 120, 350],
+            elevator_penalty_secs: 90,
+            customer_walk_m: [30, 100, 280],
+        }
+    }
+}
+
+impl WalkRules {
+    /// 取某一档的商家步行距离，越界一律按 0 处理（不 panic）。
+    pub fn merchant_walk_m(&self, difficulty: u8) -> u32 {
+        *self.merchant_walk_m.get(difficulty as usize).unwrap_or(&0)
+    }
+
+    /// 取某一档的顾客步行距离（往返），越界按 0 处理。
+    pub fn customer_walk_m(&self, difficulty: u8) -> u32 {
+        *self.customer_walk_m.get(difficulty as usize).unwrap_or(&0)
+    }
+
+    /// 该档是否需要额外付出电梯 / 找店时间罚。
+    pub fn needs_elevator(&self, difficulty: u8) -> bool {
+        difficulty >= 2
+    }
+
+    pub fn walk_speed_mps(&self) -> f32 {
+        self.walk_speed_mps.max(0.5)
+    }
+}
+
 /// 疲劳规则。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FatigueRules {
@@ -133,6 +189,9 @@ pub struct SimConfig {
     pub rating_rules: RatingRules,
     pub level: LevelRules,
     pub fatigue: FatigueRules,
+    /// 步行规则（商场单 / 高层送货的时间成本）。
+    #[serde(default)]
+    pub walk: WalkRules,
 
     // --- 控制端开关 ---
     /// 平台抽水比例 0.0 ~ 0.30，默认 0。
@@ -235,6 +294,7 @@ impl Default for SimConfig {
                 speed_penalty_max: 0.25,
                 accident_weight: 0.02,
             },
+            walk: WalkRules::default(),
             commission_rate: 0.0,
             commission_on_rain_bonus: false,
             discriminative_commission: false,
@@ -269,6 +329,18 @@ impl SimConfig {
     }
 
     /// 是否处于高峰（出餐变慢、车流量变大）。
+    /// 该速度档位当前是否被系统开关允许。
+    ///
+    /// LLM 只能在这个白名单内调档（设计红线 2：输出必须是有限集合）。
+    pub fn speed_mode_allowed(&self, mode: crate::sim::rider::SpeedMode) -> bool {
+        use crate::sim::rider::SpeedMode;
+        match mode {
+            SpeedMode::Compliant => true,
+            SpeedMode::Tolerant => self.allow_speeding,
+            SpeedMode::Unrestricted => self.allow_unrestricted,
+        }
+    }
+
     pub fn is_peak(&self, sim_minute: u32) -> bool {
         self.surge_multiplier(sim_minute) > 1.0
     }

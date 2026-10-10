@@ -200,6 +200,76 @@ export interface Tick {
   speed_multiplier: number;
 }
 
+/** 三层 AI 的一层。`layer` 同时也是 `AiDecision.layer` 的取值。 */
+export type AiLayerKey = "rider" | "station" | "director";
+
+/** 托管模式：真人骑手在线 / 掉线时，AI 能不能代管。 */
+export type HostMode = "off" | "simulated_only" | "auto_pilot";
+
+export interface AiLayerState {
+  layer: AiLayerKey;
+  /** 这一层是否参与调度。 */
+  enabled: boolean;
+  /** 最短调用间隔（模拟分钟）。 */
+  interval_min: number;
+  calls: number;
+  failures: number;
+  /** 校验通过、真正落地的条数。 */
+  applied: number;
+  /** 被校验丢掉的条数。 */
+  dropped: number;
+  /** 回退到算法的次数。 */
+  fallbacks: number;
+}
+
+export interface AiStationKpi {
+  completed: number;
+  late_count: number;
+  /** 0~1。 */
+  on_time_rate: number;
+  avg_hourly_cents: number;
+  active_riders: number;
+  total_riders: number;
+  backlog: number;
+  avg_wait_min: number;
+}
+
+export interface AiState {
+  llm_configured: boolean;
+  llm_model: string;
+  llm_base_url: string;
+  brain_enabled: boolean;
+  host_mode: HostMode;
+  /** 每层实际用的模型（成本优化：高频层可以配便宜模型）。 */
+  models: Record<string, string>;
+  /** 状态指纹缓存。命中率越高越省钱。 */
+  cache: { hits: number; calls: number; hit_rate: number };
+  budget: {
+    calls_today: number;
+    max_calls_per_day: number;
+    /** 在飞的那一层；没有则 null。 */
+    inflight: AiLayerKey | null;
+  };
+  layers: AiLayerState[];
+  station: {
+    id: number;
+    name: string;
+    rider_count: number;
+    kpi: AiStationKpi;
+  };
+  /** 还能被否决的那一条决策；没有则 null。 */
+  rejectable: { decision_id: number; layer: string } | null;
+  reject_log: Array<{ decision_id: number; layer: string; result: string }>;
+}
+
+/** 一条 AI 运营指令的人类可读摘要。 */
+export interface AiOpBrief {
+  op: string;
+  target: string;
+  detail: string;
+  why: string;
+}
+
 export interface ServerInfo {
   llm_enabled?: boolean;
   llm_configured?: boolean;
@@ -208,6 +278,8 @@ export interface ServerInfo {
   brain_note?: string;
   brain_calls_today?: number;
   brain_max_calls_per_day?: number;
+  /** 三层 AI 的统一状态（控制台 AI Tab 用）。 */
+  ai?: AiState;
   hub?: Record<string, unknown>;
   [k: string]: unknown;
 }
@@ -253,7 +325,51 @@ export interface EventPayloads {
   weather_changed: { label: string; speed_factor: number; rain_bonus_cents: number };
   fine_issued: { rider_id: number; kind: string; amount_cents: number; reason: string };
   config_changed: { speed_multiplier: number; commission_rate: number; weather: Weather };
-  ai_decision: { source: string; note?: string };
+  ai_decision: {
+    source: string;
+    /** 哪一层做的决策：`rider` | `station` | `director` | `algorithm` | `manual`。 */
+    layer?: string;
+    assignments?: Array<Record<string, unknown>>;
+    /** 站长 / 烽火台的运营指令摘要。 */
+    ops?: AiOpBrief[];
+    /** 决策 id，人工否决时回传它。`0` = 不可否决。 */
+    decision_id?: number;
+    note?: string;
+  };
+  /** 三层 AI 状态（控制端专用，随 server_info 与 ai_query 下发）。 */
+  ai_state: AiState;
+  /** 骑手层一轮 LLM 决策（控制端专用，比 ai_decision 更详细）。 */
+  llm_brain: {
+    decision_id: number;
+    layer: string;
+    source: string;
+    note: string;
+    model?: string;
+    latency_ms?: number;
+    assignments?: number;
+    dropped?: number;
+    policies?: Array<Record<string, unknown>>;
+    station_ops?: Array<Record<string, unknown>>;
+    fingerprint?: string;
+    cached?: boolean;
+    prompt_bytes?: number;
+    trim?: Record<string, unknown>;
+    stats?: Record<string, unknown>;
+  };
+  /** 烽火台一轮 LLM 决策（控制端专用）。 */
+  llm_world: {
+    decision_id: number;
+    layer: string;
+    source: string;
+    note: string;
+    model?: string;
+    latency_ms?: number;
+    ops?: Array<Record<string, unknown>>;
+    narrate?: string | null;
+    dropped?: number;
+  };
+  /** AI 说的一句话（烽火台旁白等）。只影响气氛，不改数值。 */
+  narration: { layer: string; text: string };
   task_message: { order_id: number; from: string; text: string };
   day_closed: { day: number; total_orders: number; total_takehome_cents: number };
   ack: AckPayload;

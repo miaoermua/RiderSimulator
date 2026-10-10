@@ -57,20 +57,56 @@ impl Assignment {
 /// 路网绕行系数：直线距离 ×1.3 近似真实骑行距离。
 const ROAD_FACTOR: f32 = 1.3;
 
-/// 估算行程。
+/// 取餐端步行秒数：商场内店要走进楼，高层还要等电梯。
+pub fn merchant_walk_secs(world: &World, order: &Order) -> f32 {
+    let w = &world.cfg.walk;
+    let d = order.merchant_walk_difficulty;
+    w.merchant_walk_m(d) as f32 / w.walk_speed_mps()
+        + if w.needs_elevator(d) {
+            w.elevator_penalty_secs as f32
+        } else {
+            0.0
+        }
+}
+
+/// 送端步行秒数：送到楼上还要走下来，所以算的是往返距离。
+pub fn customer_walk_secs(world: &World, order: &Order) -> f32 {
+    let w = &world.cfg.walk;
+    w.customer_walk_m(order.customer_walk_difficulty) as f32 / w.walk_speed_mps()
+}
+
+/// 送端行程分钟（骑行 + 顾客端步行往返）。
+///
+/// 与 [`plan_for`] 共用同一套算法，保证「估算的时间」和「实际推进的时间」一致。
+pub fn customer_leg_min(world: &World, rider: &Rider, order: &Order) -> u32 {
+    let ride_mps = rider.speed_mps(&world.cfg, world.weather).max(1.0);
+    let ride_m = order.distance_m as f32 * ROAD_FACTOR;
+    ((ride_m / ride_mps + customer_walk_secs(world, order)) / 60.0)
+        .ceil()
+        .max(1.0) as u32
+}
+
+/// 估算行程（骑行 + 步行）。
+///
+/// 「商场单」难跑就在这里：骑行时间之外，还要停车、走进楼、找店、坐电梯。
+/// 步行段是**物理量**，由 [`super::config::WalkRules`] 给出，**不接受 LLM 干预**
+/// （《LLM协议设计》§5.1、设计红线 1）。
 pub fn plan_for(world: &World, rider: &Rider, order: &Order) -> DeliveryPlan {
-    let cfg = &world.cfg;
-    let speed_mps = rider.speed_mps(cfg, world.weather).max(1.0);
-    let to_shop_m = haversine_m(rider.pos(), order.merchant_pos()) as f32 * ROAD_FACTOR;
-    let to_customer_m = order.distance_m as f32 * ROAD_FACTOR;
+    let ride_mps = rider.speed_mps(&world.cfg, world.weather).max(1.0);
+    let to_shop_ride_m = haversine_m(rider.pos(), order.merchant_pos()) as f32 * ROAD_FACTOR;
+    let to_shop_min = ((to_shop_ride_m / ride_mps + merchant_walk_secs(world, order)) / 60.0)
+        .ceil()
+        .max(1.0) as u32;
+
     // 已到店则用实际出餐耗时，否则用商家平均值估算
     let prep = order
         .prep_minutes
         .unwrap_or_else(|| world.avg_prep_minutes(order.merchant_id));
+
     DeliveryPlan {
-        to_shop_min: (to_shop_m / speed_mps / 60.0).ceil().max(1.0) as u32,
+        to_shop_min,
         prep_min: prep,
-        to_customer_min: (to_customer_m / speed_mps / 60.0).ceil().max(1.0) as u32,
+        to_customer_min: customer_leg_min(world, rider, order),
     }
 }
 
@@ -147,7 +183,11 @@ pub fn evaluate(world: &World, rider_id: RiderId, order_id: OrderId) -> Option<A
 }
 
 /// 骑手是否愿意接（时薪门槛）。
-fn accepts(world: &World, rider: &Rider, order: &Order) -> bool {
+///
+/// 门槛是**三层倍率叠加**的结果（《LLM协议设计》§5.5）：
+/// `骑手基准 × 高峰系数 × LLM 期望单价档位倍率`。
+/// 默认档位 `Normal` 的倍率是 1.0，所以 LLM 关掉时这里与旧实现逐字节等价。
+pub fn accepts(world: &World, rider: &Rider, order: &Order) -> bool {
     if rider.kind != super::rider::RiderKind::Simulated {
         return true;
     }
@@ -158,15 +198,14 @@ fn accepts(world: &World, rider: &Rider, order: &Order) -> bool {
     {
         return false;
     }
+    // 已到「本人愿意背的上限」就不再接（LLM 可以把 cap 压到 0 = 今日不背单）
+    if rider.held.len() as u32 >= rider.effective_max_held(&world.cfg) {
+        return false;
+    }
     let plan = plan_for(world, rider, order);
     let takehome = estimated_takehome_cents(world, rider, order);
     let hourly = takehome as f32 / plan.total_min().max(1) as f32 * 60.0;
-    // 高峰期挑单：只接高时薪
-    let threshold = if world.cfg.is_peak(world.sim_minute) {
-        rider.strategy.accept_threshold_cents_hour as f32 * 1.15
-    } else {
-        rider.strategy.accept_threshold_cents_hour as f32
-    };
+    let threshold = rider.effective_threshold_cents_hour(world.cfg.is_peak(world.sim_minute));
     hourly >= threshold
 }
 
@@ -226,6 +265,9 @@ pub struct LlmPlan {
     pub latency_ms: u64,
     #[serde(default)]
     pub note: String,
+    /// 决策 id（服务端分配，供控制台人工否决用）。`0` = 不可否决。
+    #[serde(default)]
+    pub decision_id: u64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]

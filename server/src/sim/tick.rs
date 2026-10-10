@@ -9,8 +9,9 @@ use super::{
     economy,
     event::{DayLedger, DecisionSource, SimEvent},
     geo::LatLng,
+    host::{self, HostMode},
     order::OrderStatus,
-    rider::{Phase, RiderKind},
+    rider::{Phase, Rider, RiderKind},
     risk, scheduler,
     world::World,
 };
@@ -20,13 +21,28 @@ use super::{
 pub struct TickInput {
     /// app 层异步拿到的 LLM 计划（可能为 None）。
     pub llm_plan: Option<LlmPlan>,
+    /// 托管模式。`Off` = AI 全停机，这一 tick 不派单、也不需要谁去点按钮。
+    /// 默认 [`HostMode::SimulatedOnly`]，所以不开托管模式时行为与从前一致。
+    pub host_mode: HostMode,
+    /// 本 tick **有活人连着 WS** 的骑手（hub 给）。**不缓存**：玩家一断线，
+    /// 下一 tick 的 [`host::ai_should_drive`] 就该让 AI 接手。
+    pub live_riders: Vec<RiderId>,
+}
+
+impl TickInput {
+    /// 这个骑手这一 tick 由 AI 代管吗？判定只有 `host::ai_should_drive` 一条。
+    pub fn ai_hosts(&self, rider: &Rider) -> bool {
+        host::ai_should_drive(rider, self.live_riders.contains(&rider.id), self.host_mode)
+    }
 }
 
 /// 推进一个 tick。
-pub fn tick(world: &mut World, input: TickInput) -> Vec<SimEvent> {
+pub fn tick(world: &mut World, mut input: TickInput) -> Vec<SimEvent> {
     let mut events = Vec::new();
     // 0. 消费外部输入
-    world.llm_plan = input.llm_plan;
+    let ai_off = input.host_mode == HostMode::Off;
+    // 托管模式「全停机」：AI 彻底不碰这一 tick（计划也一并丢掉，免得下一轮补派）。
+    world.llm_plan = if ai_off { None } else { input.llm_plan.take() };
 
     // 1. 时钟 + 疲劳
     let day_rolled = world.advance_clock();
@@ -57,11 +73,11 @@ pub fn tick(world: &mut World, input: TickInput) -> Vec<SimEvent> {
     }
 
     // 5. 骑手行程推进 + 风险
-    advance_riders(world, &mut events);
+    advance_riders(world, &mut events, &input);
 
     // 6. AI 分配
-    if world.cfg.ai_batch_enabled {
-        run_ai(world, &mut events);
+    if world.cfg.ai_batch_enabled && !ai_off {
+        run_ai(world, &mut events, &input);
     }
 
     // 7. 日结
@@ -103,16 +119,20 @@ fn spawn_orders(world: &mut World, events: &mut Vec<SimEvent>) {
 }
 
 /// AI 分配：优先用 LLM 计划（经校验），否则算法贪心。
-fn run_ai(world: &mut World, events: &mut Vec<SimEvent>) {
+///
+/// 派单对象走 [`host::ai_idle_riders`]——**在线的真人不在名单里**（AI 让位），
+/// 掉线的真人在 AutoPilot 下才在名单里（AI 接手）。
+fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
     let pending = world.pending_orders();
-    let idle = world.idle_riders();
+    let idle = host::ai_idle_riders(world, input.host_mode, |id| input.live_riders.contains(&id));
     if pending.is_empty() || idle.is_empty() {
         world.llm_plan = None;
         return;
     }
 
     let plan = world.llm_plan.take();
-    let (assignments, source, note) = match plan {
+    // (分配、来源、层、决策 id、说明)
+    let (assignments, source, layer, decision_id, note) = match plan {
         Some(p) if world.cfg.llm_brain_enabled => {
             let verdict = ai::validate_llm_plan(world, &p, &idle, &pending);
             if verdict.assignments.is_empty() {
@@ -121,6 +141,8 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>) {
                 (
                     ai::batch_decide(world, &pending, &idle),
                     DecisionSource::AlgorithmFallback,
+                    "rider",
+                    0,
                     format!("LLM（{}）输出全部被丢弃，算法兜底", p.model),
                 )
             } else {
@@ -132,12 +154,20 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>) {
                     verdict.assignments.len(),
                     verdict.dropped
                 );
-                (verdict.assignments, DecisionSource::Llm, note)
+                (
+                    verdict.assignments,
+                    DecisionSource::Llm,
+                    "rider",
+                    p.decision_id,
+                    note,
+                )
             }
         }
         _ => (
             ai::batch_decide(world, &pending, &idle),
             DecisionSource::Algorithm,
+            "algorithm",
+            0,
             format!("贪心：{} 空闲骑手 / {} 待抢单", idle.len(), pending.len()),
         ),
     };
@@ -166,13 +196,16 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>) {
     }
     events.push(SimEvent::AiDecision {
         source,
+        layer,
         assignments: assignments.iter().map(|a| a.to_event()).collect(),
+        ops: Vec::new(),
+        decision_id,
         note,
     });
 }
 
 /// 骑手行程推进。这是状态机唯一的推进入口。
-fn advance_riders(world: &mut World, events: &mut Vec<SimEvent>) {
+fn advance_riders(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
     let ids: Vec<RiderId> = world.riders.iter().map(|r| r.id).collect();
     let mut to_deliver: Vec<(RiderId, OrderId)> = Vec::new();
 
@@ -182,7 +215,7 @@ fn advance_riders(world: &mut World, events: &mut Vec<SimEvent>) {
             None => continue,
         };
         for oid in held_ids {
-            step_one(world, rid, oid, &mut to_deliver, events);
+            step_one(world, rid, oid, &mut to_deliver, events, input);
         }
     }
 
@@ -194,18 +227,22 @@ fn advance_riders(world: &mut World, events: &mut Vec<SimEvent>) {
 }
 
 /// 推进单个 (骑手, 手持单)。
+///
+/// `needs_click` = 这一步要真人点按钮（取餐 / 送达）。它**不等于**「是不是真人」：
+/// 掉线的真人在 AutoPilot 下由 AI 代管，AI 替他点，所以不该卡在那里等（§6.2）。
 fn step_one(
     world: &mut World,
     rid: RiderId,
     oid: OrderId,
     to_deliver: &mut Vec<(RiderId, OrderId)>,
     events: &mut Vec<SimEvent>,
+    input: &TickInput,
 ) {
     let now = world.elapsed_min;
     let weather = world.weather;
     let cfg = world.cfg.clone();
 
-    let (phase, remaining, awaiting, prep, is_human, speed_mps, target) = {
+    let (phase, remaining, awaiting, prep, needs_click, speed_mps, target) = {
         let Some(rider) = world.rider(rid) else {
             return;
         };
@@ -226,7 +263,7 @@ fn step_one(
             order
                 .prep_minutes
                 .unwrap_or_else(|| world.avg_prep_minutes(order.merchant_id)),
-            rider.kind == RiderKind::Human,
+            rider.kind == RiderKind::Human && !input.ai_hosts(rider),
             rider.speed_mps(&cfg, weather),
             target,
         )
@@ -244,8 +281,9 @@ fn step_one(
         ));
     }
 
-    // 真人骑手在倒计时归零后必须点按钮，兜底 10 分钟自动推进
-    if awaiting {
+    // 真人骑手在倒计时归零后必须点按钮，兜底 10 分钟自动推进。
+    // AI 代管的骑手（含 AutoPilot 下掉线的真人）不看这个闸门，直接往下走。
+    if awaiting && needs_click {
         let stalled = world
             .rider(rid)
             .and_then(|r| r.held.iter().find(|h| h.order_id == oid))
@@ -270,7 +308,7 @@ fn step_one(
                 return;
             }
             // 到店
-            if is_human {
+            if needs_click {
                 if let Some(rider) = world.rider_mut(rid)
                     && let Some(h) = rider.held_mut(oid)
                 {
@@ -314,15 +352,19 @@ fn step_one(
                 set_remaining(world, rid, oid, remaining - 1);
                 return;
             }
-            // 出餐完成 → 上路送货
-            let road_m = world.order(oid).map(|o| o.distance_m).unwrap_or(0) as f32
-                * crate::sim::world::ROAD_FACTOR as f32;
-            let travel = ((road_m / speed_mps.max(1.0) / 60.0).ceil() as u32).max(1);
+            // 出餐完成 → 上路送货（骑行 + 顾客端步行往返，与 plan_for 同源）
+            let travel = world
+                .rider(rid)
+                .and_then(|r| world.order(oid).map(|o| ai::customer_leg_min(world, r, o)))
+                .unwrap_or_else(|| {
+                    let road_m = world.order(oid).map(|o| o.distance_m).unwrap_or(0) as f32
+                        * crate::sim::world::ROAD_FACTOR as f32;
+                    ((road_m / speed_mps.max(1.0) / 60.0).ceil() as u32).max(1)
+                });
             if let Some(rider) = world.rider_mut(rid)
                 && let Some(h) = rider.held_mut(oid)
             {
-                h.phase = Phase::ToCustomer;
-                h.remaining_min = travel;
+                h.set_leg(Phase::ToCustomer, travel);
                 h.awaiting_ack = false;
                 h.wait_started_min = now;
             }
@@ -348,7 +390,8 @@ fn step_one(
             {
                 h.phase = Phase::ArrivedCustomer;
                 h.remaining_min = 0;
-                h.awaiting_ack = is_human;
+                h.leg_total_min = 1;
+                h.awaiting_ack = needs_click;
                 h.wait_started_min = now;
             }
             if let Some(rider) = world.rider(rid)
@@ -360,11 +403,15 @@ fn step_one(
                     r.set_pos(p);
                 }
             }
-            if !is_human {
+            if !needs_click {
                 to_deliver.push((rid, oid));
             }
         }
         Phase::ArrivedCustomer => {
+            // 到门口了：玩家要自己点「送达」，AI 代管时替他按下这个按钮。
+            if !needs_click {
+                to_deliver.push((rid, oid));
+            }
             if let Some(ev) = scheduler::state_event(world, rid) {
                 events.push(ev);
             }
@@ -394,8 +441,7 @@ fn enter_waiting_food(
     if let Some(rider) = world.rider_mut(rid)
         && let Some(h) = rider.held_mut(oid)
     {
-        h.phase = Phase::WaitingFood;
-        h.remaining_min = prep.max(1);
+        h.set_leg(Phase::WaitingFood, prep.max(1));
         h.awaiting_ack = false;
         h.wait_started_min = now;
         h.wait_fined = false;
@@ -528,4 +574,159 @@ fn close_day(world: &mut World, events: &mut Vec<SimEvent>) {
         total_takehome_cents,
         total_orders,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::config::SimConfig;
+
+    fn is_ai_decision(e: &SimEvent) -> bool {
+        matches!(e, SimEvent::AiDecision { .. })
+    }
+
+    /// 托管模式「全停机」：同样的世界，默认会派单，`Off` 则不派。
+    #[test]
+    fn ai_off_skips_the_whole_ai_pass() {
+        // 用 ai.rs 里验证过「贪心一定会派出单」的那套参数，免得测试前提飘。
+        let cfg = SimConfig {
+            sim_rider_count: 4,
+            ..Default::default()
+        };
+        let mut on = World::new_for_test(cfg.clone(), 42);
+        on.generate_order_batch(4);
+        let mut off = World::new_for_test(cfg, 42);
+        off.generate_order_batch(4);
+
+        let ev_on = tick(&mut on, TickInput::default());
+        let ev_off = tick(
+            &mut off,
+            TickInput {
+                host_mode: HostMode::Off,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            ev_on.iter().any(is_ai_decision),
+            "默认必须有 AI 分配（前提：有单 + 有空闲骑手）"
+        );
+        assert!(
+            !ev_off.iter().any(is_ai_decision),
+            "全停机时一条 AI 分配都不该有"
+        );
+        assert_eq!(off.pending_orders().len(), 4, "没人接的单要原样留在大厅");
+    }
+
+    /// 全停机也要把上一轮拿到的 LLM 计划丢掉，否则它会在下一轮偷偷被消费。
+    #[test]
+    fn ai_off_drops_an_incoming_plan() {
+        let mut w = World::new_for_test(SimConfig::default(), 3);
+        let plan = LlmPlan {
+            decision_id: 42,
+            ..Default::default()
+        };
+        tick(
+            &mut w,
+            TickInput {
+                llm_plan: Some(plan),
+                host_mode: HostMode::Off,
+                ..Default::default()
+            },
+        );
+        assert!(w.llm_plan.is_none(), "停机时计划要当场作废");
+    }
+
+    /// 只有一个掉线的真人：SimulatedOnly 时 AI 不碰他，AutoPilot 时 AI 接手。
+    #[test]
+    fn autopilot_assigns_to_an_offline_human_but_simulated_only_does_not() {
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 11);
+        let human = w.spawn_human_rider("张三");
+        w.rider_mut(human).unwrap().online = false;
+        w.generate_order_batch(2);
+
+        let ev = tick(&mut w, TickInput::default());
+        assert!(
+            !ev.iter().any(is_ai_decision),
+            "SimulatedOnly：他掉线了，AI 不能替他接单"
+        );
+        assert!(w.rider(human).unwrap().held.is_empty());
+
+        let ev = tick(
+            &mut w,
+            TickInput {
+                host_mode: HostMode::AutoPilot,
+                ..Default::default()
+            },
+        );
+        let Some(SimEvent::AiDecision { assignments, .. }) = ev.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("AutoPilot：AI 该接过他的单");
+        };
+        assert!(!assignments.is_empty());
+    }
+
+    /// AutoPilot 的离线真人：取餐 / 送达这些「要真人点按钮」的关口由 AI 代按，
+    /// 所以那张单能一路送到头，而不是卡在待确认上。
+    #[test]
+    fn autopilot_drives_an_offline_human_all_the_way_to_delivery() {
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 11);
+        let human = w.spawn_human_rider("张三");
+        w.rider_mut(human).unwrap().online = false;
+        w.generate_order_batch(2);
+
+        let mut delivered = false;
+        for _ in 0..600 {
+            let evs = tick(
+                &mut w,
+                TickInput {
+                    host_mode: HostMode::AutoPilot,
+                    ..Default::default()
+                },
+            );
+            if evs
+                .iter()
+                .any(|e| matches!(e, SimEvent::OrderDelivered { .. }))
+            {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "AutoPilot 该把掉线真人的单送到头");
+    }
+
+    /// 真人在线时 AI 必须让位：哪怕他手上没单，也不进 AI 的派单名单。
+    #[test]
+    fn an_online_human_is_left_alone_by_the_ai() {
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 11);
+        let human = w.spawn_human_rider("张三");
+        w.rider_mut(human).unwrap().online = true;
+        w.generate_order_batch(2);
+
+        let ev = tick(
+            &mut w,
+            TickInput {
+                host_mode: HostMode::AutoPilot,
+                live_riders: vec![human],
+                ..Default::default()
+            },
+        );
+        assert!(
+            !ev.iter().any(is_ai_decision),
+            "玩家自己在线，AI 不许替他接单"
+        );
+        assert!(w.rider(human).unwrap().held.is_empty());
+    }
 }

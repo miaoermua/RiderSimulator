@@ -163,6 +163,21 @@ impl Hub {
             .count()
     }
 
+    /// **所有连着活人客户端的骑手**（去重、升序）。
+    ///
+    /// 这是 [`crate::sim::host::ai_should_drive`] 的 `has_live_conn` 的数据源：
+    /// 玩家断线 = 从这个列表里消失 = AI 下一 tick 接手。
+    pub fn live_rider_ids(&self) -> Vec<RiderId> {
+        let mut ids: Vec<RiderId> = self
+            .conns
+            .iter()
+            .filter_map(|c| c.role.rider_id())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// 发给单条连接。
     pub fn send_to(&mut self, id: ConnId, env: &Envelope) {
         let Ok(text) = serde_json::to_string(env) else {
@@ -265,6 +280,7 @@ pub fn event_name(ev: &SimEvent) -> &'static str {
         SimEvent::FineIssued { .. } => "fine_issued",
         SimEvent::ConfigChanged { .. } => "config_changed",
         SimEvent::AiDecision { .. } => "ai_decision",
+        SimEvent::Narration { .. } => "narration",
         SimEvent::TaskMessage { .. } => "task_message",
         SimEvent::DayClosed { .. } => "day_closed",
     }
@@ -655,7 +671,10 @@ mod tests {
         assert_eq!(
             event_name(&SimEvent::AiDecision {
                 source: DecisionSource::Algorithm,
+                layer: "algorithm",
                 assignments: vec![],
+                ops: vec![],
+                decision_id: 0,
                 note: String::new(),
             }),
             "ai_decision"

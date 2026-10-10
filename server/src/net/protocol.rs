@@ -129,6 +129,35 @@ pub enum ClientMessage {
         #[serde(default)]
         model: Option<String>,
     },
+    /// 拉一份三层 AI 状态（控制台 AI Tab 打开时用）。
+    AiQuery,
+    /// 改三层 AI 开关与托管模式。字段缺省 = 不改。
+    SetAi(AiPatch),
+    /// 人工否决一条 AI 决策。
+    RejectAi { decision_id: u64 },
+}
+
+/// 三层 AI 的开关补丁。**每个字段都可选**，缺省 = 这一项不动。
+///
+/// 与 `ConfigPatch` 一样，越界 / 认不出的值在服务端被拒或夹取，协议层不做判断。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AiPatch {
+    /// 骑手层开关。
+    #[serde(default)]
+    pub rider: Option<bool>,
+    /// 站长层开关。站长指令搭骑手层下发（`station_ops`），自己不单独发请求：
+    /// 打开它只是让「站长该决策了」这一轮到点时也顺带跑一轮骑手。
+    #[serde(default)]
+    pub station: Option<bool>,
+    /// 烽火台层开关。
+    #[serde(default)]
+    pub director: Option<bool>,
+    /// 「允许调用 LLM」总开关。
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 托管模式：`simulated_only` | `auto_pilot` | `off`。
+    #[serde(default)]
+    pub host_mode: Option<String>,
 }
 
 /// `set_config` 的载荷。每个字段都是可选的，越界值在服务端夹取。

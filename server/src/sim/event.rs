@@ -141,6 +141,8 @@ pub enum DecisionSource {
     AlgorithmFallback,
     /// 控制端手动指派。
     Manual,
+    /// AI 托管（真人骑手掉线后由 AI 自动决策，见 `sim::host`）。
+    AiHosted,
 }
 
 impl DecisionSource {
@@ -150,8 +152,22 @@ impl DecisionSource {
             DecisionSource::Llm => "LLM 战术大脑",
             DecisionSource::AlgorithmFallback => "LLM 失败，算法兜底",
             DecisionSource::Manual => "控制端指派",
+            DecisionSource::AiHosted => "AI 托管",
         }
     }
+}
+
+/// 一条 AI 运营指令（站长 / 烽火台）的人类可读摘要，推给控制台的决策流用。
+#[derive(Debug, Clone, Serialize)]
+pub struct AiOpBrief {
+    /// 指令名，如 `cap_rider` / `set_weather` / `narrate`。
+    pub op: &'static str,
+    /// 作用对象，人类可读（`r5` / `#42` / `-`）。
+    pub target: String,
+    /// 补充说明（钳制后的值 / 订单号）。
+    pub detail: String,
+    /// 为什么这么做。
+    pub why: String,
 }
 
 /// 模拟事件。
@@ -233,8 +249,20 @@ pub enum SimEvent {
     /// AI 分配结果与理由。
     AiDecision {
         source: DecisionSource,
+        /// 哪一层做的决策：`rider` | `station` | `director` | `algorithm`。
+        layer: &'static str,
         assignments: Vec<AiAssignment>,
+        /// 站长 / 烽火台的运营指令摘要（控制台决策流用）。
+        ops: Vec<AiOpBrief>,
+        /// 决策 id，人工否决时回传它。`0` = 不可否决（算法兜底）。
+        decision_id: u64,
         note: String,
+    },
+    /// AI 说的一句话（烽火台旁白等）。**只影响气氛，不改任何数值**。
+    Narration {
+        /// 说话的是哪一层：`director` | `station` | `rider`。
+        layer: &'static str,
+        text: String,
     },
     /// 任务对话（预设 / LLM 裁决）。
     TaskMessage {

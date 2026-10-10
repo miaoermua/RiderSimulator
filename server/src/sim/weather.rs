@@ -93,6 +93,37 @@ impl Weather {
         }
     }
 
+    /// 协议里的天气短码（省 token）。LLM 只需要区分「晴天 / 下雨 / 暴雨 / 雪」。
+    pub fn code(self) -> &'static str {
+        match self {
+            Weather::Clear | Weather::Cloudy => "c",
+            Weather::Overcast => "o",
+            Weather::Fog => "f",
+            Weather::LightRain | Weather::ModerateRain => "r",
+            Weather::HeavyRain | Weather::Rainstorm => "hr",
+            Weather::Windy => "w",
+            Weather::Snow => "s",
+        }
+    }
+
+    /// 短码 / 全名 → 天气。认不出来返回 `None`（烽火台 AI 的非法天气一律丢弃）。
+    ///
+    /// 短码优先（省 token 的协议用它）；同时容忍 `as_str` 的全名，方便人手写。
+    pub fn from_code(s: &str) -> Option<Self> {
+        let t = s.trim();
+        Some(match t {
+            "c" | "clear" | "cloudy" => Weather::Clear,
+            "o" | "overcast" => Weather::Overcast,
+            "f" | "fog" => Weather::Fog,
+            "r" | "light_rain" => Weather::LightRain,
+            "moderate_rain" => Weather::ModerateRain,
+            "hr" | "heavy_rain" | "rainstorm" => Weather::HeavyRain,
+            "w" | "windy" => Weather::Windy,
+            "s" | "snow" => Weather::Snow,
+            _ => return None,
+        })
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Weather::Clear => "晴",

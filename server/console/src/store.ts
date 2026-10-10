@@ -1,5 +1,7 @@
 import {
   PROTOCOL_VERSION,
+  type AiOpBrief,
+  type AiState,
   type ConfigView,
   type EventName,
   type EventPayloads,
@@ -21,6 +23,37 @@ export interface LogItem {
   tagColor?: string;
 }
 
+/**
+ * AI 决策流里的一条。由 `llm_brain` / `llm_world` / `ai_decision` 三种事件汇总而来，
+ * 保证控制台只对着**一个**列表就能看清「AI 干了什么、为什么、还能不能撤」。
+ */
+export interface AiDecisionEntry {
+  /** 前端自增序号，仅用于 React key。 */
+  id: number;
+  /** 服务端决策 id；`0` = 不可否决（算法兜底 / 手动指派）。 */
+  decisionId: number;
+  /** 模拟时钟 `hh:mm`。 */
+  at: string;
+  /** `rider` | `station` | `director` | `algorithm` | `manual`。 */
+  layer: string;
+  source: string;
+  note: string;
+  /** 站长 / 烽火台的运营指令。 */
+  ops: AiOpBrief[];
+  /** 骑手层派单条数。 */
+  assignments: number;
+  dropped: number;
+  model?: string;
+  latencyMs?: number;
+  /** 状态指纹 + 是否命中缓存（成本优化的观测口）。 */
+  fingerprint?: string;
+  cached?: boolean;
+  /** 烽火台旁白。 */
+  narrate?: string;
+  /** 本地标记：已被人工否决。 */
+  rejected?: boolean;
+}
+
 export interface State {
   role: Role | null;
   conn: ConnState;
@@ -32,11 +65,16 @@ export interface State {
   lastError: string | null;
   /** 首屏是否已经按商户范围缩放过地图。 */
   mapFitted: boolean;
+  /** 三层 AI 状态（控制台 AI Tab 用）。来自 `server_info.ai` 与 `ai_state`。 */
+  ai: AiState | null;
+  /** AI 决策流，新的在前。 */
+  decisions: AiDecisionEntry[];
 }
 
 type Notifier = (kind: "success" | "error" | "info", text: string) => void;
 
 const MAX_LOGS = 300;
+const MAX_DECISIONS = 60;
 
 const initialState: State = {
   role: null,
@@ -47,6 +85,8 @@ const initialState: State = {
   logs: [],
   lastError: null,
   mapFitted: false,
+  ai: null,
+  decisions: [],
 };
 
 /**
@@ -64,6 +104,7 @@ class ConsoleStore {
   private retry = 0;
   private lastResync = 0;
   private logSeq = 0;
+  private decisionSeq = 0;
   private notifier: Notifier = () => {};
   /** 组件挂载后由 antd 的 message API 覆盖。 */
   onRosterChanged: (() => void) | null = null;
@@ -158,6 +199,34 @@ class ConsoleStore {
     this.set({ logs: [item, ...this.state.logs].slice(0, MAX_LOGS) });
   }
 
+  /** 往 AI 决策流里塞一条（新的在前，超出上限截断）。 */
+  private pushDecision(entry: Omit<AiDecisionEntry, "id" | "at">) {
+    const at = this.state.snap ? hhmm(this.state.snap.sim_minute) : "--:--";
+    const item: AiDecisionEntry = { ...entry, id: ++this.decisionSeq, at };
+    this.set({ decisions: [item, ...this.state.decisions].slice(0, MAX_DECISIONS) });
+  }
+
+  /** 请求一份三层 AI 状态（打开 AI Tab 时调）。 */
+  queryAi() {
+    this.send("ai_query");
+  }
+
+  /** 改三层开关 / 托管模式。只传要改的字段。 */
+  setAi(patch: {
+    rider?: boolean;
+    station?: boolean;
+    director?: boolean;
+    enabled?: boolean;
+    host_mode?: string;
+  }) {
+    this.send("set_ai", patch);
+  }
+
+  /** 人工否决一条决策。 */
+  rejectAi(decisionId: number) {
+    this.send("reject_ai", { decision_id: decisionId });
+  }
+
   // ---------------- 事件分发 ----------------
 
   private onEvent<K extends EventName>(name: K, p: EventPayloads[K]) {
@@ -178,8 +247,14 @@ class ConsoleStore {
       case "snapshot":
         this.applySnapshot(p as Snapshot);
         break;
-      case "server_info":
-        this.set({ info: p as ServerInfo });
+      case "server_info": {
+        const info = p as ServerInfo;
+        // `server_info.ai` 与独立的 `ai_state` 是同一份口径，谁先到用谁。
+        this.set({ info, ...(info.ai ? { ai: info.ai } : {}) });
+        break;
+      }
+      case "ai_state":
+        this.set({ ai: p as AiState });
         break;
       case "tick":
         // 高频帧**不写回快照**：否则每帧快照引用都变，
@@ -240,6 +315,68 @@ class ConsoleStore {
       case "ai_decision": {
         const a = p as EventPayloads["ai_decision"];
         if (a.note) this.log(a.note, a.source, "blue");
+        // 站长 / 烽火台的运营指令走这里进决策流；算法兜底不进（噪音）。
+        if (a.ops && a.ops.length > 0) {
+          this.pushDecision({
+            decisionId: a.decision_id ?? 0,
+            layer: a.layer ?? "station",
+            source: a.source,
+            note: a.note ?? "",
+            ops: a.ops,
+            assignments: a.assignments?.length ?? 0,
+            dropped: 0,
+          });
+        }
+        break;
+      }
+      case "llm_brain": {
+        const b = p as EventPayloads["llm_brain"];
+        // 算法兜底不是 AI 决策，不进流（否则刷屏）。
+        // 缓存命中要进 —— 它同样是 AI 的决策，只是这轮没再花钱。
+        if (b.source === "fallback") break;
+        this.pushDecision({
+          decisionId: b.decision_id ?? 0,
+          layer: b.layer ?? "rider",
+          source: b.source,
+          note: b.note ?? "",
+          ops: [],
+          assignments: b.assignments ?? 0,
+          dropped: b.dropped ?? 0,
+          model: b.model,
+          latencyMs: b.latency_ms,
+          fingerprint: b.fingerprint,
+          cached: b.cached,
+        });
+        break;
+      }
+      case "llm_world": {
+        const w = p as EventPayloads["llm_world"];
+        const ops: AiOpBrief[] = (w.ops ?? []).map((o) => {
+          const op = String(o.op ?? "?");
+          return {
+            op,
+            target: String(o.v ?? o.text ?? "-"),
+            detail: String(o.label ?? ""),
+            why: String(o.why ?? ""),
+          };
+        });
+        this.pushDecision({
+          decisionId: w.decision_id ?? 0,
+          layer: w.layer ?? "director",
+          source: w.source,
+          note: w.note ?? "",
+          ops,
+          assignments: 0,
+          dropped: w.dropped ?? 0,
+          model: w.model,
+          latencyMs: w.latency_ms,
+          narrate: w.narrate ?? undefined,
+        });
+        break;
+      }
+      case "narration": {
+        const n = p as EventPayloads["narration"];
+        this.log(`[${n.layer}] ${n.text}`, "旁白", "purple");
         break;
       }
       case "task_message": {
@@ -272,8 +409,21 @@ class ConsoleStore {
       this.notifier("error", `${a.action} 失败：${a.message || a.code}`);
       return;
     }
-    // resync 是内部节流动作，不该弹提示。
-    if (a.action === "resync") return;
+    // 人工否决：服务端认定「撤不下来」时 data.ok 为 false，前一条已经提示过了。
+    if (a.action === "reject_ai") {
+      const id = Number(a.data?.decision_id ?? 0);
+      if (a.data?.rejected && id > 0) {
+        this.set({
+          decisions: this.state.decisions.map((d) =>
+            d.decisionId === id ? { ...d, rejected: true } : d,
+          ),
+        });
+      }
+      this.resync();
+      return;
+    }
+    // resync / ai_query 是内部动作，不该弹提示。
+    if (a.action === "resync" || a.action === "ai_query") return;
     this.notifier("success", `${a.action} 成功`);
     // 控制类指令的 ack 里带回了配置片段（如倍率、实时档），
     // 就地合并能让顶栏立刻响应，不必等下一次快照。

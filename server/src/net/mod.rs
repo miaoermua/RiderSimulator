@@ -22,7 +22,7 @@ pub use hub::{
     ConnId, Connection, Hub, HubStats, event_name, render, render_snapshot, server_info,
 };
 pub use protocol::{
-    Ack, ClientMessage, ConfigPatch, Envelope, MAX_FRAME_BYTES, PROTOCOL_VERSION, Role, Welcome,
-    code,
+    Ack, AiPatch, ClientMessage, ConfigPatch, Envelope, MAX_FRAME_BYTES, PROTOCOL_VERSION, Role,
+    Welcome, code,
 };
 pub use ws::{HEALTH_PATH, Inbound, OutboundTx, WS_PATH, next_conn_id, router};

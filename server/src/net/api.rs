@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
-use super::{protocol::ConfigPatch, ws::Inbound};
+use super::{
+    protocol::{AiPatch, ConfigPatch},
+    ws::Inbound,
+};
 use crate::sim::{OrderId, RiderId};
 
 /// 读当前世界。
@@ -41,6 +44,14 @@ pub const DISPATCH_PATH: &str = "/api/dispatch";
 pub const CONFIG_PATH: &str = "/api/config";
 /// 强制某个骑手上线 / 下线。
 pub const RIDER_ONLINE_PATH: &str = "/api/riders/{id}/online";
+/// 三层 AI 的观测与开关：`GET` 读状态，`POST` 改开关 / 托管模式。
+pub const AI_PATH: &str = "/api/ai";
+/// `GET` 读三层 AI 状态。与 `GET /api/ai` 等价，留给只认显式路径的调用方。
+pub const AI_STATE_PATH: &str = "/api/ai/state";
+/// `POST` 改开关 / 托管模式。与 `POST /api/ai` 等价。
+pub const AI_CONFIG_PATH: &str = "/api/ai/config";
+/// 人工否决一条 AI 决策。
+pub const AI_REJECT_PATH: &str = "/api/ai/reject";
 
 /// 鉴权配置。由 `main.rs` 的环境变量决定。
 #[derive(Debug, Clone, Default)]
@@ -92,6 +103,12 @@ pub enum RpcRequest {
     SetConfig(ConfigPatch),
     /// 上 / 下线。
     SetRiderOnline { rider_id: RiderId, online: bool },
+    /// 读三层 AI 的完整状态（开关 / 预算 / 统计 / 站点 KPI / 否决记录）。
+    AiState,
+    /// 改 AI 开关与托管模式。
+    SetAi(super::protocol::AiPatch),
+    /// 人工否决一条决策。
+    RejectAi { decision_id: u64 },
 }
 
 /// 主循环回给 HTTP 的结果。
@@ -235,7 +252,45 @@ pub fn routes(state: ApiState) -> Router {
         .route(DISPATCH_PATH, post(dispatch_route))
         .route(CONFIG_PATH, post(config_route))
         .route(RIDER_ONLINE_PATH, post(rider_online_route))
+        .route(AI_PATH, get(ai_state_route).post(ai_config_route))
+        .route(AI_STATE_PATH, get(ai_state_route))
+        .route(AI_CONFIG_PATH, post(ai_config_route))
+        .route(AI_REJECT_PATH, post(ai_reject_route))
         .with_state(state)
+}
+
+async fn ai_state_route(State(api): State<ApiState>, headers: HeaderMap) -> Response {
+    api.call(&headers, RpcRequest::AiState).await
+}
+
+async fn ai_config_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let patch: AiPatch = match serde_json::from_value(body) {
+        Ok(p) => p,
+        Err(e) => {
+            return ApiError::bad_request(format!("无法解析为 AI patch：{e}")).into_response();
+        }
+    };
+    api.call(&headers, RpcRequest::SetAi(patch)).await
+}
+
+async fn ai_reject_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(decision_id) = body
+        .get("decision_id")
+        .and_then(Value::as_u64)
+        .or_else(|| body.get("id").and_then(Value::as_u64))
+    else {
+        return ApiError::bad_request("需要 decision_id").into_response();
+    };
+    api.call(&headers, RpcRequest::RejectAi { decision_id })
+        .await
 }
 
 async fn state_route(State(api): State<ApiState>, headers: HeaderMap) -> Response {

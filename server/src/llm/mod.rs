@@ -18,6 +18,13 @@
 //! | [`task::TaskJudge`] | 顾客自由输入的任务判定 | 关键词匹配 |
 //! | [`client::LlmClient`] | 店名 / 文案一次性生成 | 预置文案 |
 //!
+//! ## 分层：协议在 [`protocol`]，时序在 [`brain`]
+//!
+//! [`protocol`] 定义「请求长什么样、响应怎么校验」，可以脱离 HTTP 单测；
+//! [`brain`] 负责「什么时候调、调完怎么落库、失败怎么降级」。
+//! 校验层是**代码的最终解释权**——《LLM协议设计》§4.1 的四级流水线在这里实现，
+//! LLM 说什么都要先过它。
+//!
 //! ## 一条绝对不能破的规矩
 //!
 //! **随机性绝不来自 LLM。** 世界种子固定，所有随机数走 ChaCha8。
@@ -31,11 +38,28 @@
 
 pub mod brain;
 pub mod client;
+pub mod director_brain;
+pub mod orchestrator;
+pub mod protocol;
 pub mod task;
 
 pub use brain::{
     BrainOutcome, BrainSource, BrainStats, MAX_CALLS_PER_DAY, PlanFetch, PreparedPlan,
-    TacticalBrain, Throttle,
+    StationOpBrief, TacticalBrain, Throttle,
 };
-pub use client::{ENV_API_KEY, ENV_BASE_URL, ENV_MODEL, LlmClient, LlmConfig, LlmError};
+pub use client::{
+    ENV_API_KEY, ENV_BASE_URL, ENV_MODEL, ENV_MODEL_DIRECTOR, ENV_MODEL_RIDER, ENV_MODEL_STATION,
+    LayerKey, LayerModels, LlmClient, LlmConfig, LlmError,
+};
+pub use director_brain::{
+    DirectorBrain, DirectorOutcome, PreparedWorldPlan, ValidatedWorldOp, WorldFetch, WorldOp,
+    WorldRequest, WorldResponse, WorldVerdict, validate_world_ops,
+};
+pub use orchestrator::{AiLayer, AiOrchestrator, DEFAULT_MAX_CALLS_PER_DAY, LayerStats};
+pub use protocol::{
+    ActKind, Action, BrainRequest, DecisionResponse, DecisionVerdict, MAX_PROMPT_BYTES,
+    MAX_RIDERS_IN_PROMPT, PROTOCOL_VERSION, PolicyPatch, RiderSnap, SimCtx, StationOp, TrimStats,
+    ValidatedAct, ValidatedPolicy, ValidatedStationOp, state_fingerprint, system_prompt,
+    user_prompt, validate_decision,
+};
 pub use task::{RulingLimits, RulingSource, TaskJudge, TaskRuling};

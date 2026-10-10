@@ -102,6 +102,13 @@ pub struct Order {
     pub promised_minutes: u32,
     pub tier: OrderTier,
 
+    /// 商家步行难度 0/1/2（路边店 / 商场内 / 高层深巷）。
+    ///
+    /// **物理量**：由商家数据在生成时定下，运行期不变（见 `WalkRules`）。
+    pub merchant_walk_difficulty: u8,
+    /// 顾客端步行难度 0/1/2（送到门口 / 进小区上楼 / 高层深巷）。
+    pub customer_walk_difficulty: u8,
+
     /// 生成时刻（自开局起算的模拟分钟，单调）。
     pub created_at_min: u64,
     /// 抢单窗口截止（tick 数换算，见 SimConfig::claim_window_ticks）。
@@ -183,6 +190,8 @@ mod tests {
             distance_m: 1200,
             promised_minutes: 30,
             tier: OrderTier::Normal,
+            merchant_walk_difficulty: 0,
+            customer_walk_difficulty: 0,
             created_at_min: 100,
             claim_deadline_min: 103,
             picked_up_at_min: None,
