@@ -130,6 +130,11 @@ pub struct AiAssignment {
 }
 
 /// AI 决策来源。
+///
+/// 「AI 决策」与「LLM 决策」是两个**不同的**概念，控制台必须能分得清：
+/// [`Algorithm`](DecisionSource::Algorithm)、[`AlgorithmFallback`](DecisionSource::AlgorithmFallback)、
+/// [`AlgorithmRescue`](DecisionSource::AlgorithmRescue) 都是纯算法（LLM 关着也能跑），
+/// 只有 [`Llm`](DecisionSource::Llm) 是真的问了模型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionSource {
@@ -139,6 +144,8 @@ pub enum DecisionSource {
     Llm,
     /// LLM 失败/被校验丢弃后回退到算法。
     AlgorithmFallback,
+    /// 超时救单：重投次数用尽，算法强制指派给最近的骑手（不允许流单）。
+    AlgorithmRescue,
     /// 控制端手动指派。
     Manual,
     /// AI 托管（真人骑手掉线后由 AI 自动决策，见 `sim::host`）。
@@ -151,9 +158,17 @@ impl DecisionSource {
             DecisionSource::Algorithm => "算法贪心",
             DecisionSource::Llm => "LLM 战术大脑",
             DecisionSource::AlgorithmFallback => "LLM 失败，算法兜底",
+            DecisionSource::AlgorithmRescue => "超时救单",
             DecisionSource::Manual => "控制端指派",
             DecisionSource::AiHosted => "AI 托管",
         }
+    }
+
+    /// 这一条决策**是否真的来自 LLM**。
+    ///
+    /// 控制台据此把决策流分成两类展示；算法兜底、超时救单都算算法。
+    pub fn is_llm(self) -> bool {
+        matches!(self, DecisionSource::Llm)
     }
 }
 

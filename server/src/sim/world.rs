@@ -25,7 +25,11 @@ pub const ROAD_FACTOR: f64 = 1.25;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SimStats {
     pub orders_created: u64,
+    /// 彻底流单的订单数。**当前任何路径都不再产生**，恒为 0——
+    /// 重投用尽会走强制指派（见 `orders_rescued`），留着只是为了协议/回放兼容。
     pub orders_expired: u64,
+    /// 重投用尽后被**强制指派给最近骑手**救回来的订单数。
+    pub orders_rescued: u64,
     pub orders_delivered: u64,
     pub orders_late: u64,
     pub claims: u64,
@@ -35,6 +39,16 @@ pub struct SimStats {
     pub llm_calls: u32,
     /// LLM 失败 / 被校验丢弃后回退算法的次数。
     pub llm_fallbacks: u32,
+}
+
+/// 重投的归宿。**没有「流单」这一种**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redispatch {
+    /// 加价重回大厅，等下一轮抢单。
+    ToHall,
+    /// 重投次数用尽：订单**仍留在大厅**，等调用方把它强制指派给最近的骑手
+    /// （[`crate::sim::scheduler::rescue_nearest`]）。它绝不会被判流单。
+    NeedsRescue,
 }
 
 /// 计价规则的只读视图（「单价系统」的对外口径）。
@@ -616,56 +630,76 @@ impl World {
 
     /// 把订单退回大厅重投：阶梯加价、重置抢单窗口、累加重投次数。
     ///
-    /// 返回 `true` 表示已重投（订单仍在池子里等人接），`false` 表示重投次数用尽、
-    /// 订单被判流单（`Expired`）。
+    /// 返回 `None` 只表示订单不存在；重投次数用尽时返回 [`Redispatch::NeedsRescue`]，
+    /// 订单**依然留在大厅**（继续加价、窗口重置，等着被救单），
+    /// 因为「不允许流单」是这个模拟的硬约束。
     ///
     /// 这是「订单不会凭空消失」的唯一出口：无论是没人接还是骑手取消，
     /// 都从这里回到池子，由 `ai::evaluate` 重新挑合适的骑手。
-    pub fn release_to_hall(&mut self, order_id: OrderId) -> bool {
+    pub fn release_to_hall(&mut self, order_id: OrderId) -> Option<Redispatch> {
+        let now = self.elapsed_min;
+        let window = self.cfg.claim_window_ticks() as u64;
+        let o = self.order_mut(order_id)?;
+
+        // 次数封顶后不再增长：`count == MAX` 就是「该救单了」的稳定判据。
+        o.redispatch_count = (o.redispatch_count + 1).min(MAX_REDISPATCH_ATTEMPTS);
+        o.assigned_to = None;
+        o.back_order = false;
+        o.back_order_bonus_cents = 0;
+
+        // 补贴按重投次数阶梯累加：加价既补偿骑手，也提高越过 AI 接单意愿门槛的概率。
+        // 次数封顶 → 加价自然封顶，一张没人接的死单推不爆流水。
+        o.surcharge_cents = REDISPATCH_SURCHARGE_STEP_CENTS * o.redispatch_count as i64;
+        o.status = OrderStatus::Pending;
+        o.claim_deadline_min = now + window;
+
+        if o.redispatch_count >= MAX_REDISPATCH_ATTEMPTS {
+            Some(Redispatch::NeedsRescue)
+        } else {
+            Some(Redispatch::ToHall)
+        }
+    }
+
+    /// 订单回到大厅等下一轮：**不加重投次数、不加价**。
+    ///
+    /// 给「没人做错事」的回流用：骑手半路出事故被送医，顾客的饭不能跟着一起消失。
+    /// 与 [`World::release_to_hall`] 的区别只在记账口径，归宿一样——
+    /// **回到池子里**，绝不判流单。窗口必须重置，否则这单再也抢不了。
+    pub fn return_to_hall_uncharged(&mut self, order_id: OrderId) -> bool {
         let now = self.elapsed_min;
         let window = self.cfg.claim_window_ticks() as u64;
         let Some(o) = self.order_mut(order_id) else {
             return false;
         };
-
-        o.redispatch_count += 1;
-        o.assigned_to = None;
-        o.back_order = false;
-        o.back_order_bonus_cents = 0;
-
-        if o.redispatch_count >= MAX_REDISPATCH_ATTEMPTS {
-            o.status = OrderStatus::Expired;
-            return false;
-        }
-
-        // 补贴按重投次数阶梯累加：加价既补偿骑手，也提高越过 AI 接单意愿门槛的概率。
-        o.surcharge_cents = REDISPATCH_SURCHARGE_STEP_CENTS * o.redispatch_count as i64;
         o.status = OrderStatus::Pending;
+        o.assigned_to = None;
+        o.picked_up_at_min = None;
         o.claim_deadline_min = now + window;
         true
     }
 
-    /// 超过抢单窗口的待抢单：加价重投，投满上限才判流单。
+    /// 超过抢单窗口、还挂在大厅的单。
     ///
-    /// 返回值只含**真正流单**的订单 id，重投成功的单不算——调用方据此决定
-    /// 要不要广播 `order_expired`。
-    pub fn expire_stale_orders(&mut self) -> Vec<OrderId> {
+    /// 只做查询，不改状态：调用方拿着这批 id 走
+    /// [`World::release_to_hall`]，重投用尽的再交给
+    /// [`crate::sim::scheduler::rescue_nearest`] 强制指派。
+    pub fn stale_pending_orders(&self) -> Vec<OrderId> {
         let now = self.elapsed_min;
-        let stale: Vec<OrderId> = self
-            .orders
+        self.orders
             .iter()
             .filter(|o| o.status == OrderStatus::Pending && now > o.claim_deadline_min)
             .map(|o| o.id)
-            .collect();
+            .collect()
+    }
 
-        let mut expired = Vec::new();
-        for id in stale {
-            if !self.release_to_hall(id) {
-                expired.push(id);
-            }
-        }
-        self.stats.orders_expired += expired.len() as u64;
-        expired
+    /// 订单是否还有可能被接：大厅里等着、或被指派/配送中。
+    ///
+    /// 用于「不允许流单」的断言与看板——`false` 意味着这单已经出局
+    /// （只可能是已送达/超时送达，或历史数据里的流单）。
+    pub fn order_is_in_play(&self, order_id: OrderId) -> bool {
+        self.order(order_id)
+            .map(|o| o.status.is_active())
+            .unwrap_or(false)
     }
 
     /// 清理历史订单，保留最近 500 条已结束的单，防止内存无界增长。
@@ -1035,7 +1069,9 @@ mod tests {
         for _ in 0..10 {
             w.advance_clock();
         }
-        assert!(w.expire_stale_orders().is_empty(), "首轮超窗不该直接流单");
+        for id in w.stale_pending_orders() {
+            assert_eq!(w.release_to_hall(id), Some(Redispatch::ToHall));
+        }
         assert_eq!(w.pending_orders().len(), 3, "订单应仍在大厅等人接");
 
         let o = w.order(ids[0]).expect("订单还在");
@@ -1048,18 +1084,85 @@ mod tests {
         );
         assert_eq!(o.status, OrderStatus::Pending);
 
-        // 再耗两轮，重投次数用尽 → 判流单。
+        // 再耗两轮，重投次数用尽 → **不是流单**，而是标记「该救单了」。
         for _ in 0..2 {
             for _ in 0..10 {
                 w.advance_clock();
             }
-            w.expire_stale_orders();
+            for id in w.stale_pending_orders() {
+                w.release_to_hall(id);
+            }
         }
-        assert!(w.pending_orders().is_empty(), "投满上限后不该再留在池子");
-        assert_eq!(
-            w.order(ids[0]).expect("订单还在").status,
-            OrderStatus::Expired
+        for id in &ids {
+            let o = w.order(*id).expect("订单还在");
+            assert_eq!(
+                o.redispatch_count, MAX_REDISPATCH_ATTEMPTS,
+                "重投次数封顶后不再增长"
+            );
+            assert_eq!(o.status, OrderStatus::Pending, "投满上限也不许流单");
+            assert!(
+                o.claim_deadline_min > w.elapsed_min,
+                "窗口必须重置，否则再也抢不了"
+            );
+        }
+
+        // 再往后走也一样：只会一直 NeedsRescue，永远不会变成 Expired。
+        for _ in 0..3 {
+            for _ in 0..10 {
+                w.advance_clock();
+            }
+            for id in w.stale_pending_orders() {
+                assert_eq!(w.release_to_hall(id), Some(Redispatch::NeedsRescue));
+            }
+        }
+        assert_eq!(w.stats.orders_expired, 0, "整个模拟里不允许有流单出口");
+        assert!(
+            w.stale_pending_orders().is_empty(),
+            "刚重置过窗口，这一轮不该还有超窗单"
         );
+    }
+
+    /// 补贴有上限：一张一直没人接的死单不能把加价推到天上。
+    #[test]
+    fn redispatch_surcharge_is_capped() {
+        let mut w = World::new_for_test(SimConfig::default(), 1);
+        let ids = w.generate_order_batch(1);
+        for _ in 0..60 {
+            for _ in 0..10 {
+                w.advance_clock();
+            }
+            for id in w.stale_pending_orders() {
+                w.release_to_hall(id);
+            }
+        }
+        let o = w.order(ids[0]).expect("订单还在");
+        assert_eq!(o.status, OrderStatus::Pending);
+        assert_eq!(
+            o.surcharge_cents,
+            REDISPATCH_SURCHARGE_STEP_CENTS * MAX_REDISPATCH_ATTEMPTS as i64,
+            "重投次数封顶，加价跟着封顶"
+        );
+    }
+
+    /// 事故回流：不加重投次数、不加价，但窗口重置，订单仍在局里。
+    #[test]
+    fn accident_return_to_hall_is_not_charged() {
+        let mut w = World::new_for_test(SimConfig::default(), 1);
+        let ids = w.generate_order_batch(1);
+        let order_id = ids[0];
+        let rider_id = w.riders[0].id;
+        crate::sim::scheduler::try_claim(&mut w, order_id, rider_id).expect("抢单失败");
+
+        let before = w.order(order_id).expect("订单还在").surcharge_cents;
+        assert!(w.return_to_hall_uncharged(order_id));
+
+        let o = w.order(order_id).expect("订单还在");
+        assert_eq!(o.status, OrderStatus::Pending);
+        assert_eq!(o.redispatch_count, 0, "骑手出事故不算拒单");
+        assert_eq!(o.surcharge_cents, before, "事故回流不加价");
+        assert!(o.assigned_to.is_none());
+        assert!(o.claim_deadline_min > w.elapsed_min);
+        assert!(w.order_is_in_play(order_id), "回流后仍在局里");
     }
 
     #[test]

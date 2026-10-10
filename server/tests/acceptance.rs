@@ -9,8 +9,10 @@
 
 use rider_sim::sim::{
     RiderId,
-    config::SimConfig,
-    event::SimEvent,
+    config::{MAX_REDISPATCH_ATTEMPTS, SimConfig},
+    event::{DecisionSource, SimEvent},
+    host::HostMode,
+    order::OrderStatus,
     rider::SpeedMode,
     scheduler,
     tick::{TickInput, tick},
@@ -275,4 +277,141 @@ fn speed_multiplier_only_changes_real_time_pacing() {
         tick(&mut fast, TickInput::default());
         assert_eq!(fast.elapsed_min, i);
     }
+}
+
+/// 硬约束：**不允许流单**。跑一整天（1 模拟分钟 1 tick），任何一单都不许落到 `Expired`。
+#[test]
+fn no_order_ever_flows_away_in_a_full_day() {
+    let mut w = world(20261010);
+    for _ in 0..1_440u64 {
+        tick(&mut w, TickInput::default());
+    }
+    let flowed: Vec<_> = w
+        .orders
+        .iter()
+        .filter(|o| o.status == OrderStatus::Expired)
+        .map(|o| o.id)
+        .collect();
+    assert!(flowed.is_empty(), "这些单流掉了：{flowed:?}");
+    assert_eq!(w.stats.orders_expired, 0, "整个模拟里不允许有流单出口");
+    assert!(w.stats.orders_created > 0, "跑了一天居然一单没出");
+}
+
+/// 没人抢的单在重投用尽后被**强制指派给最近的骑手**，而不是流掉。
+///
+/// 前半段把 AI 全停机（`HostMode::Off`）制造「全城没人接单」，让订单一路重投到顶；
+/// 后半段把 AI 打开，订单必须被救单——来源标成 `algorithm_rescue`，事件带 `forced`。
+#[test]
+fn exhausted_order_is_force_assigned_to_the_nearest_rider() {
+    let mut w = world(4242);
+    let off = TickInput {
+        host_mode: HostMode::Off,
+        ..Default::default()
+    };
+    let on = TickInput::default(); // SimulatedOnly
+
+    // 1. AI 全停机：没人抢单，订单反复重投直到把次数耗光。
+    for _ in 0..60u64 {
+        tick(&mut w, off.clone());
+    }
+    let exhausted: Vec<_> = w
+        .orders
+        .iter()
+        .filter(|o| {
+            o.status == OrderStatus::Pending && o.redispatch_count >= MAX_REDISPATCH_ATTEMPTS
+        })
+        .map(|o| o.id)
+        .collect();
+    assert!(
+        !exhausted.is_empty(),
+        "全停机跑了 60 分钟，总该有单把重投次数耗光"
+    );
+    assert_eq!(w.stats.orders_expired, 0, "停机期间也不许流单");
+
+    // 2. 打开 AI：这些单必须被强制指派（`forced: true`），而不是一直挂着。
+    let mut rescued: Vec<_> = Vec::new();
+    let mut rescue_decisions = 0usize;
+    for _ in 0..40u64 {
+        for ev in tick(&mut w, on.clone()) {
+            match ev {
+                SimEvent::OrderClaimed {
+                    order_id,
+                    forced: true,
+                    ..
+                } => rescued.push(order_id),
+                // 救单必须进决策流，来源标成 `algorithm_rescue`：它是**算法**决策，不是 LLM。
+                SimEvent::AiDecision {
+                    source: DecisionSource::AlgorithmRescue,
+                    layer,
+                    decision_id,
+                    ..
+                } => {
+                    rescue_decisions += 1;
+                    assert_eq!(layer, "algorithm");
+                    assert_eq!(decision_id, 0, "救单不可人工否决");
+                }
+                _ => {}
+            }
+        }
+        if !rescued.is_empty() {
+            break;
+        }
+    }
+    assert!(!rescued.is_empty(), "重投用尽的单必须被救单，不能一直挂着");
+    assert!(
+        rescue_decisions > 0,
+        "救单要进决策流并标成 algorithm_rescue"
+    );
+    assert!(w.stats.orders_rescued > 0, "救单次数要记账");
+    assert!(
+        rescued.iter().any(|id| exhausted.contains(id)),
+        "被救的必须就是那些重投耗光的单：救了 {rescued:?}，耗光的是 {exhausted:?}"
+    );
+    assert_eq!(w.stats.orders_expired, 0);
+}
+
+/// 救单挑的是**最近的**那个骑手。
+///
+/// 直接把一个骑手挪到商家门口、另一个挪到城市另一头，救单必须选近的那个。
+#[test]
+fn rescue_picks_the_closest_available_rider() {
+    let mut w = world(777);
+    let ids = w.generate_order_batch(1);
+    let order_id = ids[0];
+    let merchant = w.order(order_id).expect("订单还在").merchant_pos();
+
+    let near = w.riders[0].id;
+    let far = w.riders[1].id;
+    w.rider_mut(near).expect("骑手在").set_pos(merchant);
+    w.rider_mut(far)
+        .expect("骑手在")
+        .set_pos(rider_sim::sim::geo::LatLng::new(
+            merchant.lat + 0.5,
+            merchant.lng + 0.5,
+        ));
+
+    let a = scheduler::rescue_nearest(&mut w, order_id).expect("必须救得回来");
+    assert_eq!(a.rider, near, "救单要选最近的骑手");
+    assert!(!a.reason.is_empty(), "救单必须说明理由");
+    assert!(w.rider(near).expect("骑手在").is_holding(order_id));
+    assert_eq!(w.stats.orders_rescued, 1);
+}
+
+/// 一个骑手都派不出去时，订单**留在大厅**，绝不流单。
+#[test]
+fn rescue_holds_the_order_when_nobody_is_available() {
+    let mut w = world(31);
+    let ids = w.generate_order_batch(1);
+    let order_id = ids[0];
+    for r in w.riders.iter_mut() {
+        r.online = false;
+    }
+    assert!(
+        scheduler::rescue_nearest(&mut w, order_id).is_none(),
+        "没人能接就不该强塞"
+    );
+    let o = w.order(order_id).expect("订单还在");
+    assert_eq!(o.status, OrderStatus::Pending, "派不出去就留在厅里等");
+    assert_eq!(w.stats.orders_expired, 0, "派不出去也不许流单");
+    assert!(w.stats.orders_rescued == 0);
 }

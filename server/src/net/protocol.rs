@@ -16,6 +16,8 @@
 //! 服务端 → 客户端：{ "event": "order_claimed", "payload": { ... } }
 //! ```
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::sim::{OrderId, RiderId, geo::CoordSystem, rider::SpeedMode};
@@ -128,7 +130,16 @@ pub enum ClientMessage {
         base_url: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        /// 分层模型：`{"rider":"gpt-4o-mini","director":"gpt-4o"}`。
+        ///
+        /// 缺省 = 不改；某层传空串 = 该层回退到全局模型（不是「清空所有层」）。
+        #[serde(default)]
+        layer_models: Option<BTreeMap<String, String>>,
     },
+    /// 问上游要一份可用模型清单（控制台的模型下拉靠它）。
+    ///
+    /// 只读元数据、不花 token，所以 LLM 没启用时也可以问。
+    ListModels,
     /// 拉一份三层 AI 状态（控制台 AI Tab 打开时用）。
     AiQuery,
     /// 改三层 AI 开关与托管模式。字段缺省 = 不改。
@@ -457,6 +468,7 @@ mod tests {
             api_key,
             base_url,
             model,
+            layer_models,
         } = m
         else {
             panic!("应解析为 set_llm_config");
@@ -464,6 +476,35 @@ mod tests {
         assert_eq!(api_key, None);
         assert_eq!(base_url, None);
         assert_eq!(model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(layer_models, None, "没提分层模型就不该动它");
+
+        // 分层模型：只动提到的那几层。
+        let m: ClientMessage = serde_json::from_str(
+            r#"{"type":"set_llm_config","layer_models":{"rider":"gpt-4o-mini","director":""}}"#,
+        )
+        .unwrap();
+        let ClientMessage::SetLlmConfig {
+            api_key,
+            layer_models,
+            ..
+        } = m
+        else {
+            panic!("应解析为 set_llm_config");
+        };
+        assert_eq!(api_key, None, "只改分层模型不该顺手清掉 Key");
+        let layers = layer_models.expect("该带上分层模型");
+        assert_eq!(layers.get("rider").map(String::as_str), Some("gpt-4o-mini"));
+        assert_eq!(
+            layers.get("director").map(String::as_str),
+            Some(""),
+            "空串是「这层回退全局模型」，必须原样传下去"
+        );
+    }
+
+    #[test]
+    fn parses_list_models() {
+        let m: ClientMessage = serde_json::from_str(r#"{"type":"list_models"}"#).unwrap();
+        assert!(matches!(m, ClientMessage::ListModels));
     }
 
     #[test]

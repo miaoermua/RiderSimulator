@@ -243,6 +243,80 @@ pub fn apply_assignment(world: &mut World, assignment: &Assignment) {
     attach(world, assignment);
 }
 
+/// 超时 / 被取消的单的最后一手：**不允许流单**，强制指派给最近的骑手。
+///
+/// 与 [`try_claim`] 的区别：绕开抢单窗口、评分门槛和接单意愿评估，只看
+/// 「谁离商家最近、还背得下」。真实平台在单快黄了的时候也是这么兜的
+/// （扩大派单范围、直接塞单），所以这是**算法**决策，跟 LLM 无关——
+/// 上报时来源是 [`DecisionSource::AlgorithmRescue`]。
+///
+/// 只派给**模拟骑手**：真人玩家在线时手里的单是他在玩的，AI 不抢。
+///
+/// 返回 `None` 表示一个骑手都派不出去（全离线 / 全受伤 / 都背满了），
+/// 此时订单**继续留在大厅**（已经加价、窗口已重置），等下一轮再救。
+/// 无论哪条路，订单都不会被判流单。
+pub fn rescue_nearest(world: &mut World, order_id: OrderId) -> Option<Assignment> {
+    let now = world.elapsed_min;
+    let cfg = world.cfg.clone();
+    let order = world.order(order_id)?;
+    if order.status != OrderStatus::Pending {
+        return None;
+    }
+    let merchant_pos = order.merchant_pos();
+
+    // 最近的优先；距离一样就挑背单少的（更可能真跑得动）。
+    let mut best: Option<(f64, usize, RiderId)> = None;
+    for r in &world.riders {
+        if r.kind != RiderKind::Simulated || !r.online {
+            continue;
+        }
+        if r.is_frozen(now) || r.is_injured(now) {
+            continue;
+        }
+        if r.held.len() as u32 >= r.effective_max_held(&cfg) {
+            continue;
+        }
+        let d = super::geo::haversine_m(r.pos(), merchant_pos);
+        let better = match best {
+            None => true,
+            Some((best_d, best_held, _)) => d < best_d || (d == best_d && r.held.len() < best_held),
+        };
+        if better {
+            best = Some((d, r.held.len(), r.id));
+        }
+    }
+
+    let (dist_m, _, rider_id) = best?;
+    let mut assignment = ai::evaluate(world, rider_id, order_id)?;
+    assignment.source = DecisionSource::AlgorithmRescue;
+    assignment.reason = format!(
+        "超时救单：重投已用尽，强制塞给最近的骑手（距商家约 {:.0}m）",
+        dist_m
+    );
+    attach(world, &assignment);
+    world.stats.orders_rescued += 1;
+    Some(assignment)
+}
+
+/// 把一笔强制指派包成推给控制台的事件（与 AI 派单共用 `order_claimed`）。
+///
+/// `forced` 置位是为了让人一眼看出「这单不是谁抢的，是系统塞的」。
+pub fn claimed_event(world: &World, a: &Assignment) -> SimEvent {
+    SimEvent::OrderClaimed {
+        order_id: a.order,
+        rider_id: a.rider,
+        rider_name: world
+            .rider(a.rider)
+            .map(|r| r.name.clone())
+            .unwrap_or_default(),
+        quoted_fee_cents: world
+            .order(a.order)
+            .map(|o| o.quoted_fee_cents())
+            .unwrap_or(0),
+        forced: true,
+    }
+}
+
 /// 真正把订单挂到骑手身上。这是「抢单」唯一改状态的地方。
 fn attach(world: &mut World, assignment: &Assignment) {
     let now = world.elapsed_min;
@@ -509,17 +583,15 @@ pub fn reject_order(
         );
         rider.held.retain(|h| h.order_id != order_id);
 
-        let mut events = vec![SimEvent::FineIssued {
+        // 回大厅重投，**绝不流单**：窗口内还能被人抢；
+        // 窗口过了还没人接，由 tick 统一走强制指派（见 `tick` 第 4 步）。
+        world.release_to_hall(order_id);
+        return Ok(vec![SimEvent::FineIssued {
             rider_id,
             kind: "cancel".into(),
             amount_cents: cfg.fine.cancel_cents,
             reason: "取消已接订单".into(),
-        }];
-        // 回大厅重投；只有投满上限才真正流单。
-        if !world.release_to_hall(order_id) {
-            events.push(SimEvent::OrderExpired { order_id });
-        }
-        return Ok(events);
+        }]);
     }
     let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
     rider.rejected += 1;

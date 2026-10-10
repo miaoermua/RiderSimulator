@@ -1,10 +1,13 @@
 import {
   PROTOCOL_VERSION,
+  SOURCE_LABEL,
+  isLlmSource,
   type AiOpBrief,
   type AiState,
   type ConfigView,
   type EventName,
   type EventPayloads,
+  type ModelInfo,
   type Role,
   type ServerInfo,
   type Snapshot,
@@ -37,6 +40,8 @@ export interface AiDecisionEntry {
   /** `rider` | `station` | `director` | `algorithm` | `manual`。 */
   layer: string;
   source: string;
+  /** **这一条是否真的来自 LLM**（算法 / 兜底 / 救单 / 人工都不算）。 */
+  llm: boolean;
   note: string;
   /** 站长 / 烽火台的运营指令。 */
   ops: AiOpBrief[];
@@ -54,6 +59,15 @@ export interface AiDecisionEntry {
   rejected?: boolean;
 }
 
+/** 上游模型清单的加载态。 */
+export interface ModelListState {
+  loading: boolean;
+  error: string | null;
+  models: ModelInfo[];
+  /** 当前各层实际用的模型（layer -> model），下拉框回显用。 */
+  current: Record<string, string>;
+}
+
 export interface State {
   role: Role | null;
   conn: ConnState;
@@ -69,6 +83,8 @@ export interface State {
   ai: AiState | null;
   /** AI 决策流，新的在前。 */
   decisions: AiDecisionEntry[];
+  /** 上游模型清单（`ai_models` 事件）。没拉过时为 null。 */
+  models: ModelListState | null;
 }
 
 type Notifier = (kind: "success" | "error" | "info", text: string) => void;
@@ -87,6 +103,7 @@ const initialState: State = {
   mapFitted: false,
   ai: null,
   decisions: [],
+  models: null,
 };
 
 /**
@@ -211,6 +228,20 @@ class ConsoleStore {
     this.send("ai_query");
   }
 
+  /** 问上游要一份可用模型清单（打开设置面板 / 点刷新时调）。 */
+  listModels() {
+    const prev = this.state.models;
+    this.set({
+      models: {
+        loading: true,
+        error: null,
+        models: prev?.models ?? [],
+        current: prev?.current ?? {},
+      },
+    });
+    this.send("list_models");
+  }
+
   /** 改三层开关 / 托管模式。只传要改的字段。 */
   setAi(patch: {
     rider?: boolean;
@@ -256,6 +287,19 @@ class ConsoleStore {
       case "ai_state":
         this.set({ ai: p as AiState });
         break;
+      case "ai_models": {
+        const m = p as EventPayloads["ai_models"];
+        this.set({
+          models: {
+            loading: false,
+            error: m.ok ? null : m.message ?? "拉取失败",
+            models: m.models ?? [],
+            current: m.current?.layers ?? {},
+          },
+        });
+        if (!m.ok) this.notifier("error", `模型列表拉取失败：${m.message ?? "未知原因"}`);
+        break;
+      }
       case "tick":
         // 高频帧**不写回快照**：否则每帧快照引用都变，
         // 订阅快照的地图与列表会跟着 16ms 重渲染一次。
@@ -314,15 +358,26 @@ class ConsoleStore {
         break;
       case "ai_decision": {
         const a = p as EventPayloads["ai_decision"];
-        if (a.note) this.log(a.note, a.source, "blue");
-        // 站长 / 烽火台的运营指令走这里进决策流；算法兜底不进（噪音）。
-        if (a.ops && a.ops.length > 0) {
+        const llm = isLlmSource(a.source);
+        if (a.note) this.log(a.note, SOURCE_LABEL[a.source] ?? a.source, llm ? "blue" : "default");
+        // 进决策流的条件：
+        //  - 站长 / 烽火台的运营指令（一定有 ops）；
+        //  - **非 LLM 但值得一提**的兜底 / 救单 / 人工指派 / 托管，且真的派了单。
+        // 纯算法批量派单每 tick 都来，不进（噪音）。
+        const noteworthy =
+          a.source === "algorithm_fallback" ||
+          a.source === "algorithm_rescue" ||
+          a.source === "manual" ||
+          a.source === "ai_hosted";
+        const hasOps = (a.ops?.length ?? 0) > 0;
+        if (hasOps || (noteworthy && (a.assignments?.length ?? 0) > 0)) {
           this.pushDecision({
             decisionId: a.decision_id ?? 0,
-            layer: a.layer ?? "station",
+            layer: a.layer ?? "algorithm",
             source: a.source,
+            llm,
             note: a.note ?? "",
-            ops: a.ops,
+            ops: a.ops ?? [],
             assignments: a.assignments?.length ?? 0,
             dropped: 0,
           });
@@ -331,13 +386,14 @@ class ConsoleStore {
       }
       case "llm_brain": {
         const b = p as EventPayloads["llm_brain"];
-        // 算法兜底不是 AI 决策，不进流（否则刷屏）。
-        // 缓存命中要进 —— 它同样是 AI 的决策，只是这轮没再花钱。
+        // 算法兜底不是 LLM 决策，不进流（否则刷屏）。
+        // 缓存命中要进 —— 它同样是模型的决策，只是这轮没再花钱。
         if (b.source === "fallback") break;
         this.pushDecision({
           decisionId: b.decision_id ?? 0,
           layer: b.layer ?? "rider",
           source: b.source,
+          llm: isLlmSource(b.source),
           note: b.note ?? "",
           ops: [],
           assignments: b.assignments ?? 0,
@@ -364,6 +420,7 @@ class ConsoleStore {
           decisionId: w.decision_id ?? 0,
           layer: w.layer ?? "director",
           source: w.source,
+          llm: isLlmSource(w.source),
           note: w.note ?? "",
           ops,
           assignments: 0,
@@ -422,8 +479,9 @@ class ConsoleStore {
       this.resync();
       return;
     }
-    // resync / ai_query 是内部动作，不该弹提示。
-    if (a.action === "resync" || a.action === "ai_query") return;
+    // resync / ai_query / list_models 是内部动作，不该弹提示
+    // （list_models 的真实结果随后由 `ai_models` 事件专门呈现）。
+    if (a.action === "resync" || a.action === "ai_query" || a.action === "list_models") return;
     this.notifier("success", `${a.action} 成功`);
     // 控制类指令的 ack 里带回了配置片段（如倍率、实时档），
     // 就地合并能让顶栏立刻响应，不必等下一次快照。

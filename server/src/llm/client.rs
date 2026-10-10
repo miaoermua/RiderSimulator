@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
 /// 默认 3 秒超时。**这是玩法设计的硬要求**：超时就放弃本轮，用算法兜底。
@@ -188,6 +189,36 @@ impl LayerModels {
     pub fn is_empty(&self) -> bool {
         self.rider.is_none() && self.station.is_none() && self.director.is_none()
     }
+
+    /// 序列化成控制台认的形状：`{"rider":"gpt-4o-mini","director":"gpt-4o"}`。
+    ///
+    /// 没配的层**不出现在对象里**——控制台据此区分「没提这层」和「这层回退全局」。
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for layer in LayerKey::ALL {
+            if let Some(model) = self.get(layer) {
+                map.insert(
+                    layer.key().to_string(),
+                    serde_json::Value::String(model.to_string()),
+                );
+            }
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// 从控制台/库里存过的对象读回。认不出的层名静默忽略，坏值当没配。
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        let mut out = Self::default();
+        let Some(obj) = value.as_object() else {
+            return out;
+        };
+        for (key, raw) in obj {
+            if let (Some(layer), Some(model)) = (LayerKey::from_key(key.trim()), raw.as_str()) {
+                out.set(layer, Some(model.to_string()));
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -225,6 +256,22 @@ impl LlmError {
     }
 }
 
+/// 上游给出的一个可用模型。
+///
+/// 控制台要靠它给出「这一层用哪个模型」的下拉框——不然只能手打模型名，
+/// 打错了要等到下一轮决策才能从错误里发现。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelInfo {
+    /// 填进 `model` 字段的就是它。
+    pub id: String,
+    /// 归属方。OpenAI 兼容服务多半是组织名，本地服务通常不给。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owned_by: Option<String>,
+    /// 创建时间戳（秒）。有些服务不给。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created: Option<u64>,
+}
+
 /// LLM 客户端。可克隆、可共享。
 #[derive(Clone)]
 pub struct LlmClient {
@@ -258,6 +305,14 @@ impl LlmClient {
         if !cfg.has_key() {
             return Err(LlmError::KeyMissing);
         }
+        Self::metadata_only(cfg)
+    }
+
+    /// 建一个「只问元数据」的客户端（列模型用）：**不因缺 Key 报错**。
+    ///
+    /// 本地推理服务（Ollama / vLLM / LM Studio）大多不校验 Key，
+    /// 「能不能列出模型」跟「LLM 决策有没有启用」是两回事，别混在一起。
+    pub fn metadata_only(cfg: LlmConfig) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .timeout(cfg.timeout)
             .user_agent(concat!("rider-sim/", env!("CARGO_PKG_VERSION")))
@@ -333,6 +388,94 @@ impl LlmClient {
             detail: "无法从内容里提取出 JSON 对象".to_string(),
         })
     }
+
+    /// 上游 `GET {base}/models`：控制台的模型下拉靠它，免得手打模型名打错。
+    ///
+    /// 只读元数据、不产生 token 花费，所以缺 Key 也能问（见 [`LlmClient::metadata_only`]）。
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+        let url = format!("{}/models", self.cfg.base_url.trim_end_matches('/'));
+        let mut req = self.http.get(url).timeout(self.cfg.timeout);
+        if self.cfg.has_key() {
+            req = req.bearer_auth(&self.cfg.api_key);
+        }
+
+        let resp = req.send().await.map_err(|e| {
+            if e.is_timeout() {
+                LlmError::Timeout(self.cfg.timeout)
+            } else {
+                LlmError::Http(e)
+            }
+        })?;
+
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(LlmError::Status {
+                status: status.as_u16(),
+                body: truncate(&text, 300),
+            });
+        }
+
+        let envelope: Value = serde_json::from_str(&text).map_err(|e| LlmError::BadJson {
+            raw: truncate(&text, 300),
+            detail: e.to_string(),
+        })?;
+        Ok(parse_models(&envelope))
+    }
+}
+
+/// 从 `/models` 的响应里抠出模型清单，按名字排序去重。
+///
+/// 兼容几种常见形状，因为「OpenAI 兼容」在实践中并不只有一种：
+/// `{"data":[{"id":...}]}`（OpenAI / DeepSeek / vLLM）、
+/// `{"models":["qwen2.5:7b"]}`（部分本地服务）、
+/// `{"models":[{"name":...}]}`（少数服务把 id 叫 name）。
+pub fn parse_models(envelope: &Value) -> Vec<ModelInfo> {
+    let rows = envelope
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| envelope.get("models").and_then(Value::as_array));
+
+    let mut out: Vec<ModelInfo> = rows
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| match row {
+                    Value::String(s) => {
+                        let id = s.trim();
+                        if id.is_empty() {
+                            None
+                        } else {
+                            Some(ModelInfo {
+                                id: id.to_string(),
+                                owned_by: None,
+                                created: None,
+                            })
+                        }
+                    }
+                    Value::Object(o) => {
+                        let id = ["id", "name", "model"]
+                            .iter()
+                            .find_map(|k| o.get(*k).and_then(Value::as_str))
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())?;
+                        Some(ModelInfo {
+                            id: id.to_string(),
+                            owned_by: o
+                                .get("owned_by")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            created: o.get("created").and_then(Value::as_u64),
+                        })
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.dedup_by(|a, b| a.id == b.id);
+    out
 }
 
 /// 从模型输出里抠出 JSON 对象。
@@ -426,6 +569,41 @@ mod tests {
     }
 
     #[test]
+    fn layer_models_round_trip_through_json() {
+        let mut models = LayerModels::default();
+        models.set(LayerKey::Rider, Some("gpt-4o-mini".into()));
+        models.set(LayerKey::Director, Some("gpt-4o".into()));
+
+        let json = models.to_json();
+        // 没配的层不该出现在对象里 —— 控制台据此区分「没提」和「回退全局」。
+        assert!(json.get("rider").is_some());
+        assert!(json.get("director").is_some());
+        assert!(json.get("station").is_none());
+
+        let back = LayerModels::from_json(&json);
+        assert_eq!(back.get(LayerKey::Rider), Some("gpt-4o-mini"));
+        assert_eq!(back.get(LayerKey::Director), Some("gpt-4o"));
+        assert_eq!(back.get(LayerKey::Station), None);
+    }
+
+    #[test]
+    fn layer_models_from_json_ignores_junk() {
+        // 不是对象、认不出的层名、非字符串的值，都不该 panic，也不该写进去。
+        assert!(LayerModels::from_json(&serde_json::json!(null)).is_empty());
+        assert!(LayerModels::from_json(&serde_json::json!([1, 2])).is_empty());
+
+        let back = LayerModels::from_json(&serde_json::json!({
+            "rider": "gpt-4o-mini",
+            "director": "gpt-4o",
+            "nope": "x",          // 认不出，忽略
+            "station": 42,        // 类型不对，忽略
+        }));
+        assert_eq!(back.get(LayerKey::Rider), Some("gpt-4o-mini"));
+        assert_eq!(back.get(LayerKey::Director), Some("gpt-4o"));
+        assert_eq!(back.get(LayerKey::Station), None);
+    }
+
+    #[test]
     fn missing_key_disables_the_feature_without_panicking() {
         let cfg = LlmConfig::new("   ");
         assert!(!cfg.has_key());
@@ -483,5 +661,200 @@ mod tests {
     #[test]
     fn timeout_default_matches_the_design() {
         assert_eq!(LlmConfig::default().timeout, Duration::from_secs(3));
+    }
+
+    // -----------------------------------------------------------------
+    // HTTP 层：起一个假上游，验证真的发得出去、真的解析得回来
+    // -----------------------------------------------------------------
+
+    /// 起一个只回固定响应的假上游，返回它的 base_url（`/v1`）。
+    ///
+    /// 顺手把收到的请求体记下来，好断言「我们发出去的是不是想发的东西」。
+    async fn stub_upstream(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::{Router, routing::any};
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let sink = seen.clone();
+        let app = Router::new().route(
+            "/v1/{*rest}",
+            any(move |req: axum::extract::Request| {
+                let sink = sink.clone();
+                async move {
+                    let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                        sink.lock().unwrap().push(v);
+                    }
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1"), seen)
+    }
+
+    fn client_for_stmt(base_url: String) -> LlmClient {
+        LlmClient::new(LlmConfig {
+            base_url,
+            api_key: "test-key".into(),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        })
+        .expect("带 Key 的配置必须建得出来")
+    }
+
+    #[test]
+    fn parses_the_common_models_shapes() {
+        // OpenAI / DeepSeek / vLLM：data 数组 + 对象
+        let v = json!({"data":[
+            {"id":"gpt-4o","owned_by":"openai","created":1},
+            {"id":"gpt-4o-mini"},
+            {"id":"gpt-4o"},
+            {"id":"   "}
+        ]});
+        let got: Vec<String> = parse_models(&v).into_iter().map(|m| m.id).collect();
+        assert_eq!(
+            got,
+            vec!["gpt-4o", "gpt-4o-mini"],
+            "要排序 + 去重 + 丢掉空名"
+        );
+        assert_eq!(parse_models(&v)[0].owned_by.as_deref(), Some("openai"));
+
+        // 部分本地服务：models 数组 + 纯字符串
+        let v = json!({"models":["qwen2.5:7b","llama3.1:8b"]});
+        let got: Vec<String> = parse_models(&v).into_iter().map(|m| m.id).collect();
+        assert_eq!(got, vec!["llama3.1:8b", "qwen2.5:7b"]);
+
+        // 少数服务把 id 叫 name / model
+        let v = json!({"models":[{"name":"m1"},{"model":"m2"}]});
+        assert_eq!(parse_models(&v).len(), 2);
+
+        // 什么都没给：空清单，不 panic
+        assert!(parse_models(&json!({})).is_empty());
+        assert!(parse_models(&json!({"data":"nope"})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_models_hits_the_upstream_and_parses_it() {
+        let (base, _seen) = stub_upstream(
+            200,
+            r#"{"data":[{"id":"zeta"},{"id":"alpha","owned_by":"acme"}]}"#,
+        )
+        .await;
+        let models = client_for_stmt(base).list_models().await.expect("该成功");
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
+        assert_eq!(models[0].owned_by.as_deref(), Some("acme"));
+    }
+
+    #[tokio::test]
+    async fn list_models_surfaces_upstream_rejections() {
+        let (base, _seen) = stub_upstream(401, r#"{"error":"bad key"}"#).await;
+        let err = client_for_stmt(base).list_models().await.unwrap_err();
+        match err {
+            LlmError::Status { status, .. } => assert_eq!(status, 401),
+            other => panic!("该报 Status，实际是 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_garbage_instead_of_panicking() {
+        let (base, _seen) = stub_upstream(200, "<html>502 Bad Gateway</html>").await;
+        let err = client_for_stmt(base).list_models().await.unwrap_err();
+        assert!(matches!(err, LlmError::BadJson { .. }), "实际是 {err:?}");
+    }
+
+    /// 本地推理服务大多不校验 Key：**没有 Key 也要能列模型**。
+    #[tokio::test]
+    async fn listing_models_works_without_a_key() {
+        let (base, _seen) = stub_upstream(200, r#"{"models":["qwen2.5:7b"]}"#).await;
+        let cfg = LlmConfig {
+            base_url: base,
+            api_key: String::new(),
+            ..Default::default()
+        };
+        assert!(
+            matches!(LlmClient::new(cfg.clone()), Err(LlmError::KeyMissing)),
+            "决策客户端仍然要求 Key——缺 Key 就是没启用"
+        );
+        let models = LlmClient::metadata_only(cfg)
+            .expect("元数据客户端不该因为缺 Key 失败")
+            .list_models()
+            .await
+            .unwrap();
+        assert_eq!(models[0].id, "qwen2.5:7b");
+    }
+
+    /// `complete_json` 发出去的请求体得是我们要的形状（模型名 / 0 温度 / JSON 模式）。
+    #[tokio::test]
+    async fn complete_json_sends_the_configured_request() {
+        let (base, seen) = stub_upstream(
+            200,
+            r#"{"choices":[{"message":{"content":"{\"assignments\":[]}"}}]}"#,
+        )
+        .await;
+        let client = client_for_stmt(base);
+        let v = client
+            .complete_json("只输出 JSON", "派单")
+            .await
+            .expect("该成功");
+        assert_eq!(v["assignments"], json!([]));
+
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "只该发一次");
+        let body = &sent[0];
+        assert_eq!(body["model"], json!(client.model()));
+        assert_eq!(body["temperature"], json!(0.0), "决策必须 0 温度");
+        assert_eq!(body["response_format"]["type"], json!("json_object"));
+        assert_eq!(body["messages"][0]["content"], json!("只输出 JSON"));
+    }
+
+    /// 上游把 JSON 包在 ``` 围栏里也得能解析出来（真实模型经常这么干）。
+    #[tokio::test]
+    async fn complete_json_unwraps_a_fenced_answer() {
+        let (base, _seen) = stub_upstream(
+            200,
+            r#"{"choices":[{"message":{"content":"```json\n{\"v\":1}\n```"}}]}"#,
+        )
+        .await;
+        let v = client_for_stmt(base)
+            .complete_json("s", "u")
+            .await
+            .expect("该成功");
+        assert_eq!(v["v"], json!(1));
+    }
+
+    /// 上游返回 429 要给 `Status`（可回退），返回 200 却没有 content 要给 `Empty`。
+    #[tokio::test]
+    async fn complete_json_separates_transport_failures_from_empty_answers() {
+        let (busy, _seen) = stub_upstream(429, r#"{"error":{"message":"rate limited"}}"#).await;
+        let err = client_for_stmt(busy)
+            .complete_json("s", "u")
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "限流该可回退，实际是 {err:?}");
+
+        let (empty, _seen) = stub_upstream(200, r#"{"choices":[]}"#).await;
+        let err = client_for_stmt(empty)
+            .complete_json("s", "u")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LlmError::Empty), "实际是 {err:?}");
+        assert!(!err.is_transient(), "空回答不是网络问题");
     }
 }

@@ -13,7 +13,7 @@ use super::{
     order::OrderStatus,
     rider::{Phase, Rider, RiderKind},
     risk, scheduler,
-    world::World,
+    world::{Redispatch, World},
 };
 
 /// tick 的外部输入。**IO 的结果只能从这里进来。**
@@ -67,9 +67,37 @@ pub fn tick(world: &mut World, mut input: TickInput) -> Vec<SimEvent> {
     // 3. 生成新单（在线骑手越多，单越多）
     spawn_orders(world, &mut events);
 
-    // 4. 抢单窗口过期的单
-    for id in world.expire_stale_orders() {
-        events.push(SimEvent::OrderExpired { order_id: id });
+    // 4. 抢单窗口过期的单：加价回大厅；重投用尽就强制塞给最近的骑手。
+    //
+    // **不允许流单**：这里不会产生 `order_expired`。真派不出去（骑手全离线/全受伤）时
+    // 订单继续留在大厅等着，进入下一轮。
+    //
+    // 救单是 AI 动作，所以 `HostMode::Off`（AI 全停机）下不做——那时订单就在大厅里等着，
+    // 由玩家自己抢；它依然不会过期。
+    let may_rescue = input.host_mode != HostMode::Off;
+    for id in world.stale_pending_orders() {
+        if world.release_to_hall(id) != Some(Redispatch::NeedsRescue) {
+            continue;
+        }
+        if !may_rescue {
+            continue;
+        }
+        if let Some(a) = scheduler::rescue_nearest(world, id) {
+            events.push(scheduler::claimed_event(world, &a));
+            // 救单也要进决策流：它不是 LLM 决策，控制台必须能一眼分清。
+            let rider_name = world
+                .rider(a.rider)
+                .map(|r| r.name.clone())
+                .unwrap_or_default();
+            events.push(SimEvent::AiDecision {
+                source: DecisionSource::AlgorithmRescue,
+                layer: "algorithm",
+                assignments: vec![a.to_event()],
+                ops: Vec::new(),
+                decision_id: 0,
+                note: format!("超时救单：#{id} 重投用尽，强制塞给 {rider_name}"),
+            });
+        }
     }
 
     // 5. 骑手行程推进 + 风险
@@ -513,12 +541,9 @@ fn roll_leg_risk(world: &mut World, rid: RiderId, oid: OrderId, events: &mut Vec
         // 手上的单全部退回大厅（必须有人接）
         r.held.clear();
     }
-    if let Some(order) = world.order_mut(oid) {
-        order.status = OrderStatus::Pending;
-        order.assigned_to = None;
-        order.picked_up_at_min = None;
-        order.claim_deadline_min = now + cfg.claim_window_ticks() as u64;
-    }
+    // 手上的单退回大厅：走统一的回流出口，别在这里自己拼状态。
+    // （不累加重投次数——骑手是出事故进医院，不是拒单。这单迟早会有人接。）
+    world.return_to_hall_uncharged(oid);
     events.push(SimEvent::FineIssued {
         rider_id: rid,
         kind: "accident".into(),
@@ -728,5 +753,142 @@ mod tests {
             "玩家自己在线，AI 不许替他接单"
         );
         assert!(w.rider(human).unwrap().held.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // LLM 决策 vs AI 决策：来源必须泾渭分明
+    // -----------------------------------------------------------------
+
+    /// 造一个有单、有空闲骑手的 LLM 大脑开着世界，返回 (世界, 第一条合法计划)。
+    fn llm_world(seed: u64) -> (World, LlmPlan) {
+        let cfg = SimConfig {
+            sim_rider_count: 4,
+            llm_brain_enabled: true,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, seed);
+        w.generate_order_batch(4);
+
+        let rider_id = w.riders[0].id;
+        let order_id = w.pending_orders()[0];
+        let plan = LlmPlan {
+            assignments: vec![ai::LlmAssign {
+                rider_id: format!("r{rider_id}"),
+                order_id,
+                reason: "这条最顺路".into(),
+            }],
+            model: "gpt-4o-mini".into(),
+            latency_ms: 120,
+            note: String::new(),
+            decision_id: 77,
+        };
+        (w, plan)
+    }
+
+    /// 合法 LLM 计划：来源必须标成 `Llm`，带上决策 id，并保留模型给出的理由。
+    #[test]
+    fn a_well_formed_llm_plan_is_reported_as_llm() {
+        let (mut w, plan) = llm_world(42);
+        let evs = tick(
+            &mut w,
+            TickInput {
+                llm_plan: Some(plan),
+                ..Default::default()
+            },
+        );
+
+        let Some(SimEvent::AiDecision {
+            source,
+            layer,
+            assignments,
+            decision_id,
+            note,
+            ..
+        }) = evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("LLM 给了合法计划，必须有一条决策");
+        };
+        assert_eq!(*source, DecisionSource::Llm);
+        assert!(source.is_llm(), "来源标成 LLM 才允许算「LLM 决策」");
+        assert_eq!(*layer, "rider", "骑手层的计划就该报骑手层");
+        assert_eq!(*decision_id, 77, "决策 id 要原样透传给控制台否决");
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0].reason.starts_with("[LLM]"));
+        assert!(note.contains("gpt-4o-mini"), "理由里要带上用的模型：{note}");
+        assert_eq!(w.stats.llm_calls, 1);
+        assert_eq!(w.stats.llm_fallbacks, 0);
+    }
+
+    /// LLM 输出全是垃圾：一条都不能落地，来源必须标成「算法兜底」而非 LLM。
+    #[test]
+    fn a_garbage_llm_plan_falls_back_to_the_algorithm() {
+        let (mut w, _) = llm_world(42);
+        let garbage = LlmPlan {
+            assignments: vec![ai::LlmAssign {
+                rider_id: "r999".into(),
+                order_id: 99999,
+                reason: String::new(),
+            }],
+            model: "gpt-4o-mini".into(),
+            decision_id: 88,
+            ..Default::default()
+        };
+        let evs = tick(
+            &mut w,
+            TickInput {
+                llm_plan: Some(garbage),
+                ..Default::default()
+            },
+        );
+
+        let Some(SimEvent::AiDecision {
+            source,
+            decision_id,
+            ..
+        }) = evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("兜底算法也该有一条决策");
+        };
+        assert_eq!(*source, DecisionSource::AlgorithmFallback);
+        assert!(!source.is_llm(), "兜底不是 LLM 决策");
+        assert_eq!(*decision_id, 0, "兜底不可否决");
+        assert_eq!(w.stats.llm_fallbacks, 1);
+        assert_eq!(w.stats.llm_calls, 0);
+    }
+
+    /// 大脑开关关着时，就算手里攥着 LLM 计划也不许用——来源必须是纯算法。
+    #[test]
+    fn a_plan_is_ignored_when_the_brain_switch_is_off() {
+        let (mut w, plan) = llm_world(42);
+        w.cfg.llm_brain_enabled = false;
+        let evs = tick(
+            &mut w,
+            TickInput {
+                llm_plan: Some(plan),
+                ..Default::default()
+            },
+        );
+
+        let Some(SimEvent::AiDecision { source, .. }) = evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("关掉 LLM 后算法仍要派单");
+        };
+        assert_eq!(*source, DecisionSource::Algorithm);
+        assert!(!source.is_llm());
+    }
+
+    /// `is_llm` 只承认真模型：救单、兜底、人工、托管都不算 LLM 决策。
+    #[test]
+    fn only_the_real_model_counts_as_an_llm_decision() {
+        assert!(DecisionSource::Llm.is_llm());
+        for other in [
+            DecisionSource::Algorithm,
+            DecisionSource::AlgorithmFallback,
+            DecisionSource::AlgorithmRescue,
+            DecisionSource::Manual,
+            DecisionSource::AiHosted,
+        ] {
+            assert!(!other.is_llm(), "{:?} 不该被算成 LLM 决策", other);
+        }
     }
 }

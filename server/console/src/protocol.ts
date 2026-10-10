@@ -31,6 +31,23 @@ export type OrderStatus =
   | "expired"
   | "cancelled";
 
+/**
+ * 一条决策的来源。
+ *
+ * **「AI 决策」与「LLM 决策」是两个不同的概念**：只有 `llm` 是真的问了模型，
+ * 其余都是纯算法 / 人工（`algorithm_rescue` 是超时救单，也是算法）。
+ */
+export type DecisionSource =
+  | "algorithm"
+  | "llm"
+  | "algorithm_fallback"
+  | "algorithm_rescue"
+  | "manual"
+  | "ai_hosted";
+
+/** 骑手层大脑一轮结果的来源（比 `DecisionSource` 多出缓存 / 跳过态）。 */
+export type BrainSource = "llm" | "cache" | "disabled" | "throttled" | "fallback";
+
 /** 坐标系。方案 A：服务端内部保持 GCJ-02，只在下发快照时按需转换。 */
 export type CoordSystem = "gcj02" | "wgs84";
 
@@ -262,6 +279,15 @@ export interface AiState {
   reject_log: Array<{ decision_id: number; layer: string; result: string }>;
 }
 
+/** 上游给出的一个可用模型（`GET {base}/models`）。控制台的模型下拉靠它。 */
+export interface ModelInfo {
+  /** 填进 `model` / `layer_models` 的就是它。 */
+  id: string;
+  /** 归属方。OpenAI 兼容服务多半是组织名，本地服务通常不给。 */
+  owned_by?: string;
+  created?: number;
+}
+
 /** 一条 AI 运营指令的人类可读摘要。 */
 export interface AiOpBrief {
   op: string;
@@ -326,7 +352,7 @@ export interface EventPayloads {
   fine_issued: { rider_id: number; kind: string; amount_cents: number; reason: string };
   config_changed: { speed_multiplier: number; commission_rate: number; weather: Weather };
   ai_decision: {
-    source: string;
+    source: DecisionSource;
     /** 哪一层做的决策：`rider` | `station` | `director` | `algorithm` | `manual`。 */
     layer?: string;
     assignments?: Array<Record<string, unknown>>;
@@ -338,6 +364,17 @@ export interface EventPayloads {
   };
   /** 三层 AI 状态（控制端专用，随 server_info 与 ai_query 下发）。 */
   ai_state: AiState;
+  /** 上游模型清单（回给点名要它的那条连接）。 */
+  ai_models: {
+    ok: boolean;
+    count: number;
+    /** `ok: false` 时为空数组。 */
+    models?: ModelInfo[];
+    /** `ok: false` 时的失败原因。 */
+    message?: string;
+    /** 当前三层各用什么，供下拉框回显。 */
+    current?: { global: string; layers: Record<string, string> };
+  };
   /** 骑手层一轮 LLM 决策（控制端专用，比 ai_decision 更详细）。 */
   llm_brain: {
     decision_id: number;
@@ -385,3 +422,26 @@ export interface Envelope<K extends EventName = EventName> {
   event: K;
   payload: EventPayloads[K];
 }
+
+/**
+ * 这一条来源**是否真的来自 LLM**。
+ *
+ * `cache` 也算：指纹命中的同样是模型的决策，只是这一轮没再花钱。
+ * 其余（算法、兜底、救单、人工、托管）一律不算。
+ */
+export function isLlmSource(source: string): boolean {
+  return source === "llm" || source === "cache";
+}
+
+/** 来源的中文名。界面上不该出现机器名。 */
+export const SOURCE_LABEL: Record<string, string> = {
+  llm: "LLM",
+  cache: "LLM·缓存",
+  algorithm: "算法",
+  algorithm_fallback: "算法兜底",
+  algorithm_rescue: "超时救单",
+  manual: "人工指派",
+  ai_hosted: "AI 托管",
+  disabled: "未启用",
+  throttled: "限流跳过",
+};

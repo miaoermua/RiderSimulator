@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   Alert,
   App as AntApp,
+  AutoComplete,
   Button,
   Divider,
   Empty,
@@ -18,6 +19,13 @@ import { COORD_LABEL, WEATHERS } from "../const";
 import { useIsControl, useStore } from "../hooks";
 import type { CoordSystem } from "../protocol";
 import { store, yuan } from "../store";
+
+/** 三层模型的可配字段：机器名 → 中文名。 */
+const LAYER_MODEL_FIELDS: Array<[string, string]> = [
+  ["rider", "骑手"],
+  ["station", "站长"],
+  ["director", "烽火台"],
+];
 
 /**
  * 设置面板。
@@ -263,13 +271,16 @@ function AdvancedSection({
 }) {
   const snap = useStore((s) => s.snap);
   const info = useStore((s) => s.info);
+  const models = useStore((s) => s.models);
   const [names, setNames] = useState("");
   const namesDirty = useRef(false);
   const [key, setKey] = useState("");
   const [base, setBase] = useState("");
   const [model, setModel] = useState("");
+  const [layerModels, setLayerModels] = useState<Record<string, string>>({});
   const baseTouched = useRef(false);
   const modelTouched = useRef(false);
+  const layerTouched = useRef(false);
 
   // 名单：从快照同步，用户改过就不再覆盖。
   useEffect(() => {
@@ -293,6 +304,21 @@ function AdvancedSection({
     setModel(info?.llm_model ?? "");
   }, [info]);
 
+  // 进面板就拉一次上游模型清单——下拉框有值才不至于手打模型名打错。
+  // 观战身份调不了（服务端只认控制端），所以只在有权限时问。
+  useEffect(() => {
+    if (!disabled) store.listModels();
+  }, [disabled]);
+
+  // 分层模型：从最近一次模型清单回填，用户改过就不再覆盖。
+  useEffect(() => {
+    if (layerTouched.current || !models) return;
+    setLayerModels(models.current ?? {});
+  }, [models]);
+
+  /** 上游给的模型名做成下拉候选；输入框仍允许自由填（上游可能不给 models 接口）。 */
+  const modelOptions = (models?.models ?? []).map((m) => ({ value: m.id, label: m.id }));
+
   const saveNames = () => {
     const list = names
       .split("\n")
@@ -309,6 +335,10 @@ function AdvancedSection({
   const saveLlm = () => {
     const body: Record<string, unknown> = { base_url: base.trim(), model: model.trim() };
     if (key.trim()) body.api_key = key.trim(); // 留空 = 不碰已存的 Key
+    // 分层模型：只发这三个已知层；空串 = 该层回退到全局模型。
+    body.layer_models = Object.fromEntries(
+      LAYER_MODEL_FIELDS.map(([k]) => [k, (layerModels[k] ?? "").trim()]),
+    );
     store.send("set_llm_config", body);
     setKey("");
   };
@@ -357,17 +387,64 @@ function AdvancedSection({
           }}
         />
       </Row>
-      <Row label="模型" stack>
-        <Input
+      <Row label="模型" hint="三层没有单独指定时都用它" stack>
+        <AutoComplete
+          style={{ width: "100%" }}
           disabled={disabled}
+          options={modelOptions}
           placeholder="gpt-4o-mini"
           value={model}
-          onChange={(e) => {
+          onChange={(v) => {
             modelTouched.current = true;
-            setModel(e.target.value);
+            setModel(v);
           }}
+          filterOption={(input, opt) =>
+            String(opt?.value ?? "")
+              .toLowerCase()
+              .includes(input.toLowerCase())
+          }
         />
       </Row>
+
+      <Row
+        label="上游模型列表"
+        hint={
+          models?.loading
+            ? "拉取中…"
+            : models?.error
+              ? `拉取失败：${models.error}`
+              : models
+                ? `共 ${models.models.length} 个可选模型（下拉候选）`
+                : "进面板时自动拉取"
+        }
+      >
+        <Button disabled={disabled} loading={models?.loading} onClick={() => store.listModels()}>
+          刷新
+        </Button>
+      </Row>
+
+      {LAYER_MODEL_FIELDS.map(([field, label]) => (
+        <Row key={field} label={`${label}层模型`} hint="留空 = 用全局模型" stack>
+          <AutoComplete
+            style={{ width: "100%" }}
+            disabled={disabled}
+            allowClear
+            options={modelOptions}
+            placeholder={model || "全局模型"}
+            value={layerModels[field] ?? ""}
+            onChange={(v) => {
+              layerTouched.current = true;
+              setLayerModels((d) => ({ ...d, [field]: v ?? "" }));
+            }}
+            filterOption={(input, opt) =>
+              String(opt?.value ?? "")
+                .toLowerCase()
+                .includes(input.toLowerCase())
+            }
+          />
+        </Row>
+      ))}
+
       <Space style={{ marginTop: 8 }}>
         <Button disabled={disabled} onClick={saveLlm}>
           保存

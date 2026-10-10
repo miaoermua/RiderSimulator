@@ -32,9 +32,9 @@ use tokio::sync::{
 use tokio::time::{Instant, sleep_until};
 
 use crate::llm::{
-    AiLayer, AiOrchestrator, DirectorBrain, LayerKey, LayerModels, LlmConfig, PlanFetch,
-    PreparedPlan, PreparedWorldPlan, TacticalBrain, TaskJudge, TaskRuling, ValidatedWorldOp,
-    WorldFetch,
+    AiLayer, AiOrchestrator, DirectorBrain, LayerKey, LayerModels, LlmClient, LlmConfig, ModelInfo,
+    PlanFetch, PreparedPlan, PreparedWorldPlan, TacticalBrain, TaskJudge, TaskRuling,
+    ValidatedWorldOp, WorldFetch,
 };
 use crate::net::{
     Ack, ApiAuth, ApiError, ClientMessage, ConnId, DispatchItem, Envelope, Hub, Inbound,
@@ -99,6 +99,16 @@ struct PendingRuling {
     ruling: TaskRuling,
 }
 
+/// 后台「列出模型」的结果。
+///
+/// 带上 `conn_id` 是因为这是**点名要的**：谁点的回给谁，
+/// 不像世界状态那样广播给所有控制端。
+#[derive(Debug)]
+struct ModelListing {
+    conn_id: ConnId,
+    outcome: Result<Vec<ModelInfo>, String>,
+}
+
 /// 后台任务送回来的一轮 AI 结果。
 ///
 /// 三层**共用同一条通道**：编排器保证同一时刻只有一个在飞请求，
@@ -137,6 +147,9 @@ pub struct App {
     ruling_rx: Option<UnboundedReceiver<PendingRuling>>,
     plan_tx: UnboundedSender<AiInbound>,
     plan_rx: Option<UnboundedReceiver<AiInbound>>,
+    /// 「列出模型」的后台结果回传口（网络慢，不能在主循环里等）。
+    models_tx: UnboundedSender<ModelListing>,
+    models_rx: Option<UnboundedReceiver<ModelListing>>,
 
     /// 已占坑、正在后台打 HTTP 的那一轮。`None` = 没有在途请求。
     inflight_since: Option<Instant>,
@@ -181,6 +194,7 @@ impl App {
         let (inbound_tx, inbound_rx) = unbounded_channel();
         let (ruling_tx, ruling_rx) = unbounded_channel();
         let (plan_tx, plan_rx) = unbounded_channel();
+        let (models_tx, models_rx) = unbounded_channel();
 
         // LLM 接入的优先级：控制台存下来的 > 环境变量 > 空配置。
         //
@@ -197,7 +211,10 @@ impl App {
         });
         // 分层模型：骑手层高频要便宜，烽火台层低频可以贵一点。
         // 没配（默认）时三层都用全局模型，行为与从前逐字节一致。
-        let layer_models = LayerModels::from_env();
+        //
+        // 控制台改过的分层模型落库，重启后优先于环境变量——否则在界面上
+        // 选好的模型一重启就被 `RIDER_SIM_*` 覆盖回去，很难解释。
+        let layer_models = load_layer_models(&store).unwrap_or_else(LayerModels::from_env);
         let (brain, judge, director) = if llm_config.has_key() {
             (
                 TacticalBrain::from_config(&llm_config.for_layer(&layer_models, LayerKey::Rider)),
@@ -257,6 +274,8 @@ impl App {
             ruling_rx: Some(ruling_rx),
             plan_tx,
             plan_rx: Some(plan_rx),
+            models_tx,
+            models_rx: Some(models_rx),
             inflight_since: None,
             inflight_layer: None,
             pending_plan: None,
@@ -326,12 +345,13 @@ impl App {
 
     /// 主循环本体。
     ///
-    /// `select!` 的四条腿：定时 tick、网络消息、任务裁决、LLM 计划。
-    /// 只有第一条会推进世界，其余三条都只是「改变输入」。
+    /// `select!` 的几条腿：定时 tick、网络消息、任务裁决、LLM 计划、模型清单。
+    /// 只有第一条会推进世界，其余几条都只是「改变输入」。
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> std::io::Result<()> {
         let mut inbound = self.inbound_rx.take().expect("run 只能调用一次");
         let mut rulings = self.ruling_rx.take().expect("run 只能调用一次");
         let mut plans = self.plan_rx.take().expect("run 只能调用一次");
+        let mut models = self.models_rx.take().expect("run 只能调用一次");
 
         self.maybe_start_plan();
         let mut next = Instant::now() + self.period();
@@ -353,6 +373,7 @@ impl App {
                 }
                 Some(r) = rulings.recv() => self.on_ruling(r),
                 Some(ai) = plans.recv() => self.on_ai(ai),
+                Some(m) = models.recv() => self.on_models(m),
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         break;
@@ -1405,15 +1426,22 @@ impl App {
                 api_key,
                 base_url,
                 model,
+                layer_models,
             } => self.control(conn_id, role, "set_llm_config", |app| {
-                app.apply_llm_config(api_key, base_url, model);
+                app.apply_llm_config(api_key, base_url, model, layer_models);
                 // 配完立刻把新的「配没配 / 什么模型」推给控制端，表单才能回显。
                 app.push_server_info();
                 Some(json!({
                     "llm_configured": app.llm_config.has_key(),
                     "base_url": app.llm_config.base_url,
                     "model": app.llm_config.model,
+                    "models": app.layer_models.to_json(),
                 }))
+            }),
+            M::ListModels => self.control(conn_id, role, "list_models", |app| {
+                // 真去问上游，但走后台任务：网络慢不能把世界卡住。
+                app.spawn_list_models(conn_id);
+                Some(json!({ "pending": true }))
             }),
             M::AiQuery => self.control(conn_id, role, "ai_query", |app| {
                 let state = app.ai_state();
@@ -1449,11 +1477,14 @@ impl App {
     ///
     /// `None` = 这一项不动；`api_key` 传空串 = 清除 Key（连带把大脑开关落下）。
     /// Key 只进数据库，不下发、不写日志。
+    ///
+    /// `layer_models` 只覆盖传进来的那几层，值传空串 = 该层回退到全局模型。
     fn apply_llm_config(
         &mut self,
         api_key: Option<String>,
         base_url: Option<String>,
         model: Option<String>,
+        layer_models: Option<std::collections::BTreeMap<String, String>>,
     ) {
         if let Some(k) = api_key {
             self.llm_config.api_key = k.trim().to_string();
@@ -1473,6 +1504,16 @@ impl App {
             } else {
                 m.to_string()
             };
+        }
+        if let Some(map) = layer_models {
+            for (key, value) in map {
+                // `LayerModels::set` 会把空串当 None —— 正好是「这层回退全局」。
+                match LayerKey::from_key(key.trim()) {
+                    Some(layer) => self.layer_models.set(layer, Some(value)),
+                    // 认不出来的层名直接忽略：控制台名字改了不至于把整份配置打回去。
+                    None => tracing::warn!(key = %key, "分层模型：认不出的层名，已忽略"),
+                }
+            }
         }
 
         // 重建客户端：三层大脑与任务判定共用同一份配置，按层挑模型。
@@ -1510,6 +1551,49 @@ impl App {
             .store
             .set_meta("llm_base_url", &self.llm_config.base_url);
         let _ = self.store.set_meta("llm_model", &self.llm_config.model);
+        // 分层模型也要落库，否则控制台选好的模型一重启就回退。
+        if let Ok(json) = serde_json::to_string(&self.layer_models.to_json()) {
+            let _ = self.store.set_meta("llm_layer_models", &json);
+        }
+    }
+
+    /// 后台去问上游有哪些模型，结果从 `models_tx` 回到主循环。
+    ///
+    /// **不在主循环里 await**：上游慢（或不通）时世界照跑。
+    fn spawn_list_models(&mut self, conn_id: ConnId) {
+        let cfg = self.llm_config.clone();
+        let tx = self.models_tx.clone();
+        tokio::spawn(async move {
+            let outcome = match LlmClient::metadata_only(cfg) {
+                Ok(client) => client.list_models().await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(ModelListing { conn_id, outcome });
+        });
+    }
+
+    /// 把模型清单（或失败原因）回给点名要它的那条连接。
+    fn on_models(&mut self, listing: ModelListing) {
+        let payload = match listing.outcome {
+            Ok(models) => json!({
+                "ok": true,
+                "count": models.len(),
+                "models": models,
+                // 顺带把「现在三层各用什么」带回去，下拉框可以直接回显。
+                "current": {
+                    "global": self.llm_config.model,
+                    "layers": self.layer_models.to_json(),
+                },
+            }),
+            Err(message) => json!({
+                "ok": false,
+                "count": 0,
+                "models": [],
+                "message": message,
+            }),
+        };
+        self.hub
+            .send_to(listing.conn_id, &Envelope::new("ai_models", payload));
     }
 
     /// 把当前模拟骑手名单落库，重启后接着用。
@@ -2083,6 +2167,16 @@ fn load_llm_config(store: &Store) -> Option<LlmConfig> {
     Some(cfg)
 }
 
+/// 从库里读回控制台存过的分层模型。
+///
+/// 只要库里**存过这一项**就认（哪怕是空对象）——那代表人在控制台上
+/// 明确设定过的状态，不该被环境变量覆盖回去。
+fn load_layer_models(store: &Store) -> Option<LayerModels> {
+    let raw = store.meta("llm_layer_models").ok().flatten()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some(LayerModels::from_json(&value))
+}
+
 /// 从库里读回骑手名单。解析失败就当没存过。
 fn load_rider_names(store: &Store) -> Option<Vec<String>> {
     let raw = store.meta("rider_names").ok().flatten()?;
@@ -2525,6 +2619,7 @@ mod tests {
                 api_key: Some("sk-secret-value".into()),
                 base_url: Some("https://api.deepseek.com/v1".into()),
                 model: Some("deepseek-chat".into()),
+                layer_models: None,
             },
         );
 
@@ -2550,12 +2645,111 @@ mod tests {
                 api_key: Some(String::new()),
                 base_url: None,
                 model: None,
+                layer_models: None,
             },
         );
         assert!(!app.llm_config.has_key());
         assert!(!app.llm_enabled());
         assert!(!app.brain.is_enabled());
         assert!(!app.world.cfg.llm_brain_enabled);
+    }
+
+    #[test]
+    fn console_can_set_per_layer_models_and_clear_them() {
+        use std::collections::BTreeMap;
+
+        let mut app = control_app();
+        let (mut ctrl, _) = hello(&mut app, 1, None);
+        drain(&mut ctrl);
+
+        let mut layers = BTreeMap::new();
+        layers.insert("rider".to_string(), "gpt-4o-mini".to_string());
+        layers.insert("director".to_string(), "gpt-4o".to_string());
+        layers.insert("station".to_string(), "   ".to_string()); // 空白 = 回退全局
+        layers.insert("查无此层".to_string(), "x".to_string()); // 认不出的层名忽略
+
+        send(
+            &mut app,
+            1,
+            ClientMessage::SetLlmConfig {
+                api_key: Some("sk-test".into()),
+                base_url: Some("https://api.deepseek.com/v1".into()),
+                model: Some("deepseek-chat".into()),
+                layer_models: Some(layers),
+            },
+        );
+
+        // 分层真的落到了各层大脑头上。
+        assert_eq!(
+            app.llm_config
+                .for_layer(&app.layer_models, LayerKey::Rider)
+                .model,
+            "gpt-4o-mini"
+        );
+        assert_eq!(
+            app.llm_config
+                .for_layer(&app.layer_models, LayerKey::Director)
+                .model,
+            "gpt-4o"
+        );
+        assert_eq!(
+            app.llm_config
+                .for_layer(&app.layer_models, LayerKey::Station)
+                .model,
+            "deepseek-chat",
+            "空白层要回退全局模型"
+        );
+
+        // 回执里带上当前分层，控制台才能回显；空白层不该出现。
+        let v = drain(&mut ctrl);
+        let echoed = &ack(&v)["payload"]["data"]["models"];
+        assert_eq!(echoed["rider"].as_str(), Some("gpt-4o-mini"));
+        assert_eq!(echoed["director"].as_str(), Some("gpt-4o"));
+        assert!(
+            echoed.get("station").is_none(),
+            "空白层不该被记成配过：{echoed}"
+        );
+
+        // 再发空串 = 这一层退回全局，且不该动到别的层。
+        let mut clear = BTreeMap::new();
+        clear.insert("rider".to_string(), String::new());
+        send(
+            &mut app,
+            1,
+            ClientMessage::SetLlmConfig {
+                api_key: None,
+                base_url: None,
+                model: None,
+                layer_models: Some(clear),
+            },
+        );
+        assert_eq!(
+            app.llm_config
+                .for_layer(&app.layer_models, LayerKey::Rider)
+                .model,
+            "deepseek-chat"
+        );
+        assert_eq!(
+            app.llm_config
+                .for_layer(&app.layer_models, LayerKey::Director)
+                .model,
+            "gpt-4o",
+            "清一层不该动到别的层"
+        );
+    }
+
+    #[test]
+    fn layer_models_survive_a_restart() {
+        let store = Store::in_memory().unwrap();
+        let mut saved = LayerModels::default();
+        saved.set(LayerKey::Rider, Some("gpt-4o-mini".into()));
+        store
+            .set_meta("llm_layer_models", &saved.to_json().to_string())
+            .unwrap();
+
+        let back = load_layer_models(&store).expect("存过就该读得回来");
+        assert_eq!(back.get(LayerKey::Rider), Some("gpt-4o-mini"));
+        assert_eq!(back.get(LayerKey::Station), None);
     }
 
     #[test]

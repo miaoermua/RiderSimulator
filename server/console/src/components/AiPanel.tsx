@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   Alert,
   App as AntApp,
@@ -17,7 +17,7 @@ import {
   Typography,
 } from "antd";
 import { useIsControl, useStore } from "../hooks";
-import type { AiLayerState, HostMode } from "../protocol";
+import { SOURCE_LABEL, type AiLayerState, type HostMode } from "../protocol";
 import { store, yuan, type AiDecisionEntry } from "../store";
 
 /** 三层的中文名。`layer` 是协议里的机器名，界面上不该出现。 */
@@ -55,11 +55,17 @@ export function AiPanel() {
   const ai = useStore((s) => s.ai);
   const decisions = useStore((s) => s.decisions);
   const isControl = useIsControl();
+  /** 决策流的筛选：只看 LLM / 只看算法，用来把两种决策分开看。 */
+  const [scope, setScope] = useState<"all" | "llm" | "algo">("all");
 
   // 打开面板主动拉一份最新状态；随后 server_info / ai_state 会自动续上。
   useEffect(() => {
     store.queryAi();
   }, []);
+
+  const shown = decisions.filter((d) =>
+    scope === "llm" ? d.llm : scope === "algo" ? !d.llm : true,
+  );
 
   if (!ai) {
     return <Empty style={{ marginTop: 48 }} description="等待 AI 状态…" />;
@@ -177,13 +183,36 @@ export function AiPanel() {
         </Descriptions>
       </Card>
 
-      <Card size="small" title="决策流" style={{ marginBottom: 12 }}>
-        {decisions.length === 0 ? (
-          <Typography.Text type="secondary">还没有 AI 决策（没配 Key 或还没到间隔）。</Typography.Text>
+      <Card
+        size="small"
+        title="决策流"
+        style={{ marginBottom: 12 }}
+        extra={
+          <Segmented
+            size="small"
+            value={scope}
+            onChange={(v) => setScope(v as typeof scope)}
+            options={[
+              { label: `全部 ${decisions.length}`, value: "all" },
+              { label: "仅 LLM", value: "llm" },
+              { label: "仅算法", value: "algo" },
+            ]}
+          />
+        }
+      >
+        <Typography.Text type="secondary" style={{ display: "block", marginBottom: 8 }}>
+          蓝色标签 = 真问过模型（含缓存命中）；灰色 = 纯算法（兜底 / 超时救单 / 人工指派）。
+        </Typography.Text>
+        {shown.length === 0 ? (
+          <Typography.Text type="secondary">
+            {decisions.length === 0
+              ? "还没有决策（没配 Key、没到间隔，或全是纯算法批量派单）。"
+              : "当前筛选下没有决策。"}
+          </Typography.Text>
         ) : (
           <Timeline
-            items={decisions.map((d) => ({
-              color: LAYER_COLOR[d.layer] ?? "gray",
+            items={shown.map((d) => ({
+              color: d.llm ? "blue" : "gray",
               children: <DecisionItem entry={d} />,
             }))}
           />
@@ -237,6 +266,10 @@ function DecisionItem({ entry }: { entry: AiDecisionEntry }) {
   return (
     <Space direction="vertical" size={2} style={{ width: "100%" }}>
       <Space size={6} wrap>
+        {/* 来源标签放最前：一眼分清「真问过模型」和「纯算法兜底」。 */}
+        <Tag color={entry.llm ? "geekblue" : "default"}>
+          {SOURCE_LABEL[entry.source] ?? entry.source}
+        </Tag>
         <Tag color={LAYER_COLOR[entry.layer] ?? "default"}>
           {LAYER_LABEL[entry.layer] ?? entry.layer}
         </Tag>
