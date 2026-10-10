@@ -4,25 +4,51 @@ import '../game_client.dart';
 import '../game_state.dart';
 import '../protocol.dart';
 
-/// 订单卡片。大厅里显示「抢单」，我的单里显示阶段按钮。
+/// 订单卡的形态：决定底部操作区画什么。
+enum OrderCardMode {
+  /// 大厅待抢：抢单按钮 + 抢单倒计时条。
+  hall,
+
+  /// 待取货：到店 / 催单。
+  pickup,
+
+  /// 待送达：送达 / 催单。
+  delivery,
+
+  /// 指派单确认：拒绝 / 接受。
+  assign,
+}
+
+/// 订单卡片。
+///
+/// 四个形态共用同一套信息区（报酬、距离、时限、备注、地址），
+/// 只有底部操作区不同——这是众包骑手端订单卡的通行做法：
+/// 卡片是决策信息面板，按钮才是状态机。
 class OrderCard extends StatelessWidget {
   const OrderCard({
     super.key,
     required this.order,
     required this.state,
     required this.client,
-    this.mine = false,
+    this.mode = OrderCardMode.hall,
+    this.onAccept,
+    this.onReject,
   });
 
   final OrderView order;
   final GameState state;
   final GameClient client;
-  final bool mine;
+  final OrderCardMode mode;
+
+  /// 仅 [OrderCardMode.assign] 用。
+  final VoidCallback? onAccept;
+  final VoidCallback? onReject;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final expired = !mine && state.claimRemainingMs(order) <= 0;
+    final expired =
+        mode == OrderCardMode.hall && state.claimRemainingMs(order) <= 0;
 
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -43,6 +69,10 @@ class OrderCard extends StatelessWidget {
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
+                if (mode == OrderCardMode.assign || order.forced) ...[
+                  const _Chip(text: '平台指派', color: Colors.redAccent),
+                  const SizedBox(width: 6),
+                ],
                 _TierChip(tier: order.tier),
                 if (order.backOrder) ...[
                   const SizedBox(width: 6),
@@ -72,12 +102,13 @@ class OrderCard extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
               ),
             ],
-            const SizedBox(height: 4),
-            Text(
-              '送：${order.customerAddress.isEmpty ? order.customerName : order.customerAddress}',
-              style: theme.textTheme.bodySmall,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
+            const SizedBox(height: 6),
+            _Leg(
+              icon: Icons.location_on_outlined,
+              label: '送',
+              text: order.customerAddress.isEmpty
+                  ? order.customerName
+                  : '${order.customerName} · ${order.customerAddress}',
             ),
             const Divider(height: 20),
             Row(
@@ -101,18 +132,21 @@ class OrderCard extends StatelessWidget {
                   ],
                 ),
                 const Spacer(),
-                if (!mine)
-                  _HallActions(
-                    order: order,
-                    state: state,
-                    client: client,
-                    expired: expired,
-                  )
-                else
-                  _MineActions(order: order, client: client),
+                _Actions(
+                  order: order,
+                  state: state,
+                  client: client,
+                  mode: mode,
+                  expired: expired,
+                  onAccept: onAccept,
+                  onReject: onReject,
+                ),
               ],
             ),
-            if (!mine) _CountdownBar(order: order, state: state, expired: expired),
+            if (mode == OrderCardMode.hall)
+              _CountdownBar(order: order, state: state, expired: expired),
+            if (mode == OrderCardMode.assign)
+              _AssignBar(state: state),
           ],
         ),
       ),
@@ -120,45 +154,40 @@ class OrderCard extends StatelessWidget {
   }
 }
 
-class _HallActions extends StatelessWidget {
-  const _HallActions({
+class _Actions extends StatelessWidget {
+  const _Actions({
     required this.order,
     required this.state,
     required this.client,
+    required this.mode,
     required this.expired,
+    required this.onAccept,
+    required this.onReject,
   });
 
   final OrderView order;
   final GameState state;
   final GameClient client;
+  final OrderCardMode mode;
   final bool expired;
+  final VoidCallback? onAccept;
+  final VoidCallback? onReject;
 
   @override
   Widget build(BuildContext context) {
-    if (!state.isRider) {
-      return const Text('观战', style: TextStyle(color: Colors.grey));
-    }
-    return FilledButton.icon(
-      onPressed: expired ? null : () => client.claim(order.id),
-      icon: const Icon(Icons.pan_tool_alt, size: 18),
-      label: const Text('抢单'),
-    );
-  }
-}
+    switch (mode) {
+      case OrderCardMode.hall:
+        if (!state.isRider) {
+          return const Text('观战', style: TextStyle(color: Colors.grey));
+        }
+        return FilledButton.icon(
+          onPressed: expired ? null : () => client.claim(order.id),
+          icon: const Icon(Icons.pan_tool_alt, size: 18),
+          label: const Text('抢单'),
+        );
 
-class _MineActions extends StatelessWidget {
-  const _MineActions({
-    required this.order,
-    required this.client,
-  });
-
-  final OrderView order;
-  final GameClient client;
-
-  @override
-  Widget build(BuildContext context) {
-    return switch (order.status) {
-      OrderStatus.assigned => Wrap(
+      case OrderCardMode.pickup:
+        return Wrap(
           spacing: 8,
           children: [
             OutlinedButton(
@@ -170,8 +199,10 @@ class _MineActions extends StatelessWidget {
               child: const Text('到店'),
             ),
           ],
-        ),
-      OrderStatus.pickedUp => Wrap(
+        );
+
+      case OrderCardMode.delivery:
+        return Wrap(
           spacing: 8,
           children: [
             OutlinedButton(
@@ -184,9 +215,57 @@ class _MineActions extends StatelessWidget {
               label: const Text('送达'),
             ),
           ],
+        );
+
+      case OrderCardMode.assign:
+        return Wrap(
+          spacing: 8,
+          children: [
+            OutlinedButton(
+              onPressed: onReject,
+              child: const Text('拒绝'),
+            ),
+            FilledButton(
+              onPressed: onAccept,
+              child: const Text('接受'),
+            ),
+          ],
+        );
+    }
+  }
+}
+
+/// 一行「标签 + 内容」，用来放配送地址。
+class _Leg extends StatelessWidget {
+  const _Leg({required this.icon, required this.label, required this.text});
+
+  final IconData icon;
+  final String label;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 15, color: Colors.grey.shade600),
+        const SizedBox(width: 4),
+        Text(
+          label,
+          style: theme.textTheme.labelSmall?.copyWith(color: Colors.grey),
         ),
-      _ => const SizedBox.shrink(),
-    };
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            text,
+            style: theme.textTheme.bodySmall,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    );
   }
 }
 
@@ -206,7 +285,7 @@ class _CountdownBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final total = (order.claimDeadlineMin - order.createdAtMin).clamp(1, 1 << 30);
     final remainMs = state.claimRemainingMs(order);
-    final remainSec = (remainMs / 1000).clamp(0, 1 << 30);
+    final remainSec = ((remainMs + 999) ~/ 1000).clamp(0, 1 << 30);
     final frac = ((remainMs / 1000) / total).clamp(0.0, 1.0);
     final color = expired
         ? Colors.grey
@@ -216,6 +295,49 @@ class _CountdownBar extends StatelessWidget {
                 ? Colors.orange
                 : Colors.green;
 
+    return _Bar(
+      frac: frac,
+      color: color,
+      trailing: expired ? '已截止' : '${remainSec}s',
+    );
+  }
+}
+
+/// 指派单确认倒计时条。玩法设计 §4.3：30 秒内不确认则自动拒绝。
+class _AssignBar extends StatelessWidget {
+  const _AssignBar({required this.state});
+
+  final GameState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final ms = state.assignRemainingMs;
+    final sec = ((ms + 999) ~/ 1000).clamp(0, 1 << 30);
+    final frac = (ms / GameState.assignWindow.inMilliseconds).clamp(0.0, 1.0);
+    // 30 秒的窗口，最后 5 秒才转红。
+    final color = sec <= 5 ? Colors.red : Colors.deepOrange;
+
+    return _Bar(
+      frac: frac,
+      color: color,
+      trailing: sec == 0 ? '已超时，尽快处理' : '${sec}s 内确认',
+    );
+  }
+}
+
+class _Bar extends StatelessWidget {
+  const _Bar({
+    required this.frac,
+    required this.color,
+    required this.trailing,
+  });
+
+  final double frac;
+  final Color color;
+  final String trailing;
+
+  @override
+  Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: Row(
@@ -233,7 +355,7 @@ class _CountdownBar extends StatelessWidget {
           ),
           const SizedBox(width: 8),
           Text(
-            expired ? '已截止' : '${remainSec}s',
+            trailing,
             style: TextStyle(color: color, fontWeight: FontWeight.w600),
           ),
         ],

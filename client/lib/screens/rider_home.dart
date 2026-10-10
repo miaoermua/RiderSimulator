@@ -6,8 +6,16 @@ import '../game_client.dart';
 import '../game_state.dart';
 import '../protocol.dart';
 import '../widgets/order_card.dart';
+import '../widgets/rider_drawer.dart';
+import '../widgets/task_sheet.dart';
+import 'assign_order_page.dart';
+import 'notifications_page.dart';
+import 'running_settings_sheet.dart';
 
-/// 骑手主界面：大厅 / 我的单 / 战报。
+/// 骑手端主界面。
+///
+/// 版式走众包骑手端的通行骨架：
+/// 顶栏（折叠菜单 + 时钟 + 通知）/ 状态条 / 待抢·待取·待送 / 底栏（跑单设置 + 刷新）。
 class RiderHomePage extends StatefulWidget {
   const RiderHomePage({super.key, required this.state, required this.client});
 
@@ -21,9 +29,13 @@ class RiderHomePage extends StatefulWidget {
 class _RiderHomePageState extends State<RiderHomePage> {
   Timer? _ticker;
 
+  /// 已经为哪一张指派单弹过确认界面——同一张不重复弹。
+  int? _poppedFor;
+
   @override
   void initState() {
     super.initState();
+    widget.state.addListener(_onState);
     // 每秒重绘一次，让倒计时 / 时钟走字。
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
@@ -32,8 +44,34 @@ class _RiderHomePageState extends State<RiderHomePage> {
 
   @override
   void dispose() {
+    widget.state.removeListener(_onState);
     _ticker?.cancel();
     super.dispose();
+  }
+
+  /// 收到系统指派就弹确认界面。导航不能放在 build 里，推到下一帧。
+  void _onState() {
+    final id = widget.state.assignOrderId;
+    if (id == null) {
+      _poppedFor = null;
+      return;
+    }
+    if (_poppedFor == id) return;
+    _poppedFor = id;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || widget.state.assignOrderId != id) return;
+      showAssignOrderPage(context, state: widget.state, client: widget.client);
+    });
+  }
+
+  Future<void> _refresh() async {
+    widget.client.resync();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        const SnackBar(content: Text('已请求刷新'), duration: Duration(seconds: 1)),
+      );
   }
 
   @override
@@ -42,50 +80,69 @@ class _RiderHomePageState extends State<RiderHomePage> {
     return AnimatedBuilder(
       animation: state,
       builder: (context, _) {
+        final hall = state.hall;
+        final pickup = state.pendingPickup;
+        final delivery = state.pendingDelivery;
         return DefaultTabController(
           length: 3,
           child: Scaffold(
+            drawer: RiderDrawer(state: state, client: widget.client),
             appBar: AppBar(
               title: _Title(state: state),
-              actions: [
-                IconButton(
-                  tooltip: '重新同步',
-                  onPressed: widget.client.resync,
-                  icon: const Icon(Icons.sync),
-                ),
-                IconButton(
-                  tooltip: '重连',
-                  onPressed: widget.client.reconnect,
-                  icon: const Icon(Icons.wifi_protected_setup),
-                ),
-              ],
-              bottom: const TabBar(
-                tabs: [
-                  Tab(text: '大厅'),
-                  Tab(text: '我的单'),
-                  Tab(text: '战报'),
-                ],
-              ),
+              actions: [_BellButton(state: state)],
             ),
             body: Column(
               children: [
-                _StatusHeader(state: state, client: widget.client),
+                _StatusStrip(state: state, client: widget.client),
+                TabBar(
+                  dividerColor: Colors.black12,
+                  tabs: [
+                    Tab(text: _tabLabel('待抢', hall.length)),
+                    Tab(text: _tabLabel('待取', pickup.length)),
+                    Tab(text: _tabLabel('待送', delivery.length)),
+                  ],
+                ),
                 Expanded(
                   child: TabBarView(
                     children: [
-                      _HallTab(state: state, client: widget.client),
-                      _MyOrdersTab(state: state, client: widget.client),
-                      _LedgerTab(state: state),
+                      _OrderList(
+                        orders: hall,
+                        mode: OrderCardMode.hall,
+                        state: state,
+                        client: widget.client,
+                        empty: '大厅暂时没单，下拉刷新试试。',
+                      ),
+                      _OrderList(
+                        orders: pickup,
+                        mode: OrderCardMode.pickup,
+                        state: state,
+                        client: widget.client,
+                        empty: '没有待取的单。去大厅抢一单吧。',
+                      ),
+                      _OrderList(
+                        orders: delivery,
+                        mode: OrderCardMode.delivery,
+                        state: state,
+                        client: widget.client,
+                        empty: '没有待送的单。',
+                      ),
                     ],
                   ),
                 ),
               ],
+            ),
+            bottomNavigationBar: _BottomTools(
+              state: state,
+              client: widget.client,
+              onRefresh: _refresh,
             ),
           ),
         );
       },
     );
   }
+
+  static String _tabLabel(String name, int n) => n == 0 ? name : '$name $n';
 }
 
 class _Title extends StatelessWidget {
@@ -119,9 +176,35 @@ class _Title extends StatelessWidget {
   }
 }
 
-/// 顶部骑手状态条。
-class _StatusHeader extends StatelessWidget {
-  const _StatusHeader({required this.state, required this.client});
+/// 顶栏通知铃铛，未读数是小红点。
+class _BellButton extends StatelessWidget {
+  const _BellButton({required this.state});
+
+  final GameState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final n = state.unreadLogs;
+    return IconButton(
+      tooltip: '通知消息',
+      onPressed: () => Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(
+          builder: (_) => NotificationsPage(state: state),
+        ),
+      ),
+      icon: n == 0
+          ? const Icon(Icons.notifications_none)
+          : Badge(label: Text('$n'), child: const Icon(Icons.notifications_none)),
+    );
+  }
+}
+
+/// 常驻状态条：出勤、模式、今日收入。
+///
+/// 竞品调研第一条结论就是「状态条必须常驻顶部」——骑手要随时确认
+/// 自己是否在线、什么模式，否则接不到单都不知道为什么。
+class _StatusStrip extends StatelessWidget {
+  const _StatusStrip({required this.state, required this.client});
 
   final GameState state;
   final GameClient client;
@@ -133,87 +216,58 @@ class _StatusHeader extends StatelessWidget {
       return Container(
         width: double.infinity,
         color: Colors.black12,
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         child: const Text('观战中：你看到的是公开信息，无法抢单。'),
       );
     }
-
+    final online = me.online;
     return Container(
       width: double.infinity,
-      color: Colors.black12,
-      padding: const EdgeInsets.fromLTRB(14, 10, 14, 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      color: online ? Colors.green.withOpacity(0.10) : Colors.black12,
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+      child: Row(
         children: [
-          Row(
-            children: [
-              Text(
-                '${me.name} · Lv${me.level}',
-                style: Theme.of(context)
-                    .textTheme
-                    .titleMedium
-                    ?.copyWith(fontWeight: FontWeight.bold),
+          InkWell(
+            borderRadius: BorderRadius.circular(14),
+            onTap: () => client.setOnline(!online),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: online ? Colors.green : Colors.grey,
+                borderRadius: BorderRadius.circular(14),
               ),
-              const SizedBox(width: 8),
-              Text('★ ${me.rating.toStringAsFixed(2)}'),
-              const Spacer(),
-              Switch(
-                value: me.online,
-                onChanged: (v) => client.setOnline(v),
-              ),
-              Text(me.online ? '在线' : '离线'),
-            ],
-          ),
-          const SizedBox(height: 4),
-          Row(
-            children: [
-              _Money(label: '今日到手', cents: me.takehomeCents),
-              _Money(label: '时薪', cents: me.hourlyWageCents),
-              _Money(label: '钱包', cents: me.cashCents),
-              if (me.frozen) const _Badge('冻结', Colors.red),
-              if (me.injured) const _Badge('受伤', Colors.orange),
-            ],
-          ),
-          const SizedBox(height: 6),
-          Row(
-            children: [
-              const Text('骑行模式：', style: TextStyle(fontSize: 12)),
-              const SizedBox(width: 6),
-              ...SpeedMode.values.map(
-                (m) => Padding(
-                  padding: const EdgeInsets.only(right: 6),
-                  child: ChoiceChip(
-                    label: Text(m.label, style: const TextStyle(fontSize: 12)),
-                    selected: me.speedMode == m,
-                    onSelected: (_) => client.setSpeedMode(m),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    online ? Icons.wifi_tethering : Icons.wifi_tethering_off,
+                    size: 14,
+                    color: Colors.white,
                   ),
-                ),
+                  const SizedBox(width: 4),
+                  Text(
+                    online ? '在线' : '离线',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
-        ],
-      ),
-    );
-  }
-}
-
-class _Money extends StatelessWidget {
-  const _Money({required this.label, required this.cents});
-
-  final String label;
-  final int? cents;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(right: 16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+          const SizedBox(width: 8),
           Text(
-            cents == null ? '--' : '¥${yuan(cents!)}',
-            style: const TextStyle(fontWeight: FontWeight.w600),
+            '${me.speedMode.label} · ${state.config.isPeak ? '高峰' : '平峰'}',
+            style: const TextStyle(fontSize: 12),
+          ),
+          const Spacer(),
+          if (me.frozen) const _Badge('冻结', Colors.red),
+          if (me.injured) const _Badge('受伤', Colors.orange),
+          Text(
+            '今日 ¥${yuan(me.takehomeCents ?? 0)} · ${me.completed} 单',
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
           ),
         ],
       ),
@@ -229,7 +283,7 @@ class _Badge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Container(
-        margin: const EdgeInsets.only(left: 6),
+        margin: const EdgeInsets.only(right: 6),
         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
         decoration: BoxDecoration(
           color: color.withOpacity(0.15),
@@ -239,165 +293,68 @@ class _Badge extends StatelessWidget {
       );
 }
 
-class _HallTab extends StatelessWidget {
-  const _HallTab({required this.state, required this.client});
-
-  final GameState state;
-  final GameClient client;
-
-  @override
-  Widget build(BuildContext context) {
-    if (state.hall.isEmpty) {
-      return const _Empty('大厅暂时没单，等等看。');
-    }
-    return ListView.builder(
-      itemCount: state.hall.length,
-      itemBuilder: (context, i) => OrderCard(
-        order: state.hall[i],
-        state: state,
-        client: client,
-      ),
-    );
-  }
-}
-
-class _MyOrdersTab extends StatelessWidget {
-  const _MyOrdersTab({required this.state, required this.client});
-
-  final GameState state;
-  final GameClient client;
-
-  @override
-  Widget build(BuildContext context) {
-    final orders = state.myOrders;
-    if (orders.isEmpty) {
-      return const _Empty('手上没单。去大厅抢一单吧。');
-    }
-    return ListView(
-      children: [
-        for (final o in orders) ...[
-          OrderCard(order: o, state: state, client: client, mine: true),
-          if (o.task != null)
-            Padding(
-              padding: const EdgeInsets.only(left: 12, right: 12, bottom: 8),
-              child: OutlinedButton.icon(
-                onPressed: () => _openTaskSheet(context, o),
-                icon: const Icon(Icons.chat_bubble_outline, size: 18),
-                label: Text('任务对话：${o.task!.name}'),
-              ),
-            ),
-        ],
-      ],
-    );
-  }
-
-  void _openTaskSheet(BuildContext context, OrderView order) {
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (_) => _TaskSheet(
-        orderId: order.id,
-        taskName: order.task?.name ?? '附加任务',
-        state: state,
-        client: client,
-      ),
-    );
-  }
-}
-
-class _TaskSheet extends StatefulWidget {
-  const _TaskSheet({
-    required this.orderId,
-    required this.taskName,
+/// 一页订单列表。三个 tab 共用，只有 [mode] 不同。
+class _OrderList extends StatelessWidget {
+  const _OrderList({
+    required this.orders,
+    required this.mode,
     required this.state,
     required this.client,
+    required this.empty,
   });
 
-  final int orderId;
-  final String taskName;
+  final List<OrderView> orders;
+  final OrderCardMode mode;
   final GameState state;
   final GameClient client;
-
-  @override
-  State<_TaskSheet> createState() => _TaskSheetState();
-}
-
-class _TaskSheetState extends State<_TaskSheet> {
-  final _input = TextEditingController();
-
-  @override
-  void dispose() {
-    _input.dispose();
-    super.dispose();
-  }
-
-  void _send() {
-    final text = _input.text.trim();
-    if (text.isEmpty) return;
-    widget.client.sendTaskMessage(widget.orderId, text);
-    _input.clear();
-  }
+  final String empty;
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: EdgeInsets.only(
-        bottom: MediaQuery.of(context).viewInsets.bottom,
-      ),
-      child: AnimatedBuilder(
-        animation: widget.state,
-        builder: (context, _) {
-          final List<TaskLine> lines =
-              widget.state.taskLines[widget.orderId] ?? const [];
-          return SizedBox(
-            height: MediaQuery.of(context).size.height * 0.5,
-            child: Column(
-              children: [
-                Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Text(
-                    widget.taskName,
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
-                ),
-                const Divider(height: 1),
-                Expanded(
-                  child: lines.isEmpty
-                      ? const _Empty('发一句话开始任务对话，例如「放门口吧」。')
-                      : ListView.builder(
-                          padding: const EdgeInsets.all(12),
-                          itemCount: lines.length,
-                          itemBuilder: (context, i) => _Bubble(line: lines[i]),
-                        ),
-                ),
-                SafeArea(
-                  child: Padding(
-                    padding: const EdgeInsets.all(8),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: _input,
-                            textInputAction: TextInputAction.send,
-                            onSubmitted: (_) => _send(),
-                            decoration: const InputDecoration(
-                              hintText: '对顾客说点什么…',
-                              border: OutlineInputBorder(),
-                              isDense: true,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        IconButton.filled(
-                          onPressed: _send,
-                          icon: const Icon(Icons.send),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
+    if (orders.isEmpty) {
+      return RefreshIndicator(
+        onRefresh: () async {
+          client.resync();
+        },
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          children: [
+            const SizedBox(height: 140),
+            Center(
+              child: Text(empty, style: const TextStyle(color: Colors.grey)),
             ),
+          ],
+        ),
+      );
+    }
+    return RefreshIndicator(
+      onRefresh: () async {
+        client.resync();
+      },
+      child: ListView.builder(
+        physics: const AlwaysScrollableScrollPhysics(),
+        itemCount: orders.length,
+        itemBuilder: (context, i) {
+          final o = orders[i];
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              OrderCard(order: o, state: state, client: client, mode: mode),
+              if (mode != OrderCardMode.hall && o.task != null)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                  child: OutlinedButton.icon(
+                    onPressed: () => showTaskSheet(
+                      context,
+                      order: o,
+                      state: state,
+                      client: client,
+                    ),
+                    icon: const Icon(Icons.chat_bubble_outline, size: 18),
+                    label: Text('任务对话：${o.task!.name}'),
+                  ),
+                ),
+            ],
           );
         },
       ),
@@ -405,127 +362,43 @@ class _TaskSheetState extends State<_TaskSheet> {
   }
 }
 
-class _Bubble extends StatelessWidget {
-  const _Bubble({required this.line});
+/// 底部工具栏：跑单设置 + 刷新。
+class _BottomTools extends StatelessWidget {
+  const _BottomTools({
+    required this.state,
+    required this.client,
+    required this.onRefresh,
+  });
 
-  final TaskLine line;
+  final GameState state;
+  final GameClient client;
+  final Future<void> Function() onRefresh;
 
   @override
   Widget build(BuildContext context) {
-    final align = line.isMe ? Alignment.centerRight : Alignment.centerLeft;
-    final color = switch (line.from) {
-      'rider' => Colors.green.shade100,
-      'system' => Colors.blueGrey.shade100,
-      _ => Colors.grey.shade200,
-    };
-    final who = switch (line.from) {
-      'rider' => '我',
-      'system' => '系统',
-      _ => '顾客',
-    };
-    return Align(
-      alignment: align,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 3),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        constraints: const BoxConstraints(maxWidth: 280),
-        decoration: BoxDecoration(
-          color: color,
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Text('$who：${line.text}'),
+    return BottomAppBar(
+      height: 56,
+      padding: EdgeInsets.zero,
+      child: Row(
+        children: [
+          Expanded(
+            child: TextButton.icon(
+              onPressed: () =>
+                  showRunningSettings(context, state: state, client: client),
+              icon: const Icon(Icons.tune),
+              label: const Text('跑单设置'),
+            ),
+          ),
+          Container(width: 1, height: 24, color: Colors.black12),
+          Expanded(
+            child: TextButton.icon(
+              onPressed: onRefresh,
+              icon: const Icon(Icons.refresh),
+              label: const Text('刷新'),
+            ),
+          ),
+        ],
       ),
     );
   }
-}
-
-class _LedgerTab extends StatelessWidget {
-  const _LedgerTab({required this.state});
-
-  final GameState state;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListView(
-      children: [
-        if (state.ledgers.isNotEmpty) ...[
-          const _SectionTitle('昨日结算'),
-          for (final l in state.ledgers)
-            ListTile(
-              dense: true,
-              title: Text('${l.name}（${l.key}）'),
-              subtitle: Text(
-                '${l.completed} 单 · 超时 ${l.lateCount} · 在线 ${l.onlineMinutes} 分钟',
-              ),
-              trailing: Text(
-                '¥${yuan(l.takehomeCents)}',
-                style: const TextStyle(fontWeight: FontWeight.bold),
-              ),
-            ),
-        ],
-        const _SectionTitle('动态'),
-        if (state.logs.isEmpty)
-          const _Empty('还没有动态。')
-        else
-          for (final line in state.logs)
-            ListTile(
-              dense: true,
-              leading: Icon(_iconFor(line.kind), size: 18, color: _colorFor(line.kind)),
-              title: Text(line.text),
-              subtitle: Text(
-                clockLabel(line.at.hour * 60 + line.at.minute),
-                style: const TextStyle(fontSize: 11),
-              ),
-            ),
-      ],
-    );
-  }
-
-  IconData _iconFor(LogKind k) => switch (k) {
-        LogKind.good => Icons.check_circle_outline,
-        LogKind.bad => Icons.error_outline,
-        LogKind.money => Icons.paid_outlined,
-        LogKind.chat => Icons.chat_bubble_outline,
-        LogKind.info => Icons.info_outline,
-      };
-
-  Color _colorFor(LogKind k) => switch (k) {
-        LogKind.good => Colors.green,
-        LogKind.bad => Colors.red,
-        LogKind.money => Colors.teal,
-        LogKind.chat => Colors.indigo,
-        LogKind.info => Colors.grey,
-      };
-}
-
-class _SectionTitle extends StatelessWidget {
-  const _SectionTitle(this.text);
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.fromLTRB(14, 14, 14, 6),
-        child: Text(
-          text,
-          style: Theme.of(context)
-              .textTheme
-              .titleSmall
-              ?.copyWith(fontWeight: FontWeight.bold),
-        ),
-      );
-}
-
-class _Empty extends StatelessWidget {
-  const _Empty(this.text);
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) => Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Text(text, style: const TextStyle(color: Colors.grey)),
-        ),
-      );
 }

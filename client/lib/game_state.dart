@@ -86,11 +86,79 @@ class GameState extends ChangeNotifier {
       ..sort((a, b) => a.claimDeadlineMin.compareTo(b.claimDeadlineMin));
   }
 
+  /// 待取货：已接单、还没取餐（骑手阶段 = 去商家）。
+  List<OrderView> get pendingPickup =>
+      myOrders.where((o) => o.status == OrderStatus.assigned).toList();
+
+  /// 待送达：已取餐、正在配送（骑手阶段 = 去客户）。
+  List<OrderView> get pendingDelivery =>
+      myOrders.where((o) => o.status == OrderStatus.pickedUp).toList();
+
+  /// 按 id 找单，先大厅后手上。
+  OrderView? orderById(int id) {
+    for (final o in hall) {
+      if (o.id == id) return o;
+    }
+    for (final o in activeOrders) {
+      if (o.id == id) return o;
+    }
+    return null;
+  }
+
   /// 大厅里还剩多少毫秒可抢。负数表示已过期。
   int claimRemainingMs(OrderView o) =>
       (o.claimDeadlineMin - nowMinute) * (tickIntervalMs <= 0 ? 1000 : tickIntervalMs);
 
   bool get isRider => riderId != null;
+
+  // ---------------------------------------------------------------------
+  // 指派单（控制端强制指派）
+  // ---------------------------------------------------------------------
+
+  /// 待确认的指派单 id。非空时骑手端要弹出确认界面。
+  int? assignOrderId;
+  DateTime? _assignAt;
+
+  /// 确认窗口。玩法设计 §4.3：30 秒内不确认则自动拒绝。
+  ///
+  /// 按**真实秒**（挂钟）计，不随模拟时间倍率缩放——这是留给玩家反应的窗口。
+  static const assignWindow = Duration(seconds: 30);
+
+  /// 指派单还能犹豫多少毫秒。
+  int get assignRemainingMs {
+    final at = _assignAt;
+    if (at == null) return 0;
+    final left =
+        assignWindow.inMilliseconds - DateTime.now().difference(at).inMilliseconds;
+    return left < 0 ? 0 : left;
+  }
+
+  /// 待确认的指派单本体（可能还没同步到，见 [assignOrderId] 的兜底逻辑）。
+  OrderView? get assignOrder {
+    final id = assignOrderId;
+    return id == null ? null : orderById(id);
+  }
+
+  /// 关闭指派单确认界面（接受或拒绝之后都要调）。
+  void resolveAssign() {
+    if (assignOrderId == null && _assignAt == null) return;
+    assignOrderId = null;
+    _assignAt = null;
+    notifyListeners();
+  }
+
+  // ---------------------------------------------------------------------
+  // 通知
+  // ---------------------------------------------------------------------
+
+  /// 未读通知数，顶栏铃铛上的小红点。
+  int unreadLogs = 0;
+
+  void markLogsRead() {
+    if (unreadLogs == 0) return;
+    unreadLogs = 0;
+    notifyListeners();
+  }
 
   // ---------------------------------------------------------------------
   // 入口
@@ -104,6 +172,7 @@ class GameState extends ChangeNotifier {
   void note(String text, {LogKind kind = LogKind.info}) {
     logs.insert(0, LogLine(text, kind: kind));
     if (logs.length > 200) logs.removeLast();
+    unreadLogs++;
     notifyListeners();
   }
 
@@ -250,14 +319,20 @@ class GameState extends ChangeNotifier {
     final id = reqInt(p['order_id']);
     final by = optInt(p['rider_id']);
     final mine = by != null && by == riderId;
+    final forced = reqBool(p['forced']);
     final idx = hall.indexWhere((o) => o.id == id);
     if (idx >= 0) {
       final old = hall.removeAt(idx);
       activeOrders.add(_copyOrder(old, status: OrderStatus.assigned, assignedTo: by));
     }
+    // 系统塞的单要骑手当面确认，先弹界面再算数。
+    if (mine && forced) {
+      assignOrderId = id;
+      _assignAt = DateTime.now();
+    }
     note(
       mine
-          ? '抢到了：${reqStr(p['rider_name'], '你')} → ${yuan(reqInt(p['quoted_fee_cents']))} 元'
+          ? (forced ? '平台指派：${reqStr(p['rider_name'], '你')} 塞来一单' : '抢到了：${reqStr(p['rider_name'], '你')} → ${yuan(reqInt(p['quoted_fee_cents']))} 元')
           : '单 ${reqStr(p['rider_name'], '他人')} 抢走了',
       kind: mine ? LogKind.good : LogKind.info,
     );
@@ -308,6 +383,7 @@ class GameState extends ChangeNotifier {
   void _removeOrder(int id) {
     hall.removeWhere((o) => o.id == id);
     activeOrders.removeWhere((o) => o.id == id);
+    if (assignOrderId == id) resolveAssign();
   }
 
   // ---------------------------------------------------------------------
