@@ -297,6 +297,28 @@ fn no_order_ever_flows_away_in_a_full_day() {
     assert!(w.stats.orders_created > 0, "跑了一天居然一单没出");
 }
 
+/// 送达算法回归：跑完一整天，超时不能是常态。
+///
+/// 修复前承诺时限里既没有「骑手到店」那一段，也没把高峰出餐算进去，
+/// 跑一天几乎每一单都超时——顺手还把「背单全崩」的连坐罚款刷爆。
+/// 这里不要求每单都准时（超速罚款、事故停工、暴雨都是设计里该有的压力），
+/// 只要求别全军覆没。
+#[test]
+fn a_days_deliveries_are_not_all_late() {
+    let mut w = world(20261011);
+    for _ in 0..1_440u64 {
+        tick(&mut w, TickInput::default());
+    }
+    let delivered = w.stats.orders_delivered;
+    let late = w.stats.orders_late;
+    println!("一天：送达 {delivered} 单，超时 {late} 单");
+    assert!(delivered > 0, "跑了一天居然一单都没送到");
+    assert!(
+        late * 100 / delivered < 60,
+        "一天送到 {delivered} 单，其中超时 {late} 单——承诺时限又和实际行程脱节了"
+    );
+}
+
 /// 没人抢的单在重投用尽后被**强制指派给最近的骑手**，而不是流掉。
 ///
 /// 前半段把 AI 全停机（`HostMode::Off`）制造「全城没人接单」，让订单一路重投到顶；

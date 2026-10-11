@@ -6,8 +6,11 @@ use serde::Serialize;
 
 use super::{
     MINUTES_PER_DAY, OrderId, RiderId,
-    ai::LlmPlan,
-    config::{MAX_REDISPATCH_ATTEMPTS, REDISPATCH_SURCHARGE_STEP_CENTS, SimConfig},
+    ai::{self, LlmPlan},
+    config::{
+        MAX_REDISPATCH_ATTEMPTS, REDISPATCH_PROMISE_FLOOR_MIN, REDISPATCH_SURCHARGE_STEP_CENTS,
+        SimConfig,
+    },
     economy,
     event::{DayLedger, RiderBrief},
     geo::{CoordSystem, LatLng, bearing_deg, haversine_m},
@@ -529,7 +532,7 @@ impl World {
                 break;
             }
         }
-        let (merchant_id, merchant_name, merchant_pos, _rating, prep, shop_walk) =
+        let (merchant_id, merchant_name, merchant_pos, _rating, _prep, shop_walk) =
             candidates[idx].clone();
 
         // 顾客端步行难度：大多送到楼下，少数要上楼 / 进深巷。
@@ -557,16 +560,11 @@ impl World {
             _ => OrderTier::Express,
         };
 
-        // 承诺时间 = 出餐 + 配送(合规速度) + 缓冲，向上取整到 5 分钟
-        let compliant_mps = 30.0f32 / 3.6;
-        let travel_min = (road_distance_m as f32 / compliant_mps / 60.0).ceil();
-        let buffer = match tier {
-            OrderTier::Normal => 12.0,
-            OrderTier::Premium => 10.0,
-            OrderTier::Express => 6.0,
-        };
+        // 承诺时间与「骑手真正跑一趟」同源：到店 + 出餐（含高峰）+ 送到，再加分档缓冲。
+        // 老实现只算「出餐均值 + 一段固定速度的路程」，到店段与高峰出餐都没进承诺，
+        // 高峰期因此几乎每一单都注定超时（见 `ai::promise_minutes`）。
         let promised_minutes =
-            (((prep as f32 + travel_min + buffer) / 5.0).ceil() * 5.0).clamp(15.0, 75.0) as u32;
+            ai::promise_minutes(self, merchant_id, road_distance_m, shop_walk, cust_walk, tier);
 
         let fee = economy::quote(
             &self.cfg,
@@ -664,6 +662,8 @@ impl World {
         o.surcharge_cents = REDISPATCH_SURCHARGE_STEP_CENTS * o.redispatch_count as i64;
         o.status = OrderStatus::Pending;
         o.claim_deadline_min = now + window;
+        // 空转掉的时间不记在下一个骑手头上（见 `Order::renew_promise`）。
+        o.renew_promise(now, REDISPATCH_PROMISE_FLOOR_MIN);
 
         if o.redispatch_count >= MAX_REDISPATCH_ATTEMPTS {
             Some(Redispatch::NeedsRescue)
@@ -687,6 +687,8 @@ impl World {
         o.assigned_to = None;
         o.picked_up_at_min = None;
         o.claim_deadline_min = now + window;
+        // 事故退单同理：骑手倒下不是下一任的错（见 `Order::renew_promise`）。
+        o.renew_promise(now, REDISPATCH_PROMISE_FLOOR_MIN);
         true
     }
 
@@ -1064,12 +1066,50 @@ mod tests {
         assert_eq!(ids.len(), 50);
         for o in &w.orders {
             assert!(o.distance_m >= 1);
-            assert!((15..=75).contains(&o.promised_minutes));
+            assert!(crate::sim::config::PROMISE_MINUTES_RANGE.0 <= o.promised_minutes);
+            assert!(o.promised_minutes <= crate::sim::config::PROMISE_MINUTES_RANGE.1);
             assert!(o.fee.quoted_fee_cents > 0, "报价必须为正");
             assert!(o.customer_pos().is_valid());
             assert!(o.merchant_pos().is_valid());
             assert_eq!(o.status, OrderStatus::Pending);
         }
+    }
+
+    /// 退回大厅的单要给接手骑手重新留出时限。
+    ///
+    /// 否则「超时救单」塞过去的每一单都必然超时：单子在大厅空转多久，
+    /// 接手的人就少跑多久，白跑一趟还倒贴罚金。
+    #[test]
+    fn redispatch_renews_the_promise() {
+        let mut w = World::new_for_test(SimConfig::default(), 9);
+        let id = w.generate_order_batch(1)[0];
+
+        // 让单子在大厅干等，直到承诺被空转吃干净。
+        for _ in 0..60 {
+            w.advance_clock();
+        }
+        let created = w.order(id).expect("订单在").created_at_min;
+        let idle = (w.elapsed_min - created) as u32;
+        assert!(idle >= w.order(id).expect("订单在").promised_minutes);
+
+        assert_eq!(w.release_to_hall(id), Some(Redispatch::ToHall));
+
+        let promised = w.order(id).expect("订单在").promised_minutes;
+        assert_eq!(
+            promised - idle,
+            REDISPATCH_PROMISE_FLOOR_MIN,
+            "退回首后剩余时限应回到保底值"
+        );
+
+        // 再空转同样久：只补回空转掉的那一段，不会越滚越长。
+        for _ in 0..60 {
+            w.advance_clock();
+        }
+        let idle2 = (w.elapsed_min - created) as u32;
+        w.release_to_hall(id);
+        let promised2 = w.order(id).expect("订单在").promised_minutes;
+        assert_eq!(promised2 - idle2, REDISPATCH_PROMISE_FLOOR_MIN);
+        assert!(promised2 > promised);
     }
 
     #[test]

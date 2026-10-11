@@ -169,6 +169,21 @@ impl Order {
         let deadline = self.created_at_min + self.promised_minutes as u64 + buffer_min as u64;
         now_min.saturating_sub(deadline) as u32
     }
+
+    /// 退回大厅时重新给时限：已经空转掉的时间不记在下一个骑手头上。
+    ///
+    /// 只在剩余时限低于 `floor_remaining_min` 时才补，且只补到「从下单起算刚好剩这么多」——
+    /// 每轮只延长一点点，反复退回不会把承诺越推越长。
+    ///
+    /// 没有这一步，「超时救单」塞给骑手的每一单都必然超时：单子在大厅里空转多久，
+    /// 接手的人就少跑多久，白跑一趟还倒贴罚金。
+    pub fn renew_promise(&mut self, now_min: u64, floor_remaining_min: u32) {
+        let idle = now_min.saturating_sub(self.created_at_min) as u32;
+        let remaining = self.promised_minutes.saturating_sub(idle);
+        if remaining < floor_remaining_min {
+            self.promised_minutes = idle + floor_remaining_min;
+        }
+    }
 }
 
 #[cfg(test)]

@@ -9,9 +9,10 @@ use serde::Serialize;
 
 use super::{
     OrderId, RiderId,
+    config::{PEAK_PREP_FACTOR, PROMISE_MINUTES_RANGE, SimConfig, TYPICAL_TO_SHOP_M},
     event::{AiAssignment, DecisionSource},
     geo::{angle_between, bearing_deg, haversine_m},
-    order::Order,
+    order::{Order, OrderTier},
     rider::Rider,
     world::World,
 };
@@ -54,15 +55,18 @@ impl Assignment {
     }
 }
 
-/// 路网绕行系数：直线距离 ×1.3 近似真实骑行距离。
-const ROAD_FACTOR: f32 = 1.3;
+/// 路网绕行系数：**直线距离** ×1.3 近似真实骑行距离。
+///
+/// 只对直线距离用。`Order::distance_m` 在生成时已经乘过
+/// [`super::world::ROAD_FACTOR`]（1.25），本身就是路网距离，**不能再乘这个系数**——
+/// 历史上重复乘过一次，让实际送端行程比承诺假设多出约 30%。
+const DETOUR_FACTOR: f32 = 1.3;
 
 /// 取餐端步行秒数：商场内店要走进楼，高层还要等电梯。
-pub fn merchant_walk_secs(world: &World, order: &Order) -> f32 {
-    let w = &world.cfg.walk;
-    let d = order.merchant_walk_difficulty;
-    w.merchant_walk_m(d) as f32 / w.walk_speed_mps()
-        + if w.needs_elevator(d) {
+pub fn merchant_walk_secs_of(cfg: &SimConfig, difficulty: u8) -> f32 {
+    let w = &cfg.walk;
+    w.merchant_walk_m(difficulty) as f32 / w.walk_speed_mps()
+        + if w.needs_elevator(difficulty) {
             w.elevator_penalty_secs as f32
         } else {
             0.0
@@ -70,9 +74,19 @@ pub fn merchant_walk_secs(world: &World, order: &Order) -> f32 {
 }
 
 /// 送端步行秒数：送到楼上还要走下来，所以算的是往返距离。
+pub fn customer_walk_secs_of(cfg: &SimConfig, difficulty: u8) -> f32 {
+    let w = &cfg.walk;
+    w.customer_walk_m(difficulty) as f32 / w.walk_speed_mps()
+}
+
+/// 取餐端步行秒数的订单版。
+pub fn merchant_walk_secs(world: &World, order: &Order) -> f32 {
+    merchant_walk_secs_of(&world.cfg, order.merchant_walk_difficulty)
+}
+
+/// 送端步行秒数的订单版。
 pub fn customer_walk_secs(world: &World, order: &Order) -> f32 {
-    let w = &world.cfg.walk;
-    w.customer_walk_m(order.customer_walk_difficulty) as f32 / w.walk_speed_mps()
+    customer_walk_secs_of(&world.cfg, order.customer_walk_difficulty)
 }
 
 /// 送端行程分钟（骑行 + 顾客端步行往返）。
@@ -80,10 +94,63 @@ pub fn customer_walk_secs(world: &World, order: &Order) -> f32 {
 /// 与 [`plan_for`] 共用同一套算法，保证「估算的时间」和「实际推进的时间」一致。
 pub fn customer_leg_min(world: &World, rider: &Rider, order: &Order) -> u32 {
     let ride_mps = rider.speed_mps(&world.cfg, world.weather).max(1.0);
-    let ride_m = order.distance_m as f32 * ROAD_FACTOR;
+    // `distance_m` 已经是路网距离（生成时乘过 ROAD_FACTOR），这里不再乘绕行系数。
+    let ride_m = order.distance_m as f32;
     ((ride_m / ride_mps + customer_walk_secs(world, order)) / 60.0)
         .ceil()
         .max(1.0) as u32
+}
+
+/// 生成订单时定「承诺送达时限」（分钟）。
+///
+/// 必须和 [`plan_for`] 算的是同一件事——「一个骑手跑完这一单要多久」——
+/// 否则承诺与真实行程脱节，超时就变成必然。这里补上两段最常被漏掉的时间：
+///
+/// 1. **骑手到店**（含取餐步行）：下单时还不知道谁会接，按 [`TYPICAL_TO_SHOP_M`] 估；
+/// 2. **高峰出餐**：用与 `scheduler::attach` 同一个 [`PEAK_PREP_FACTOR`]，
+///    而不是商家均值——高峰的实际出餐是均值的两倍。
+///
+/// 速度一律按合规档的 [`SimConfig::speed`] 基准算：骑手跑得更快是自己省下的时间，
+/// 不该写进承诺。暴雨叠加与疲劳同样不进承诺，那是留给玩家的博弈空间。
+pub fn promise_minutes(
+    world: &World,
+    merchant_id: u32,
+    road_distance_m: u32,
+    merchant_walk_difficulty: u8,
+    customer_walk_difficulty: u8,
+    tier: OrderTier,
+) -> u32 {
+    let cfg = &world.cfg;
+    let base_mps = (cfg.speed.base_speed_kmh / 3.6).max(1.0);
+
+    // 到店段：典型接单距离走的是直线，这里该乘绕行系数。
+    let to_shop_secs = TYPICAL_TO_SHOP_M * DETOUR_FACTOR / base_mps
+        + merchant_walk_secs_of(cfg, merchant_walk_difficulty);
+
+    // 出餐段：与 attach 同一套系数，但取期望值（不含暴雨叠加与 ±20% 抖动）。
+    let peak = if cfg.is_peak(world.sim_minute) {
+        PEAK_PREP_FACTOR
+    } else {
+        1.0
+    };
+    let prep_min = (world.avg_prep_minutes(merchant_id) as f32 * peak)
+        .round()
+        .max(1.0);
+
+    // 送端段：路网距离 + 顾客端步行往返。
+    let to_customer_secs =
+        road_distance_m as f32 / base_mps + customer_walk_secs_of(cfg, customer_walk_difficulty);
+
+    // 分档缓冲：急单给得少，那是它加价的来源。
+    let buffer_min = match tier {
+        OrderTier::Normal => 12.0,
+        OrderTier::Premium => 10.0,
+        OrderTier::Express => 6.0,
+    };
+
+    let total_min = (to_shop_secs + prep_min * 60.0 + to_customer_secs) / 60.0 + buffer_min;
+    let (lo, hi) = PROMISE_MINUTES_RANGE;
+    ((total_min / 5.0).ceil() * 5.0).clamp(lo as f32, hi as f32) as u32
 }
 
 /// 估算行程（骑行 + 步行）。
@@ -93,7 +160,7 @@ pub fn customer_leg_min(world: &World, rider: &Rider, order: &Order) -> u32 {
 /// （《LLM协议设计》§5.1、设计红线 1）。
 pub fn plan_for(world: &World, rider: &Rider, order: &Order) -> DeliveryPlan {
     let ride_mps = rider.speed_mps(&world.cfg, world.weather).max(1.0);
-    let to_shop_ride_m = haversine_m(rider.pos(), order.merchant_pos()) as f32 * ROAD_FACTOR;
+    let to_shop_ride_m = haversine_m(rider.pos(), order.merchant_pos()) as f32 * DETOUR_FACTOR;
     let to_shop_min = ((to_shop_ride_m / ride_mps + merchant_walk_secs(world, order)) / 60.0)
         .ceil()
         .max(1.0) as u32;
@@ -340,7 +407,11 @@ pub fn validate_llm_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::{config::SimConfig, world::World};
+    use crate::sim::{
+        config::{PEAK_PREP_FACTOR, TYPICAL_TO_SHOP_M, SimConfig},
+        geo::LatLng,
+        world::World,
+    };
 
     fn world() -> World {
         let cfg = SimConfig {
@@ -348,6 +419,49 @@ mod tests {
             ..Default::default()
         };
         World::new_for_test(cfg, 42)
+    }
+
+    /// 承诺时限必须盖住「一个骑手在典型接单距离上跑完这一单」要花的全部时间。
+    ///
+    /// 修复前这条是假的：承诺里既没有「骑手到店」那一段，出餐也只按商家均值算，
+    /// 高峰时段（实际出餐翻倍）几乎每一单都注定超时。
+    #[test]
+    fn promise_covers_a_typical_peak_run() {
+        let mut w = world();
+        w.sim_minute = 18 * 60; // 晚高峰
+        let ids = w.generate_order_batch(20);
+        let rid = w.sim_rider_ids()[0];
+
+        for id in ids {
+            let order = w.order(id).expect("订单在").clone();
+
+            // 把骑手放到「典型接单距离」上：承诺估的就是这一段。
+            // 取 0.9 倍留点余量，免得在 ceil 边界上抖。
+            let m = order.merchant_pos();
+            let pos = LatLng::new(
+                m.lat + (TYPICAL_TO_SHOP_M as f64 * 0.9) / 111_320.0,
+                m.lng,
+            );
+            w.rider_mut(rid).expect("骑手在").set_pos(pos);
+
+            let rider = w.rider(rid).expect("骑手在").clone();
+            let plan = plan_for(&w, &rider, &order);
+            let prep_peak = (w.avg_prep_minutes(order.merchant_id) as f32 * PEAK_PREP_FACTOR)
+                .round()
+                .max(1.0) as u32;
+            let to_customer = customer_leg_min(&w, &rider, &order);
+            let need = plan.to_shop_min + prep_peak + to_customer;
+
+            assert!(
+                order.promised_minutes >= need,
+                "订单 #{} 承诺 {} 分钟，实际要花 {need} 分钟（到店 {} + 高峰出餐 {} + 送端 {}）",
+                order.id,
+                order.promised_minutes,
+                plan.to_shop_min,
+                prep_peak,
+                to_customer,
+            );
+        }
     }
 
     #[test]

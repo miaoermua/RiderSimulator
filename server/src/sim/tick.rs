@@ -385,8 +385,8 @@ fn step_one(
                 .rider(rid)
                 .and_then(|r| world.order(oid).map(|o| ai::customer_leg_min(world, r, o)))
                 .unwrap_or_else(|| {
-                    let road_m = world.order(oid).map(|o| o.distance_m).unwrap_or(0) as f32
-                        * crate::sim::world::ROAD_FACTOR as f32;
+                    // `distance_m` 已是路网距离，别再乘 ROAD_FACTOR（与 ai::customer_leg_min 同源）。
+                    let road_m = world.order(oid).map(|o| o.distance_m).unwrap_or(0) as f32;
                     ((road_m / speed_mps.max(1.0) / 60.0).ceil() as u32).max(1)
                 });
             if let Some(rider) = world.rider_mut(rid)

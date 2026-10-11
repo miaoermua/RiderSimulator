@@ -9,7 +9,7 @@ use serde::Serialize;
 use super::{
     OrderId, RiderId,
     ai::{self, Assignment},
-    config::SimConfig,
+    config::{PEAK_PREP_FACTOR, STORM_PREP_FACTOR, SimConfig},
     economy,
     event::{DecisionSource, SimEvent},
     order::{OrderStatus, OrderTier},
@@ -335,12 +335,12 @@ fn attach(world: &mut World, assignment: &Assignment) {
                 .unwrap_or(0),
         );
         let peak = if world.cfg.is_peak(world.sim_minute) {
-            2.0
+            PEAK_PREP_FACTOR
         } else {
             1.0
         };
         let extreme = if world.weather.is_storm() && world.cfg.is_peak(world.sim_minute) {
-            1.5
+            STORM_PREP_FACTOR
         } else {
             1.0
         };

@@ -25,6 +25,35 @@ pub const MAX_REDISPATCH_ATTEMPTS: u32 = 3;
 /// 每次重投的加价（分）。补贴全给骑手，平台不抽水。
 pub const REDISPATCH_SURCHARGE_STEP_CENTS: i64 = 100;
 
+/// 订单退回大厅重投时，给接手骑手保底留出的剩余时限（分钟）。
+///
+/// 单子在大厅里空转掉的时间不该由最终接手的骑手背：现实中平台重派时会重新给时限。
+/// 没这个保底，「超时救单」塞给骑手的每一单都是注定超时的单，白跑还倒贴罚金。
+pub const REDISPATCH_PROMISE_FLOOR_MIN: u32 = 30;
+
+/// 高峰时段商家的出餐系数：实际出餐 = 商家均值 × 这个倍数。
+///
+/// **两处必须共用同一个值**，否则「承诺时限」和「真实出餐」各算各的——
+/// 历史上正是这个不同步，让高峰期几乎每一单都注定超时：
+/// - [`crate::sim::scheduler::attach`]：定这一单实际要等多久；
+/// - [`crate::sim::ai::promise_minutes`]：定生成订单时给顾客的承诺时限。
+pub const PEAK_PREP_FACTOR: f32 = 2.0;
+
+/// 暴雨叠加高峰时的额外出餐系数。同样两处共用。
+pub const STORM_PREP_FACTOR: f32 = 1.5;
+
+/// 生成订单时，估计「骑手到店」用的典型接单距离（米，直线）。
+///
+/// 下单那刻还不知道谁会接，只能用抢单半径内的典型值代一代。
+/// 不估这一段，承诺里就只剩「出餐 + 从商家到顾客」，骑手在路上跑的那截全靠分档缓冲硬兜。
+pub const TYPICAL_TO_SHOP_M: f32 = 1_200.0;
+
+/// 承诺时限的上下限（分钟）。
+///
+/// 上限给到 90：暴雨叠加高峰时「到店 + 出餐 + 送到」真的会到 80 分钟上下，
+/// 卡在 75 会把长单硬压成必然超时。
+pub const PROMISE_MINUTES_RANGE: (u32, u32) = (15, 90);
+
 /// 配送费规则。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeRules {
