@@ -48,10 +48,19 @@ pub enum AiLayer {
     Rider,
     Station,
     Director,
+    /// 末端顾客对话。**事件驱动，不参与轮询**——它由「到门口了、顾客想开口」
+    /// 触发，没有「到点没到点」的概念，所以不在 [`AiLayer::ALL`] 里。
+    ///
+    /// 但它**共用同一个并发坑位和同一条 96 次预算**：对话真的会挤掉派单决策的
+    /// 额度，这是当初明确接受的取舍（见 `DEFAULT_MAX_CALLS_PER_DAY`）。
+    Customer,
 }
 
 impl AiLayer {
     /// 按**优先级**排好的三层（Director 最优先）。遍历调度时用这个顺序。
+    ///
+    /// **刻意不含 `Customer`**：这一份是给 [`AiOrchestrator::next_due`] 定时轮询
+    /// 用的，把事件驱动的顾客对话塞进来会让它每次调度都「到期」而抢走轮次。
     pub const ALL: [AiLayer; 3] = [AiLayer::Director, AiLayer::Station, AiLayer::Rider];
 
     /// 层的优先级。数字越小越优先——预算不够时保高优先级。
@@ -61,6 +70,8 @@ impl AiLayer {
             AiLayer::Director => 0,
             AiLayer::Station => 1,
             AiLayer::Rider => 2,
+            // 对话垫底：它只影响单笔体验，挤掉世界推进不划算。
+            AiLayer::Customer => 3,
         }
     }
 
@@ -70,6 +81,8 @@ impl AiLayer {
             AiLayer::Director => 60,
             AiLayer::Station => 20,
             AiLayer::Rider => 8,
+            // 不轮询，这个值不会被读到。
+            AiLayer::Customer => 0,
         }
     }
 
@@ -79,6 +92,7 @@ impl AiLayer {
             AiLayer::Rider => "rider",
             AiLayer::Station => "station",
             AiLayer::Director => "director",
+            AiLayer::Customer => "customer",
         }
     }
 
@@ -87,6 +101,7 @@ impl AiLayer {
             "rider" => Some(AiLayer::Rider),
             "station" => Some(AiLayer::Station),
             "director" | "beacon" => Some(AiLayer::Director),
+            "customer" | "chat" => Some(AiLayer::Customer),
             _ => None,
         }
     }
@@ -96,18 +111,22 @@ impl AiLayer {
             AiLayer::Rider => "骑手 AI",
             AiLayer::Station => "站长 AI",
             AiLayer::Director => "烽火台 AI",
+            AiLayer::Customer => "顾客对话",
         }
     }
 
-    /// 数组下标。三种数组（`throttles` / `layer_stats`）都靠它定位。
+    /// 数组下标。三种数组（`throttles` / `enabled` / `layer_stats`）都靠它定位。
     ///
     /// 显式写出来，**不依赖枚举声明顺序**——哪天有人重排了 variant，
     /// 这里也不会悄悄错位。
+    ///
+    /// `Customer` 在末尾，所以三层的老下标 0/1/2 不受影响。
     fn index(self) -> usize {
         match self {
             AiLayer::Rider => 0,
             AiLayer::Station => 1,
             AiLayer::Director => 2,
+            AiLayer::Customer => 3,
         }
     }
 }
@@ -141,19 +160,19 @@ impl LayerStats {
 pub struct AiOrchestrator {
     /// 三层共享同一个 HTTP 客户端（内部是 Arc，clone 便宜）。
     client: Option<LlmClient>,
-    /// 各层独立的节流器。
-    throttles: [Throttle; 3],
+    /// 各层独立的节流器。`Customer` 那一格不用（它不轮询），但下标要保持对齐。
+    throttles: [Throttle; 4],
     /// 当前在飞的那一层。同一时刻只允许一个请求。
     inflight: Option<AiLayer>,
     /// 各层的开关。关掉的层不参与调度（控制台「三层开关」/ 未实现的层先关）。
-    enabled: [bool; 3],
+    enabled: [bool; 4],
     /// 预算所属的「天」。跨天自动重置 `calls_today`。
     day: u32,
     /// 今日总调用数（跨层累计）。
     calls_today: u32,
     max_calls_per_day: u32,
-    /// 各层统计。
-    layer_stats: [LayerStats; 3],
+    /// 各层统计（含 `Customer`）。
+    layer_stats: [LayerStats; 4],
     /// 最近一次的说明，给控制端。
     last_note: String,
 }
@@ -180,11 +199,11 @@ impl AiOrchestrator {
             client,
             throttles: std::array::from_fn(|_| Throttle::new(u32::MAX)),
             inflight: None,
-            enabled: [true; 3],
+            enabled: [true; 4],
             day: 0,
             calls_today: 0,
             max_calls_per_day,
-            layer_stats: [LayerStats::default(); 3],
+            layer_stats: [LayerStats::default(); 4],
             last_note: String::new(),
         }
     }
@@ -245,8 +264,21 @@ impl AiOrchestrator {
         self.layer_stats[layer.index()]
     }
 
+    /// 三层（**不含顾客对话**）的统计。
+    ///
+    /// 刻意只返回三个：控制台的「预算与质量」面板按三层渲染，
+    /// 对话层另有 [`AiOrchestrator::customer_stats`]，免得面板要跟着改。
     pub fn all_stats(&self) -> [LayerStats; 3] {
-        self.layer_stats
+        [
+            self.layer_stats[0],
+            self.layer_stats[1],
+            self.layer_stats[2],
+        ]
+    }
+
+    /// 顾客对话层的统计。它不在 [`AiLayer::ALL`] 里，所以单独取。
+    pub fn customer_stats(&self) -> LayerStats {
+        self.layer_stats[AiLayer::Customer.index()]
     }
 
     pub fn last_note(&self) -> &str {
@@ -265,7 +297,7 @@ impl AiOrchestrator {
         }
         self.inflight = None;
         self.calls_today = 0;
-        self.layer_stats = [LayerStats::default(); 3];
+        self.layer_stats = [LayerStats::default(); 4];
         self.last_note.clear();
     }
 

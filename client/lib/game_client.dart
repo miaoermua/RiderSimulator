@@ -213,6 +213,20 @@ class GameClient {
   void sendTaskMessage(int orderId, String text) =>
       _send({ 'type': Msg.taskMessage, 'order_id': orderId, 'text': text });
 
+  /// 订单会话（末端交付沟通）里说一句话。
+  ///
+  /// 与 [sendTaskMessage] 不同：**不要求订单挂任务**，末端任何一单都能说。
+  /// 顾客会不会回由服务端决定——说了话不等于一定有人搭理。
+  void sendChatSay(int orderId, String text) =>
+      _send({ 'type': Msg.chatSay, 'order_id': orderId, 'text': text });
+
+  /// 订单会话里点一条预设话术。文本由服务端按枚举补全，这里只发枚举名。
+  void sendChatPreset(int orderId, ChatPreset preset) => _send({
+        'type': Msg.chatPreset,
+        'order_id': orderId,
+        'preset': preset.wire,
+      });
+
   void resync() => _send({ 'type': Msg.resync });
 
   void dispose() {

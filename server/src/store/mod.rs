@@ -68,6 +68,28 @@ pub struct Account {
     pub updated_at: i64,
 }
 
+/// 一条待落库的会话消息。
+///
+/// 字段全是借用的（`&'a str`）：事件里的 `from` / `kind` / `fault` 本来就是
+/// `&'static str`，没必要为了写一次库把它们转成 `String`。
+#[derive(Debug, Clone, Copy)]
+pub struct ChatRecord<'a> {
+    pub order_id: u32,
+    /// 归属天（0:00 起算的第几天）。时效按它算。
+    pub day: u32,
+    /// 发生时的当日分钟（0..1439）。
+    pub sim_minute: u32,
+    /// `rider` | `customer` | `system`
+    pub sender: &'a str,
+    /// `preset` | `free` | `reply` | `ruling`
+    pub kind: &'a str,
+    pub text: &'a str,
+    /// 这条消息带来的赔付（分）。恒 ≥ 0。
+    pub compensation_cents: i64,
+    /// `rider` | `merchant` | `none`
+    pub fault: &'a str,
+}
+
 /// SQLite 句柄。**单线程持有**（与 tick 循环同一个任务）。
 pub struct Store {
     conn: Connection,
@@ -146,6 +168,21 @@ impl Store {
                 created_at    INTEGER NOT NULL,
                 updated_at    INTEGER NOT NULL
             );
+
+            -- 订单会话（末端交付沟通）。**只增不改**，按 `day` 做一天时效。
+            CREATE TABLE IF NOT EXISTS chat_message (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id           INTEGER NOT NULL,
+                day                INTEGER NOT NULL,
+                sim_minute         INTEGER NOT NULL,
+                sender             TEXT    NOT NULL,
+                kind               TEXT    NOT NULL,
+                text               TEXT    NOT NULL,
+                compensation_cents INTEGER NOT NULL DEFAULT 0,
+                fault              TEXT    NOT NULL DEFAULT 'none'
+            );
+            CREATE INDEX IF NOT EXISTS chat_message_day ON chat_message (day);
+            CREATE INDEX IF NOT EXISTS chat_message_order ON chat_message (order_id, day);
             "#,
         )?;
         Ok(())
@@ -200,11 +237,53 @@ impl Store {
         }
         tx.commit()?;
 
+        // 会话时效：一天。日结时顺手清掉更早的，**不需要额外的定时任务**。
+        // 放在事务外——清理失败也不该让一天的流水白写。
+        match self.purge_chats_before(day) {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(day, purged = n, "清掉了过期会话"),
+            Err(e) => tracing::warn!(error = %e, "清理过期会话失败，下次日结再试"),
+        }
+
         Ok(FlushReport {
             ledgers: ledgers.len(),
             careers_updated: ledgers.len(),
         })
     }
+
+    /// 追加一条会话消息。
+    ///
+    /// 会话是**只增不改**的日志，所以用 `INSERT` 而不是 upsert——同一分钟发两条
+    /// 同样的话，也该老老实实留两条。
+    pub fn save_chat(&self, msg: &ChatRecord<'_>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO chat_message
+                (order_id, day, sim_minute, sender, kind, text, compensation_cents, fault)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                msg.order_id,
+                msg.day,
+                msg.sim_minute,
+                msg.sender,
+                msg.kind,
+                msg.text,
+                msg.compensation_cents,
+                msg.fault
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 清掉 `day` **之前**的会话，返回删掉的行数（`day` 当天保留）。
+    ///
+    /// 由 [`Store::save_day`] 在日结时调用——过期一天即删。
+    pub fn purge_chats_before(&self, day: u32) -> Result<usize> {
+        let n = self
+            .conn
+            .execute("DELETE FROM chat_message WHERE day < ?1", params![day])?;
+        Ok(n)
+    }
+
 
     /// 读某一天的流水。
     pub fn load_day(&self, day: u32) -> Result<Vec<DayLedger>> {

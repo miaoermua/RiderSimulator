@@ -31,6 +31,11 @@ abstract final class Msg {
   static const setSpeedMode = 'set_speed_mode';
   static const changePassword = 'change_password';
   static const taskMessage = 'task_message';
+  /// 订单会话（末端交付沟通）里打字说一句。**不要求订单挂任务**，
+  /// 与绑在附加任务上的 [taskMessage] 是两回事。
+  static const chatSay = 'chat_say';
+  /// 订单会话里点一条预设话术。文本由服务端按枚举补全，客户端只发枚举名。
+  static const chatPreset = 'chat_preset';
 }
 
 /// 下行事件名。前缀为传输层事件，其余直接来自服务端模拟事件。
@@ -59,6 +64,8 @@ abstract final class Ev {
   static const configChanged = 'config_changed';
   static const aiDecision = 'ai_decision';
   static const taskMessage = 'task_message';
+  /// 订单会话消息（末端交付沟通）。骑手与顾客说的话都走它，按 `order_id` 归并。
+  static const chatMessage = 'chat_message';
   static const dayClosed = 'day_closed';
 }
 
@@ -859,4 +866,75 @@ class TaskLine {
   final int step;
 
   bool get isMe => from == 'rider';
+}
+
+/// 骑手端的**预设话术**。
+///
+/// 文本在服务端补全，客户端只发 [wire]。这样「骑手说了什么」永远可审计
+/// （没人能把任意字符串伪装成"预设"），也不会因为客户端版本不同冒出两套话术。
+enum ChatPreset {
+  leaveAtDoor('leave_at_door', '放门口'),
+  leaveAtDesk('leave_at_desk', '放前台'),
+  handToMe('hand_to_me', '当面交付'),
+  callMe('call_me', '电话联系'),
+  sorryLate('sorry_late', '抱歉晚了'),
+  reportDamage('report_damage', '餐品有损');
+
+  const ChatPreset(this.wire, this.label);
+
+  /// 发给服务端的枚举名。
+  final String wire;
+
+  /// 按钮上的短标签。**顺序即展示顺序**，与服务端 `ChatPreset::ALL` 对齐。
+  final String label;
+}
+
+/// 订单会话里的一句话（末端交付沟通）。
+///
+/// 与 [TaskLine] 分开：那条绑在附加任务上，这条是**订单级**的，
+/// 末端窗口里任何一单都可能有。
+class ChatLine {
+  const ChatLine({
+    required this.from,
+    required this.text,
+    required this.kind,
+    required this.at,
+    this.compensationCents = 0,
+    this.fault = 'none',
+  });
+
+  factory ChatLine.fromJson(Map<String, dynamic> j) {
+    // 服务端只给当日分钟数，时间戳在这儿拼——它纯展示，不该占协议字段。
+    final m = reqInt(j['sim_minute']);
+    final hh = (m ~/ 60).toString().padLeft(2, '0');
+    final mm = (m % 60).toString().padLeft(2, '0');
+    return ChatLine(
+      from: reqStr(j['from'], 'customer'),
+      text: reqStr(j['text']),
+      kind: reqStr(j['kind'], 'free'),
+      at: '$hh:$mm',
+      compensationCents: reqInt(j['compensation_cents']),
+      fault: reqStr(j['fault'], 'none'),
+    );
+  }
+
+  final String from; // rider | customer | system
+  final String text;
+
+  /// `preset` | `free` | `reply` | `ruling`。前端据此换头像 / 配色。
+  final String kind;
+
+  /// 展示用的时间戳（`HH:MM`）。由 UI 侧补，服务端只给 `sim_minute`。
+  final String at;
+
+  /// 这条消息带来的赔付（分）。`0` = 无经济后果。
+  final int compensationCents;
+
+  /// 责任方：`rider` | `merchant` | `none`。钱从谁身上出由它决定。
+  final String fault;
+
+  bool get isMe => from == 'rider';
+
+  /// 有经济后果的消息要显眼——骑手得立刻知道这单被扣了钱。
+  bool get isCostly => compensationCents > 0;
 }

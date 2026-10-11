@@ -21,6 +21,7 @@
 //! 2. **任务裁决同理。** 骑手说一句话，服务端立刻回一句「已收到」，
 //!    真正的判定结果稍后由 `ruling` 通道送回。
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -36,6 +37,7 @@ use crate::llm::{
     AiLayer, AiOrchestrator, DirectorBrain, LayerKey, LayerModels, LlmClient, LlmConfig, ModelInfo,
     PlanFetch, PreparedPlan, PreparedWorldPlan, TacticalBrain, TaskJudge, TaskRuling,
     ValidatedWorldOp, WorldFetch,
+    customer::{ChatReply, CustomerBrain, ReplySource},
 };
 use crate::net::{
     Ack, ApiAuth, ApiError, ClientMessage, ConnId, DispatchItem, Envelope, Hub, Inbound,
@@ -55,7 +57,7 @@ use crate::sim::{
     tick::{self, TickInput},
     world::{CustomOrderSpec, World},
 };
-use crate::store::Store;
+use crate::store::{ChatRecord, Store};
 
 /// 服务端运行时选项。**与 `SimConfig` 分开**：这些是「服务器怎么跑」，
 /// 不是「模拟世界怎么算」。
@@ -112,6 +114,29 @@ struct PendingRuling {
     ruling: TaskRuling,
 }
 
+/// 一个等着开口的顾客。
+///
+/// 由 `on_tick` 从 [`SimEvent::ChatOpen`] 收下来，攒进队列。**不在收到的那一刻
+/// 就发请求**：LLM 占坑是全局串行的（见 [`AiOrchestrator`]），有别的层在飞时
+/// 得让路，所以先排队、下一 tick 再试。
+#[derive(Debug)]
+struct PendingChat {
+    rider_id: RiderId,
+    order_id: OrderId,
+    /// 画像一行摘要，直接进提示词。
+    context: String,
+    /// LLM 不可用时的兜底开场白（零延迟、可复现）。
+    fallback: String,
+}
+
+/// 后台送回来的一次顾客回应。
+#[derive(Debug)]
+struct ChatInbound {
+    rider_id: RiderId,
+    order_id: OrderId,
+    reply: ChatReply,
+}
+
 /// 后台「列出模型」的结果。
 ///
 /// 带上 `conn_id` 是因为这是**点名要的**：谁点的回给谁，
@@ -150,6 +175,10 @@ pub struct App {
     judge: TaskJudge,
     /// 烽火台大脑（世界导演）。只碰世界参数，不碰具体的人和单。
     director: DirectorBrain,
+    /// **AI 顾客**：末端交付沟通里「说什么、要不要索赔」。
+    ///
+    /// 与三层共用同一个 [`AiOrchestrator`]，所以它花的额度就是派单决策的额度。
+    customer: CustomerBrain,
     /// 三层 LLM 的统一出口。**由它决定「这一 tick 轮到哪一层」。**
     orchestrator: AiOrchestrator,
     /// LLM 接入配置（Key / Base URL / 模型）。控制台可改，落库后重启仍生效。
@@ -168,6 +197,12 @@ pub struct App {
     /// 「列出模型」的后台结果回传口（网络慢，不能在主循环里等）。
     models_tx: UnboundedSender<ModelListing>,
     models_rx: Option<UnboundedReceiver<ModelListing>>,
+    /// 顾客回应的后台回传口（同上：绝不把循环卡在 HTTP 上）。
+    chat_tx: UnboundedSender<ChatInbound>,
+    chat_rx: Option<UnboundedReceiver<ChatInbound>>,
+    /// 攒着等开口的顾客。**有上限**：堆太多说明额度长期不够，
+    /// 与其无限增长，不如把最老的丢掉——反正它那份兜底话术也过期了。
+    pending_chats: VecDeque<PendingChat>,
 
     /// 已占坑、正在后台打 HTTP 的那一轮。`None` = 没有在途请求。
     inflight_since: Option<Instant>,
@@ -213,6 +248,7 @@ impl App {
         let (ruling_tx, ruling_rx) = unbounded_channel();
         let (plan_tx, plan_rx) = unbounded_channel();
         let (models_tx, models_rx) = unbounded_channel();
+        let (chat_tx, chat_rx) = unbounded_channel();
 
         // LLM 接入的优先级：控制台存下来的 > 环境变量 > 空配置。
         //
@@ -233,19 +269,21 @@ impl App {
         // 控制台改过的分层模型落库，重启后优先于环境变量——否则在界面上
         // 选好的模型一重启就被 `RIDER_SIM_*` 覆盖回去，很难解释。
         let layer_models = load_layer_models(&store).unwrap_or_else(LayerModels::from_env);
-        let (brain, judge, director) = if llm_config.has_key() {
+        let (brain, judge, director, customer) = if llm_config.has_key() {
             (
                 TacticalBrain::from_config(&llm_config.for_layer(&layer_models, LayerKey::Rider)),
                 TaskJudge::from_config(&llm_config),
                 DirectorBrain::from_config(
                     &llm_config.for_layer(&layer_models, LayerKey::Director),
                 ),
+                CustomerBrain::from_config(&llm_config),
             )
         } else {
             (
                 TacticalBrain::disabled(),
                 TaskJudge::disabled(),
                 DirectorBrain::disabled(),
+                CustomerBrain::disabled(),
             )
         };
 
@@ -285,6 +323,7 @@ impl App {
             brain,
             judge,
             director,
+            customer,
             orchestrator,
             llm_config,
             inbound_tx,
@@ -295,6 +334,9 @@ impl App {
             plan_rx: Some(plan_rx),
             models_tx,
             models_rx: Some(models_rx),
+            chat_tx,
+            chat_rx: Some(chat_rx),
+            pending_chats: VecDeque::new(),
             inflight_since: None,
             inflight_layer: None,
             pending_plan: None,
@@ -381,6 +423,7 @@ impl App {
         let mut rulings = self.ruling_rx.take().expect("run 只能调用一次");
         let mut plans = self.plan_rx.take().expect("run 只能调用一次");
         let mut models = self.models_rx.take().expect("run 只能调用一次");
+        let mut chats = self.chat_rx.take().expect("run 只能调用一次");
 
         self.maybe_start_plan();
         let mut next = Instant::now() + self.period();
@@ -403,6 +446,7 @@ impl App {
                 Some(r) = rulings.recv() => self.on_ruling(r),
                 Some(ai) = plans.recv() => self.on_ai(ai),
                 Some(m) = models.recv() => self.on_models(m),
+                Some(c) = chats.recv() => self.on_chat_reply(c),
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         break;
@@ -459,16 +503,27 @@ impl App {
         self.tick_count += 1;
 
         // 顾客开口是**内部信号**：sim 层只负责掷骰子（可复现、零 token），
-        // 「说什么」归 app 层。先在这里落地，别让它流到 `publish` 里当普通事件广播。
+        // 「说什么」归 app 层。先收下来排队，等坑位空了再发请求——
+        // **绝不在这里 await**，否则一次 HTTP 就把整个 tick 卡住了。
         for ev in &events {
             if let SimEvent::ChatOpen {
                 order_id,
                 rider_id,
+                context,
                 fallback,
-                ..
             } = ev
             {
-                self.open_chat(*order_id, *rider_id, fallback.clone());
+                // 队列有上限：堆太多说明额度长期不够，与其无限增长，
+                // 不如丢掉最老的——它那份兜底开场白的时点早就过去了。
+                if self.pending_chats.len() >= 32 {
+                    self.pending_chats.pop_front();
+                }
+                self.pending_chats.push_back(PendingChat {
+                    rider_id: *rider_id,
+                    order_id: *order_id,
+                    context: context.clone(),
+                    fallback: fallback.clone(),
+                });
             }
         }
 
@@ -482,6 +537,9 @@ impl App {
             self.push_server_info();
         }
         self.maybe_start_plan();
+        // 派单决策优先占坑；它没占上（或已经飞完）时，顾客才有机会开口。
+        // 同一时刻只有一个在飞，所以对话确实会挤掉派单——这是当初的取舍。
+        self.maybe_start_chat();
     }
 
     /// 广播事件，并顺手处理需要落库的部分。
@@ -499,6 +557,31 @@ impl App {
                         tracing::warn!(error = %e, "日结落库失败，本局数据只留在内存")
                     }
                 }
+            }
+            // 会话落库：**包括骑手自己说的那条**。落库失败只是丢一条聊天记录，
+            // 绝不能连累广播——玩家该看到的消息还得照发。
+            if let SimEvent::ChatMessage {
+                order_id,
+                from,
+                text,
+                kind,
+                day,
+                sim_minute,
+                compensation_cents,
+                fault,
+            } = ev
+                && let Err(e) = self.store.save_chat(&ChatRecord {
+                    order_id: *order_id,
+                    day: *day,
+                    sim_minute: *sim_minute,
+                    sender: *from,
+                    kind: *kind,
+                    text: text.as_str(),
+                    compensation_cents: *compensation_cents,
+                    fault: *fault,
+                })
+            {
+                tracing::warn!(error = %e, order = order_id, "会话消息落库失败");
             }
             self.hub.broadcast(&self.world, ev);
         }
@@ -710,6 +793,9 @@ impl App {
                     .skip_interval(AiLayer::Station, &self.world);
                 self.start_rider();
             }
+            // 顾客对话**事件驱动**，不在 `ALL` 里，永远不会从 `next_due` 冒出来。
+            // 它走 [`App::maybe_start_chat`] 那条独立入口。写出来只为让编译器满意。
+            Some(AiLayer::Customer) => {}
             None => {}
         }
     }
@@ -2488,11 +2574,8 @@ impl App {
         Ok(())
     }
 
-    /// 顾客开口。**先用兜底话术立刻广播，不让人干等 LLM。**
-    ///
-    /// 接上 `CustomerBrain` 之后，这里会先广播兜底句、再把精修后的回应补上；
-    /// 无论模型多慢，都**不会卡住交付**。
-    fn open_chat(&mut self, order_id: OrderId, _rider_id: RiderId, fallback: String) {
+    /// 顾客开口（**兜底路径**）：立刻广播一句预设话术，不花额度、不等人。
+    fn open_chat(&mut self, order_id: OrderId, fallback: String) {
         self.publish(&[SimEvent::ChatMessage {
             order_id,
             from: "customer",
@@ -2502,6 +2585,119 @@ impl App {
             sim_minute: self.world.sim_minute,
             compensation_cents: 0,
             fault: "none",
+        }]);
+    }
+
+    // -----------------------------------------------------------------
+    // 顾客对话（末端交付沟通）
+    // -----------------------------------------------------------------
+
+    /// 有顾客等着开口、且坑位空着，就发起一次对话调用。
+    ///
+    /// **与派单决策共用同一个坑位和同一条 96 次预算**：对话真的会挤掉派单的
+    /// 额度，这是当初明确接受的取舍。挤不下时**不做替换**——顾客退回一句兜底
+    /// 话术，骑手照样能正常跑单。
+    fn maybe_start_chat(&mut self) {
+        if self.pending_chats.is_empty() {
+            return;
+        }
+        // 没配 Key / 大脑没开：不占额度，直接用兜底话术落地。
+        if !self.customer.is_enabled() || !self.llm_enabled() {
+            self.flush_chat_fallbacks();
+            return;
+        }
+        if self.inflight_since.is_some() {
+            return; // 有别的在飞，下一 tick 再来
+        }
+        if !self.orchestrator.begin(AiLayer::Customer, &self.world) {
+            // 额度用完：兜底落地，别让顾客永远哑着。
+            self.flush_chat_fallbacks();
+            return;
+        }
+        let Some(pending) = self.pending_chats.pop_front() else {
+            // 理论上进不来（上面刚判过非空），但坑已经占了，得还回去。
+            self.orchestrator.finish(AiLayer::Customer);
+            return;
+        };
+        let tx = self.chat_tx.clone();
+        let brain = self.customer.clone();
+        self.inflight_since = Some(Instant::now());
+        self.inflight_layer = Some(AiLayer::Customer);
+        tokio::spawn(async move {
+            let reply = brain.open(&pending.context, &pending.fallback).await;
+            if tx
+                .send(ChatInbound {
+                    rider_id: pending.rider_id,
+                    order_id: pending.order_id,
+                    reply,
+                })
+                .is_err()
+            {
+                tracing::debug!("主循环已退出，丢弃这一次顾客回应");
+            }
+        });
+    }
+
+    /// 攒着的顾客开口全部用兜底话术落地（**不花额度**）。
+    fn flush_chat_fallbacks(&mut self) {
+        while let Some(p) = self.pending_chats.pop_front() {
+            self.open_chat(p.order_id, p.fallback);
+        }
+    }
+
+    /// 顾客的回应回来了。
+    fn on_chat_reply(&mut self, inbound: ChatInbound) {
+        self.inflight_since = None;
+        self.inflight_layer = None;
+        self.orchestrator.finish(AiLayer::Customer);
+        if inbound.reply.source == ReplySource::Rejected {
+            // 模型吐了非法 JSON，整条作废、退回预设——记一次回退。
+            self.orchestrator.record_fallback(AiLayer::Customer);
+        }
+        self.apply_customer_reply(inbound.rider_id, inbound.order_id, inbound.reply);
+    }
+
+    /// 顾客说完一句话：**先落地经济后果，再广播**。
+    ///
+    /// 钱只从「骑手责任」身上出——商家出餐问题不动骑手的账，没人有错则分文不取。
+    /// 这是「按责任分摊」的最终落点：LLM 只给看法，金额早在 [`ChatReply`] 里
+    /// 被夹取过了，这里只是执行。
+    fn apply_customer_reply(&mut self, rid: RiderId, oid: OrderId, reply: ChatReply) {
+        let now_min = self.world.elapsed_min;
+        let mut fined = 0i64;
+        if reply.fault.hits_rider() && reply.compensation_cents > 0 {
+            if let Some(r) = self.world.rider_mut(rid) {
+                economy::issue_fine(
+                    r,
+                    reply.compensation_cents,
+                    "customer_compensation",
+                    format!("顾客索赔：{}", reply.reply),
+                    Some(oid),
+                    now_min,
+                );
+            }
+            fined = reply.compensation_cents;
+        }
+        if reply.rating_delta != 0.0 {
+            // 先克隆配置：`rider_mut` 要可变借用整个 world，没法再借它的 cfg。
+            let cfg = self.world.cfg.clone();
+            if let Some(r) = self.world.rider_mut(rid) {
+                economy::adjust_rating(&cfg, r, reply.rating_delta);
+            }
+        }
+        if fined > 0 {
+            tracing::info!(rider = rid, order = oid, cents = fined, "顾客索赔已扣款");
+        }
+
+        self.publish(&[SimEvent::ChatMessage {
+            order_id: oid,
+            from: "customer",
+            text: reply.reply,
+            kind: "reply",
+            day: self.world.day,
+            sim_minute: self.world.sim_minute,
+            compensation_cents: fined,
+            fault: reply.fault.as_str(),
         }]);
     }
 

@@ -471,6 +471,27 @@ export interface EventPayloads {
   /** AI 说的一句话（烽火台旁白等）。只影响气氛，不改数值。 */
   narration: { layer: string; text: string };
   task_message: { order_id: number; from: string; text: string };
+  /**
+   * 订单会话消息（末端交付沟通）。骑手与顾客说的话都走它，按 `order_id` 归并。
+   *
+   * 与 `task_message` 分开：那条绑在附加任务上，这条是**订单级**的，
+   * 末端窗口里任何一单都可能有。时效一天，服务端日结时清库。
+   */
+  chat_message: {
+    order_id: number;
+    from: string;
+    text: string;
+    /** `preset` | `free` | `reply` | `ruling`。前端据此换头像 / 配色。 */
+    kind: string;
+    /** 归属天（0:00 起算的第几天）。时效按它算。 */
+    day: number;
+    /** 发生时的当日分钟（0..1439）。 */
+    sim_minute: number;
+    /** 这条消息带来的赔付（分）。恒 ≥ 0，`0` = 无经济后果。 */
+    compensation_cents: number;
+    /** `rider` | `merchant` | `none`。钱从谁身上出由它决定。 */
+    fault: string;
+  };
   day_closed: { day: number; total_orders: number; total_takehome_cents: number };
   ack: AckPayload;
   error: { code: string; message: string };

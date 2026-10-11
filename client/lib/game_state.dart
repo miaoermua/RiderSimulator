@@ -49,8 +49,14 @@ class GameState extends ChangeNotifier {
   List<OrderView> activeOrders = [];
   List<DayLedgerView> ledgers = const [];
 
-  /// 每条订单的任务对话。
+  /// 每条订单的任务对话（绑在附加任务上）。
   final Map<int, List<TaskLine>> taskLines = {};
+
+  /// 每条订单的**末端会话**（末端交付沟通，与附加任务无关）。
+  ///
+  /// 服务端那边时效一天，日结时清库；本地缓存跟着在 `day_closed` 时清空，
+  /// 见 [applyFrame]。
+  final Map<int, List<ChatLine>> chatLines = {};
 
   final List<LogLine> logs = [];
 
@@ -254,8 +260,13 @@ class GameState extends ChangeNotifier {
         _applyAiDecision(frame.payload);
       case Ev.taskMessage:
         _applyTaskMessage(frame.payload);
+      case Ev.chatMessage:
+        _applyChatMessage(frame.payload);
       case Ev.dayClosed:
         _applyDayClosed(frame.payload);
+        // 会话时效一天：服务端日结时清了库，本地缓存跟着清，
+        // 否则翻回昨天的单，还能看见早就该没了的话。
+        chatLines.clear();
       default:
         break; // 未知事件：忽略，向前兼容
     }
@@ -313,6 +324,8 @@ class GameState extends ChangeNotifier {
         Msg.setSpeedMode => '骑行模式已更新',
         Msg.changePassword => '密码已改，二维码里的旧密码作废',
         Msg.taskMessage => '消息已发出，等顾客回',
+        Msg.chatSay => '消息已发出',
+        Msg.chatPreset => '话术已发送',
         _ => '${a.action} 成功',
       };
       note(label, kind: LogKind.good);
@@ -495,6 +508,30 @@ class GameState extends ChangeNotifier {
       '${line.isMe ? '我' : '顾客'}：${line.text}',
       kind: LogKind.chat,
     );
+  }
+
+  /// 末端会话消息。
+  ///
+  /// 与 [TaskLine] 那条路分开：这里不推进任何任务进度，纯粹是末端沟通。
+  /// **带赔付的消息要显眼**——骑手得立刻知道这一单被扣了钱。
+  void _applyChatMessage(Map<String, dynamic> p) {
+    final id = reqInt(p['order_id']);
+    final line = ChatLine.fromJson(p);
+    chatLines.putIfAbsent(id, () => []).add(line);
+
+    final who = switch (line.from) {
+      'rider' => '我',
+      'customer' => '顾客',
+      _ => '系统',
+    };
+    if (line.isCostly) {
+      note(
+        '$who：${line.text}（赔付 ${yuan(line.compensationCents)} 元）',
+        kind: LogKind.money,
+      );
+    } else {
+      note('$who：${line.text}', kind: LogKind.chat);
+    }
   }
 
   void _applyDayClosed(Map<String, dynamic> p) {

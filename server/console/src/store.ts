@@ -61,6 +61,31 @@ export interface AiDecisionEntry {
   rejected?: boolean;
 }
 
+/**
+ * 订单会话里的一条消息（末端交付沟通）。
+ *
+ * 与 `LogItem` 分开：日志是给运维看的流水，会话是**按订单聚合**的业务数据。
+ * 烽火台要看的是「这一单骑手和顾客说了什么、赔了多少钱」，不是又一行文本。
+ */
+export interface ChatEntry {
+  /** 前端自增序号，仅用于 React key。 */
+  id: number;
+  orderId: number;
+  /** 模拟时钟 `hh:mm`。 */
+  at: string;
+  /** `rider` | `customer` | `system` */
+  from: string;
+  /** `preset` | `free` | `reply` | `ruling` */
+  kind: string;
+  text: string;
+  /** 归属天。**时效一天**，`day_closed` 时整体清空。 */
+  day: number;
+  /** 这条消息带来的赔付（分）。`0` = 无经济后果。 */
+  compensationCents: number;
+  /** `rider` | `merchant` | `none`。钱从谁身上出由它决定。 */
+  fault: string;
+}
+
 /** 上游模型清单的加载态。 */
 export interface ModelListState {
   loading: boolean;
@@ -87,12 +112,22 @@ export interface State {
   decisions: AiDecisionEntry[];
   /** 上游模型清单（`ai_models` 事件）。没拉过时为 null。 */
   models: ModelListState | null;
+  /** 订单会话消息，新的在前。**时效一天**：`day_closed` 时清空。 */
+  chats: ChatEntry[];
 }
 
 type Notifier = (kind: "success" | "error" | "info", text: string) => void;
 
 const MAX_LOGS = 300;
 const MAX_DECISIONS = 60;
+/** 会话消息上限。一天几百单，按订单聚合后留这么多够看了。 */
+const MAX_CHATS = 400;
+/** 责任方 → 中文。**钱从谁身上出**，一眼看清。 */
+export const FAULT_LABEL: Record<string, string> = {
+  rider: "骑手",
+  merchant: "商家",
+  none: "无人责任",
+};
 
 const initialState: State = {
   role: null,
@@ -106,6 +141,7 @@ const initialState: State = {
   ai: null,
   decisions: [],
   models: null,
+  chats: [],
 };
 
 /**
@@ -124,6 +160,7 @@ class ConsoleStore {
   private lastResync = 0;
   private logSeq = 0;
   private decisionSeq = 0;
+  private chatSeq = 0;
   private notifier: Notifier = () => {};
   /** 组件挂载后由 antd 的 message API 覆盖。 */
   onRosterChanged: (() => void) | null = null;
@@ -223,6 +260,27 @@ class ConsoleStore {
     const at = this.state.snap ? hhmm(this.state.snap.sim_minute) : "--:--";
     const item: AiDecisionEntry = { ...entry, id: ++this.decisionSeq, at };
     this.set({ decisions: [item, ...this.state.decisions].slice(0, MAX_DECISIONS) });
+  }
+
+  /**
+   * 往订单会话里塞一条（新的在前，超出上限截断）。
+   *
+   * 时间戳用消息自带的 `sim_minute`，不读快照：会话可能落在两帧快照之间，
+   * 用快照时间会把先后顺序抹平。
+   */
+  private addChat(p: EventPayloads["chat_message"]) {
+    const item: ChatEntry = {
+      id: ++this.chatSeq,
+      orderId: p.order_id,
+      at: hhmm(p.sim_minute),
+      from: p.from,
+      kind: p.kind,
+      text: p.text,
+      day: p.day,
+      compensationCents: p.compensation_cents ?? 0,
+      fault: p.fault ?? "none",
+    };
+    this.set({ chats: [item, ...this.state.chats].slice(0, MAX_CHATS) });
   }
 
   /** 请求一份三层 AI 状态（打开 AI Tab 时调）。 */
@@ -547,9 +605,16 @@ class ConsoleStore {
         this.log(`任务 #${t.order_id} [${t.from}] ${t.text}`);
         break;
       }
+      case "chat_message": {
+        this.addChat(p as EventPayloads["chat_message"]);
+        break;
+      }
       case "day_closed": {
         const d = p as EventPayloads["day_closed"];
         this.log(`第 ${d.day} 天结束：${d.total_orders} 单，骑手合计到手 ${yuan(d.total_takehome_cents)}`);
+        // 会话时效一天：服务端日结时清了库，控制台跟着清，
+        // 免得翻旧账时还看得见早就该没了的对话。
+        this.set({ chats: [] });
         break;
       }
       case "ack":

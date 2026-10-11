@@ -8,6 +8,7 @@ import '../game_state.dart';
 import '../protocol.dart';
 import '../widgets/order_card.dart';
 import '../widgets/rider_drawer.dart';
+import '../widgets/chat_sheet.dart';
 import '../widgets/task_sheet.dart';
 import 'assign_order_page.dart';
 import 'notifications_page.dart';
@@ -411,6 +412,22 @@ class _OrderListState extends State<_OrderList> {
             client: widget.client,
             mode: widget.mode,
           ),
+          // 末端交付沟通：**任何到手单都能说**，不要求挂任务——
+          // 这正是它和下面那个「任务对话」按钮的区别。
+          if (widget.mode != OrderCardMode.hall)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: OutlinedButton.icon(
+                onPressed: () => showChatSheet(
+                  context,
+                  order: o,
+                  state: widget.state,
+                  client: widget.client,
+                ),
+                icon: const Icon(Icons.support_agent, size: 18),
+                label: Text(_chatLabel(o)),
+              ),
+            ),
           // 送单路上要能顺手回顾客消息，别藏到别的页面去。
           if (widget.mode != OrderCardMode.hall && o.task != null)
             Padding(
@@ -428,6 +445,16 @@ class _OrderListState extends State<_OrderList> {
             ),
         ],
       );
+
+  /// 「联系顾客」按钮上的字。
+  ///
+  /// 顾客开口是稀罕事（大约 5% 的单子），所以一来消息就值得在按钮上报一声，
+  /// 免得骑手错过——尤其是带赔付的那种。
+  String _chatLabel(OrderView o) {
+    final has = (widget.state.chatLines[o.id] ?? const <ChatLine>[])
+        .any((l) => l.from == 'customer');
+    return has ? '联系顾客 · 有新消息' : '联系顾客';
+  }
 
   Widget _emptyView() => RefreshIndicator(
         onRefresh: () async => widget.client.resync(),

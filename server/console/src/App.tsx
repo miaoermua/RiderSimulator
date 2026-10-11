@@ -3,6 +3,7 @@ import { App as AntApp, Layout, Tabs, theme } from "antd";
 import { useStore } from "./hooks";
 import { AccessPanel } from "./components/AccessPanel";
 import { AiPanel } from "./components/AiPanel";
+import { ChatPanel } from "./components/ChatPanel";
 import { LoginGate } from "./components/LoginGate";
 import { LogPanel } from "./components/LogPanel";
 import { MapView } from "./components/MapView";
@@ -32,6 +33,7 @@ export function App() {
   const panels = [
     { key: "riders", label: "骑手", children: <RidersPanel selected={selected} onSelect={pickRider} /> },
     { key: "orders", label: "订单", children: <OrdersPanel /> },
+    { key: "chat", label: "会话", children: <ChatPanel /> },
     { key: "ai", label: "AI", children: <AiPanel /> },
     { key: "access", label: "骑手接入", children: <AccessPanel /> },
     { key: "settings", label: "设置", children: <SettingsPanel /> },
