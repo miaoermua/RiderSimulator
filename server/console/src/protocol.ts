@@ -51,6 +51,16 @@ export type BrainSource = "llm" | "cache" | "disabled" | "throttled" | "fallback
 /** 坐标系。方案 A：服务端内部保持 GCJ-02，只在下发快照时按需转换。 */
 export type CoordSystem = "gcj02" | "wgs84";
 
+/** 路线任务里的一腿。`held` 只说手上有哪几张单，看不出先后，这里才有顺序。 */
+export interface RouteLegBrief {
+  order_id: number;
+  kind: "pickup" | "dropoff";
+  /** 这一腿还要多少分钟：取餐腿是等餐时间，送达腿是骑行时间。 */
+  remaining_min: number;
+  /** 是不是当前这一腿（队首）。 */
+  current: boolean;
+}
+
 export interface RiderBrief {
   id: number;
   key: string;
@@ -66,6 +76,8 @@ export interface RiderBrief {
   /** 今日已用掉的拒单次数。配合 `ConfigView.max_rejects_per_day` 显示额度。 */
   rejects_today: number;
   held: number[];
+  /** 路线任务：队首是当前腿，走完出队。旧存档 / 没接单的骑手是空数组。 */
+  route: RouteLegBrief[];
   phase: Phase | null;
   lat: number;
   lng: number;
@@ -193,6 +205,12 @@ export interface ConfigView {
   fee: FeeView;
   insurance_per_day_cents: number;
   backorder_late_buffer_min: number;
+  /** 算法一批里给一个骑手最多派几单（1~3）。 */
+  merge_max_per_rider: number;
+  /** 单个商家同时存在的未完成单量上限，0 = 不限。 */
+  merge_merchant_cap: number;
+  /** 凑单窗口（分钟）：在店等餐的骑手愿意为同店新单多等多久。 */
+  merge_wait_min: number;
   /** 坐标系：方案 A 里由控制端设置，服务端下发快照时据此转换。 */
   coord_system: CoordSystem;
 }

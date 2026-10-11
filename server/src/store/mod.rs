@@ -284,7 +284,6 @@ impl Store {
         Ok(n)
     }
 
-
     /// 读某一天的流水。
     pub fn load_day(&self, day: u32) -> Result<Vec<DayLedger>> {
         let mut stmt = self

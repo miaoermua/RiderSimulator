@@ -449,4 +449,3 @@ fn rescue_holds_the_order_when_nobody_is_available() {
     assert_eq!(w.stats.orders_expired, 0, "派不出去也不许流单");
     assert!(w.stats.orders_rescued == 0);
 }
-

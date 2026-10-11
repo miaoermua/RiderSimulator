@@ -121,9 +121,7 @@ impl Default for ChatLimits {
 
 impl ChatLimits {
     pub fn clamped(mut self) -> Self {
-        self.max_compensation_cents = self
-            .max_compensation_cents
-            .clamp(0, MAX_COMPENSATION_CENTS);
+        self.max_compensation_cents = self.max_compensation_cents.clamp(0, MAX_COMPENSATION_CENTS);
         self
     }
 }
@@ -186,9 +184,7 @@ impl CustomerBrain {
         let Some(client) = self.client.as_ref() else {
             return fb;
         };
-        let user = format!(
-            "订单情况：{context}\n骑手刚到门口，你（顾客）主动说第一句话。"
-        );
+        let user = format!("订单情况：{context}\n骑手刚到门口，你（顾客）主动说第一句话。");
         self.call(client, &user, fb).await
     }
 
@@ -251,13 +247,14 @@ impl CustomerBrain {
             _ => Fault::None,
         };
 
-        let claimed = as_cents(raw.get("compensation_cents"))
-            .clamp(0, self.limits.max_compensation_cents);
+        let claimed =
+            as_cents(raw.get("compensation_cents")).clamp(0, self.limits.max_compensation_cents);
         // 没人有错却要索赔 = 模型自相矛盾，金额抹平。
         let compensation_cents = if fault == Fault::None { 0 } else { claimed };
 
         let rating_delta = as_f64(raw.get("rating_delta"))
-            .clamp(RATING_DELTA_MIN as f64, RATING_DELTA_MAX as f64) as f32;
+            .clamp(RATING_DELTA_MIN as f64, RATING_DELTA_MAX as f64)
+            as f32;
 
         ChatReply {
             reply: truncate(reply, MAX_REPLY_CHARS),
@@ -363,7 +360,11 @@ mod tests {
             "compensation_cents": 2000,
             "rating_delta": 0.0,
         });
-        assert_eq!(b.sanitize(&raw, ChatReply::preset("一般", "嗯")).compensation_cents, 300);
+        assert_eq!(
+            b.sanitize(&raw, ChatReply::preset("一般", "嗯"))
+                .compensation_cents,
+            300
+        );
     }
 
     #[test]
@@ -450,7 +451,11 @@ mod tests {
         let long = "汤".repeat(300);
         let raw = json!({ "reply": long, "mood": "不满", "fault": "none" });
         let r = brain().sanitize(&raw, ChatReply::preset("一般", "嗯"));
-        assert_eq!(r.reply.chars().count(), MAX_REPLY_CHARS + 1, "截断后带一个省略号");
+        assert_eq!(
+            r.reply.chars().count(),
+            MAX_REPLY_CHARS + 1,
+            "截断后带一个省略号"
+        );
         assert!(r.reply.ends_with('…'));
     }
 }

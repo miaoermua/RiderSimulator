@@ -1915,11 +1915,9 @@ impl App {
             // 骑手动作理论上已被 `on_client` 的分流拦走；走到这里说明
             // `on_client` 的分流表和这个 match 不同步。报明确错误，
             // 好过静默吞掉——同步漏了要立刻发现，而不是等到功能失灵。
-            _ => self.hub.send_error(
-                conn_id,
-                code::BAD_REQUEST,
-                "该消息不属于控制端指令",
-            ),
+            _ => self
+                .hub
+                .send_error(conn_id, code::BAD_REQUEST, "该消息不属于控制端指令"),
         }
     }
 
@@ -1950,7 +1948,9 @@ impl App {
             self.llm_config.base_url = if u.is_empty() {
                 LlmConfig::default().base_url
             } else {
-                u.to_string()
+                // 控制台里最容易把完整端点（…/v1/chat）当根路径填进来，
+                // 归一化一次，省得下游拼出 `/v1/chat/models` 这种 404。
+                crate::llm::normalize_base_url(u)
             };
         }
         if let Some(m) = model {
@@ -2097,6 +2097,16 @@ impl App {
         // 只影响下发时的坐标转换，世界状态不动。
         if let Some(v) = p.coord_system {
             cfg.coord_system = v;
+        }
+        // 合并单 / 凑单：只影响之后的派单与出单，已经在跑的单不动。
+        if let Some(v) = p.merge_max_per_rider {
+            cfg.merge.algorithm_max_per_rider = v.clamp(1, 3);
+        }
+        if let Some(v) = p.merge_merchant_cap {
+            cfg.merge.max_active_orders_per_merchant = v.min(6);
+        }
+        if let Some(v) = p.merge_wait_min {
+            cfg.merge.wait_for_merge_min = v.min(10);
         }
         // 计价规则只影响之后新生成的订单，已在跑的单沿用当时的报价。
         if let Some(v) = p.base_fee_cents {
@@ -2587,9 +2597,10 @@ impl App {
     ) {
         let text = text.trim().to_string();
         if text.is_empty() {
-            return self
-                .hub
-                .send_ack(conn_id, &Ack::err(action, code::BAD_REQUEST, "不能发空消息"));
+            return self.hub.send_ack(
+                conn_id,
+                &Ack::err(action, code::BAD_REQUEST, "不能发空消息"),
+            );
         }
         if text.chars().count() > crate::llm::customer::MAX_REPLY_CHARS {
             return self.hub.send_ack(
@@ -2975,7 +2986,7 @@ fn load_llm_config(store: &Store) -> Option<LlmConfig> {
     let mut cfg = LlmConfig::default();
     cfg.api_key = api_key;
     if let Some(u) = non_empty(store.meta("llm_base_url").ok().flatten()) {
-        cfg.base_url = u;
+        cfg.base_url = crate::llm::normalize_base_url(&u);
     }
     if let Some(m) = non_empty(store.meta("llm_model").ok().flatten()) {
         cfg.model = m;

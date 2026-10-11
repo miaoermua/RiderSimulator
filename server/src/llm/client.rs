@@ -26,6 +26,37 @@ pub const ENV_MODEL_RIDER: &str = "LLM_MODEL_RIDER";
 pub const ENV_MODEL_STATION: &str = "LLM_MODEL_STATION";
 pub const ENV_MODEL_DIRECTOR: &str = "LLM_MODEL_DIRECTOR";
 
+/// 归一化 `base_url`：**只保留到 `/v1` 这一层根路径**。
+///
+/// `base_url` 的语义是「OpenAI 兼容 API 的根」，请求路径由本模块自己拼：
+/// 聊天走 `{base}/chat/completions`，列模型走 `{base}/models`。
+/// 所以它**必须停在 `/v1`**，不能带后面的端点名。
+///
+/// 现实里最常见的误填是从文档里抄了完整地址，或者从别处复制了带路径的 URL：
+///
+/// ```text
+/// 填 https://api.x.com/v1          → 对：.../v1/chat/completions
+/// 填 https://api.x.com/v1/chat     → 错：.../v1/chat/chat/completions
+///                                    列模型变成 .../v1/chat/models → 404
+/// 填 https://api.x.com/v1/chat/completions → 错得更离谱
+/// ```
+///
+/// 网关（New API / One API 这类）对这些路径非常敏感，会直接回
+/// `404 Invalid URL (GET /v1/chat/models)`，而错误信息里那个 `chat`
+/// 很容易让人以为"网关不支持"，实际上是**填错了根路径**。
+///
+/// 所以这里把已知的端点后缀剥掉，让用户填全地址也能用。
+pub fn normalize_base_url(raw: &str) -> String {
+    let s = raw.trim().trim_end_matches('/');
+    // 按最长的后缀优先剥，否则 `/chat/completions` 会被先匹配掉 `/chat`。
+    for suffix in ["/chat/completions", "/completions", "/chat", "/models"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            return stripped.to_string();
+        }
+    }
+    s.to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub base_url: String,
@@ -70,10 +101,13 @@ impl LlmConfig {
             .or_else(|| std::env::var(ENV_OPENAI_KEY).ok())
             .unwrap_or_default();
         Self {
-            base_url: std::env::var(ENV_BASE_URL)
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(d.base_url),
+            base_url: normalize_base_url(
+                std::env::var(ENV_BASE_URL)
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(d.base_url)
+                    .as_str(),
+            ),
             api_key,
             model: std::env::var(ENV_MODEL)
                 .ok()
@@ -623,6 +657,73 @@ mod tests {
         assert_eq!(
             cfg.endpoint(),
             "https://api.deepseek.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn base_url_keeps_the_root_only() {
+        // 正确写法：到 /v1 为止，原样返回。
+        for good in [
+            "https://api.openai.com/v1",
+            "https://api.deepseek.com/v1/",
+            "https://api.dahetao.org/v1",
+        ] {
+            assert_eq!(normalize_base_url(good), good.trim_end_matches('/'));
+        }
+    }
+
+    #[test]
+    fn base_url_drops_a_pasted_endpoint_suffix() {
+        // 抄了完整端点也能救回来——这正是用户最常踩的坑：
+        // 网关回 `404 Invalid URL (GET /v1/chat/models)`，看着像"不支持"，
+        // 实际是根路径多填了 `/chat`。
+        for (raw, want) in [
+            (
+                "https://api.dahetao.org/v1/chat",
+                "https://api.dahetao.org/v1",
+            ),
+            (
+                "https://api.dahetao.org/v1/chat/completions",
+                "https://api.dahetao.org/v1",
+            ),
+            ("https://api.x.com/v1/models", "https://api.x.com/v1"),
+            ("https://api.x.com/v1/completions", "https://api.x.com/v1"),
+            // 结尾带斜杠也要认。
+            ("https://api.x.com/v1/chat/", "https://api.x.com/v1"),
+        ] {
+            assert_eq!(normalize_base_url(raw), want, "输入 {raw}");
+        }
+    }
+
+    #[test]
+    fn base_url_keeps_paths_that_are_not_known_endpoints() {
+        // 不要过度清洗：有些网关根路径里就带路径段（自建反代、多段前缀）。
+        // 只剥「已知端点名」，其余原样保留。
+        for keep in [
+            "https://gw.corp/api/openai",
+            "https://h.com/v1beta",
+            "https://h.com/proxy/v1",
+        ] {
+            assert_eq!(normalize_base_url(keep), keep);
+        }
+    }
+
+    #[test]
+    fn normalized_base_url_yields_working_endpoints() {
+        // 端到端：从用户填错的值出发，两条路径都要拼对。
+        let cfg = LlmConfig {
+            base_url: normalize_base_url("https://api.dahetao.org/v1/chat"),
+            api_key: "x".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.base_url, "https://api.dahetao.org/v1");
+        assert_eq!(
+            cfg.endpoint(),
+            "https://api.dahetao.org/v1/chat/completions"
+        );
+        assert_eq!(
+            format!("{}/models", cfg.base_url.trim_end_matches('/')),
+            "https://api.dahetao.org/v1/models"
         );
     }
 

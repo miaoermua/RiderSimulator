@@ -103,6 +103,55 @@ pub struct BackOrderRules {
     pub bonus_max_cents: i64,
     /// 承诺时限后的缓冲（分钟）。
     pub late_buffer_min: u32,
+    /// 同店合并出餐：为凑成一炉，最早好的那份**最多**再等多几分钟。
+    ///
+    /// 有上限是为了不让一份慢餐绑架已经好了的餐——那等于拿顾客的时间补贴
+    /// 「一起送」。设 0 就退回各出各的。
+    #[serde(default = "default_merge_wait_min")]
+    pub merge_wait_max_min: u32,
+}
+
+/// [`BackOrderRules::merge_wait_max_min`] 的缺省值：老存档没这个字段时用它。
+fn default_merge_wait_min() -> u32 {
+    3
+}
+
+/// 合并单 / 凑单规则。
+///
+/// 同一家店的多单该一起取、一起送——这是真实骑手最主要的省钱手段。
+/// 这几项管的就是「什么时候该把单凑到一起」，以及「别让一家店把单全发了」。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeRules {
+    /// 单个商家同时存在的**未完成**订单上限。0 = 不限。默认 2。
+    ///
+    /// 没有它，热门店（`rating^6` 加权）能把整条街的单都发出大厅，
+    /// 一堆同店单谁也没法合并，只能一个个单独跑。
+    #[serde(default = "default_merchant_order_cap")]
+    pub max_active_orders_per_merchant: u32,
+    /// 算法同一批里允许给**一个骑手**派几单。默认 1（＝原来的一批一单）。
+    pub algorithm_max_per_rider: u32,
+    /// 凑单窗口（分钟）：骑手到店后愿意多留一会儿，等同店的新单派过来。
+    /// 0 = 不等。
+    #[serde(default = "default_merge_window_min")]
+    pub wait_for_merge_min: u32,
+}
+
+fn default_merchant_order_cap() -> u32 {
+    2
+}
+
+fn default_merge_window_min() -> u32 {
+    2
+}
+
+impl Default for MergeRules {
+    fn default() -> Self {
+        Self {
+            max_active_orders_per_merchant: default_merchant_order_cap(),
+            algorithm_max_per_rider: 1,
+            wait_for_merge_min: default_merge_window_min(),
+        }
+    }
 }
 
 /// 速度档位规则（三档）。
@@ -220,6 +269,9 @@ pub struct SimConfig {
     pub fee: FeeRules,
     pub fine: FineRules,
     pub backorder: BackOrderRules,
+    /// 合并单 / 凑单规则（同店合并、算法每骑手上限、商家订单上限）。
+    #[serde(default)]
+    pub merge: MergeRules,
     pub speed: SpeedRules,
     pub rating_rules: RatingRules,
     pub level: LevelRules,
@@ -300,7 +352,9 @@ impl Default for SimConfig {
                 bonus_min_cents: 50,
                 bonus_max_cents: 120,
                 late_buffer_min: 5,
+                merge_wait_max_min: 3,
             },
+            merge: MergeRules::default(),
             speed: SpeedRules {
                 complaint_speed_kmh: [30.0, 45.0, 999.0],
                 hourly_coefficient: [1.00, 1.35, 2.20],

@@ -1,5 +1,7 @@
 //! 全局状态。tick 循环唯一的可变对象。
 
+use std::collections::HashMap;
+
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
@@ -23,6 +25,11 @@ use super::{
 
 /// 路网绕行系数：直线 → 实际骑行距离。
 pub const ROAD_FACTOR: f64 = 1.25;
+
+/// 判定「商家密集」的半径（米）。两家店在这个距离内就算邻居。
+///
+/// 用来把新订单往店多的那片撒——同批单之间够近，才可能合成一条腿一起送。
+pub const MERCHANT_CLUSTER_M: f64 = 800.0;
 
 /// 运行统计。
 #[derive(Debug, Clone, Default, Serialize)]
@@ -129,6 +136,12 @@ pub struct ConfigView {
     pub fee: FeeView,
     pub insurance_per_day_cents: i64,
     pub backorder_late_buffer_min: u32,
+    /// 算法一批里给**一个骑手**最多派几单。
+    pub merge_max_per_rider: u32,
+    /// 单个商家同时存在的未完成单量上限，`0` = 不限。
+    pub merge_merchant_cap: u32,
+    /// 凑单窗口（分钟）：在店等餐的骑手愿意为同店新单多等多久。
+    pub merge_wait_min: u32,
     /// 下发坐标的坐标系（方案 A：内部始终 GCJ-02，这里只决定出口转换）。
     pub coord_system: CoordSystem,
 }
@@ -268,7 +281,15 @@ impl World {
     }
 
     /// 骑手当前这一段要去哪。
+    ///
+    /// 优先读**路线当前腿**——那才是人真正朝着的点。从前只看 `held.first()`，
+    /// 而 `held` 的顺序是「接单先后」，跟脚步没关系：多单时顺路度评分一直在
+    /// 拿一个错的目标算方向。
     pub fn rider_current_target(&self, rider: &Rider) -> Option<LatLng> {
+        if let Some(pos) = rider.current_leg_pos() {
+            return Some(pos);
+        }
+        // 没有路线时（老存档、手工构造的手持单）退回旧口径。
         let first = rider.held.first()?;
         let order = self.order(first.order_id)?;
         Some(match first.phase {
@@ -524,9 +545,22 @@ impl World {
 
     /// 生成 1 单。商户按评分加权抽取（评分高的店单量多）。
     pub fn generate_order(&mut self) -> Option<OrderId> {
+        // 单店未完成订单上限（0 = 不限）。没有它，热门店能把整条街的单都发出
+        // 大厅，一堆同店单谁也没法合并，只能一个个单独跑。
+        let cap = self.cfg.merge.max_active_orders_per_merchant;
+        let mut active: HashMap<u32, u32> = HashMap::new();
+        if cap > 0 {
+            for o in &self.orders {
+                if o.status.is_active() {
+                    *active.entry(o.merchant_id).or_insert(0) += 1;
+                }
+            }
+        }
+
         let candidates: Vec<(u32, String, LatLng, f32, u32, u8)> = self
             .merchants
             .iter()
+            .filter(|m| cap == 0 || active.get(&m.id).copied().unwrap_or(0) < cap)
             .filter_map(|m| {
                 m.coords().map(|c| {
                     (
@@ -544,8 +578,20 @@ impl World {
             return None;
         }
 
-        // 评分加权：rating^6，把 4.5 和 4.9 的差距拉到 1.7 倍
-        let weights: Vec<f64> = candidates.iter().map(|c| (c.3 as f64).powi(6)).collect();
+        // 评分加权：rating^6，把 4.5 和 4.9 的差距拉到 1.7 倍。
+        // 再乘一层「商家密集度」：店扎堆的地方单量更高，同批单才可能落在
+        // 几百米内互相合并（见 [`MERCHANT_CLUSTER_M`]）。
+        let weights: Vec<f64> = candidates
+            .iter()
+            .map(|c| {
+                let near = candidates
+                    .iter()
+                    .filter(|o| haversine_m(c.2, o.2) <= MERCHANT_CLUSTER_M)
+                    .count();
+                let density = (1.0 + 0.5 * near.saturating_sub(1) as f64).min(3.0);
+                (c.3 as f64).powi(6) * density
+            })
+            .collect();
         let total: f64 = weights.iter().sum();
         let mut pick = self.rng.random_range(0.0..total);
         let mut idx = 0usize;
@@ -960,6 +1006,9 @@ impl World {
             },
             insurance_per_day_cents: self.cfg.fine.insurance_per_day_cents,
             backorder_late_buffer_min: self.cfg.backorder.late_buffer_min,
+            merge_max_per_rider: self.cfg.merge.algorithm_max_per_rider,
+            merge_merchant_cap: self.cfg.merge.max_active_orders_per_merchant,
+            merge_wait_min: self.cfg.merge.wait_for_merge_min,
             coord_system: self.cfg.coord_system,
         }
     }

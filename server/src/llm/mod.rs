@@ -50,7 +50,7 @@ pub use brain::{
 };
 pub use client::{
     ENV_API_KEY, ENV_BASE_URL, ENV_MODEL, ENV_MODEL_DIRECTOR, ENV_MODEL_RIDER, ENV_MODEL_STATION,
-    LayerKey, LayerModels, LlmClient, LlmConfig, LlmError, ModelInfo,
+    LayerKey, LayerModels, LlmClient, LlmConfig, LlmError, ModelInfo, normalize_base_url,
 };
 pub use director_brain::{
     DirectorBrain, DirectorOutcome, PreparedWorldPlan, ValidatedWorldOp, WorldFetch, WorldOp,

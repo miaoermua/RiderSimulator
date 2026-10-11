@@ -6,6 +6,7 @@ use super::{
     OrderId, RiderId,
     config::{PEAK_THRESHOLD_MULTIPLIER, SimConfig},
     geo::LatLng,
+    route::{LegKind, RouteTask},
     weather::Weather,
 };
 
@@ -236,7 +237,12 @@ mod leg_progress_tests {
         assert_eq!(RiderKind::Simulated.route(), RiderKind::Human.route());
         assert_eq!(
             RiderKind::Human.route(),
-            &[Phase::ToShop, Phase::WaitingFood, Phase::ToCustomer, Phase::ArrivedCustomer][..],
+            &[
+                Phase::ToShop,
+                Phase::WaitingFood,
+                Phase::ToCustomer,
+                Phase::ArrivedCustomer
+            ][..],
             "真人一旦砍掉前两段，tick 里那些取餐关口就再也不会被真人碰到"
         );
     }
@@ -396,6 +402,15 @@ pub struct Rider {
     pub lifetime_completed: u32,
 
     pub held: Vec<HeldOrder>,
+    /// 路线任务：骑手此刻真正在走的那条**腿队列**，队首是当前腿。
+    ///
+    /// 与 `held` 的分工：`held` 是「手上有哪些单」的清单（订单级状态 + 对外镜像），
+    /// 这里才是「人在往哪走」。位置推进只认这条路线——从前每单一腿各推一次，
+    /// 同一 tick 内互相拉扯，那才是抖动 / 瞬移的来源。
+    ///
+    /// `None` = 没在跑任何路段（手上没活，或停在同一处等餐）。
+    #[serde(default)]
+    pub route: Option<RouteTask>,
     /// 系统刚指派过来、骑手还没点「接受」的那张单。
     ///
     /// 为什么需要单独标记：「拒绝一张还没接受的指派单」和「取消一张
@@ -469,6 +484,7 @@ impl Rider {
             online_minutes: 0,
             lifetime_completed: 0,
             held: Vec::new(),
+            route: None,
             frozen_until_min: 0,
             injured_until_min: 0,
             strategy: SimStrategy::default(),
@@ -532,6 +548,70 @@ impl Rider {
 
     pub fn is_holding(&self, order_id: OrderId) -> bool {
         self.held.iter().any(|h| h.order_id == order_id)
+    }
+
+    /// 这单是不是骑手当前正在走的那条腿？
+    ///
+    /// **只有当前腿才推进位置与倒计时**。一个骑手同一时刻只有一条腿，
+    /// 这就是「位置不再被多单互相拉扯」的落点。
+    ///
+    /// 没有路线信息时（老存档、绕过接单流程直接塞的单）**一律视为当前腿**，
+    /// 退回「每单一腿」的旧行为——宁可偶尔抖一下，也不能让单烂在手里不动。
+    pub fn is_current_leg(&self, order_id: OrderId) -> bool {
+        match self.route.as_ref() {
+            None => true,
+            Some(route) => route.is_current(order_id),
+        }
+    }
+
+    /// 路线跑空后把 `route` 收回 `None`，免得留一个空壳。
+    pub fn prune_route(&mut self) {
+        if self.route.as_ref().is_some_and(RouteTask::is_empty) {
+            self.route = None;
+        }
+    }
+
+    /// 从**手持单和路线**上一起摘掉这单。
+    ///
+    /// 只 `held.retain` 是旧做法：腿还赖在路线上，骑手就会一直以为「还得去这个地方」，
+    /// 而队首被一张已经不存在的单占着，后面的单永远轮不到当前腿。
+    pub fn drop_order(&mut self, order_id: OrderId) {
+        self.held.retain(|h| h.order_id != order_id);
+        if let Some(route) = self.route.as_mut() {
+            route.remove_order(order_id);
+        }
+        self.prune_route();
+    }
+
+    /// 骑手到了一处取餐点：把该地点**所有**取餐腿一次性出队。
+    ///
+    /// 同店多单本来就在同一处取餐，人到店了这批餐就都算「已到取餐点」；若只弹
+    /// 当前那条，第二单还得再空耗一遍到店时长——人明明已经站在店里。
+    ///
+    /// 自动（[`super::tick`]）和真人确认（[`super::scheduler`]）两条路都走这里，
+    /// 免得两边对「到店」的理解长歪。
+    pub fn complete_pickup_legs_at_current(&mut self) {
+        let Some(shop) = self
+            .route
+            .as_ref()
+            .and_then(RouteTask::current)
+            .filter(|l| l.kind == LegKind::Pickup)
+            .map(|l| l.pos)
+        else {
+            return;
+        };
+        if let Some(route) = self.route.as_mut() {
+            route.complete_pickups_at(shop);
+        }
+        self.prune_route();
+    }
+
+    /// 当前腿的目标点——人此刻真正朝着的那个点。
+    ///
+    /// 顺路度、朝向提示都该读它，而不是 `held.first()`（那是「接单先后」，
+    /// 跟脚步没关系）。
+    pub fn current_leg_pos(&self) -> Option<LatLng> {
+        self.route.as_ref().and_then(RouteTask::current_pos)
     }
 
     pub fn held_mut(&mut self, order_id: OrderId) -> Option<&mut HeldOrder> {

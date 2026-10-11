@@ -195,6 +195,20 @@ export function RidersPanel({ selected, onSelect }: Props) {
                     {rejectLimit > 0 ? `/${rejectLimit}` : "（不限）"}
                   </Metric>
                   <Metric>{r.phase ? PHASE_LABEL[r.phase] : "空闲"}</Metric>
+                  {/* 「持单」只说明手上有哪几张单，先后顺序要看路线。
+                      一腿的没什么可看的（phase 已经说了他在干嘛），两腿以上才渲染。 */}
+                  {r.route.length > 1 && (
+                    <Metric>
+                      路线{" "}
+                      {r.route.map((leg, i) => (
+                        <span key={`${leg.order_id}-${leg.kind}`}>
+                          {i > 0 && " → "}
+                          {i + 1}.{leg.kind === "pickup" ? "取" : "送"}#{leg.order_id}
+                        </span>
+                      ))}
+                      （本腿还剩 {r.route[0].remaining_min} 分）
+                    </Metric>
+                  )}
                   <Metric>{SPEED_MODE_LABEL[r.speed_mode] ?? r.speed_mode}</Metric>
                   <Wallet cents={r.cash_cents} />
                   {r.hourly_wage_cents != null && <Metric>时薪 ¥{yuan(r.hourly_wage_cents)}</Metric>}

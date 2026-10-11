@@ -353,6 +353,17 @@ pub struct ConfigPatch {
     #[serde(default)]
     pub coord_system: Option<CoordSystem>,
 
+    // ---- 合并单 / 凑单 ----
+    /// 算法一批里给一个骑手最多派几单，1~3。
+    #[serde(default)]
+    pub merge_max_per_rider: Option<u32>,
+    /// 单个商家同时存在的未完成单量上限，0 = 不限（夹到 0~6）。
+    #[serde(default)]
+    pub merge_merchant_cap: Option<u32>,
+    /// 凑单窗口（分钟），0 = 不等（夹到 0~10）。
+    #[serde(default)]
+    pub merge_wait_min: Option<u32>,
+
     // ---- 计价规则（「单价系统」）----
     /// 起步价（分），0~2000。
     #[serde(default)]

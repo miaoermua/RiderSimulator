@@ -14,6 +14,7 @@ use super::{
     event::{DecisionSource, SimEvent},
     order::{OrderStatus, OrderTier},
     rider::{HeldOrder, Phase, RiderKind, SpeedMode},
+    route::{LegKind, RouteLeg, RouteTask},
     world::World,
 };
 
@@ -391,14 +392,28 @@ fn attach(world: &mut World, assignment: &Assignment) {
         order.credit_hall_idle(now);
     }
 
+    let shop = world.order(assignment.order).map(|o| o.merchant_pos());
     if let Some(rider) = world.rider_mut(assignment.rider) {
+        let to_shop = plan.to_shop_min.max(1);
         rider.held.push(HeldOrder::new(
             assignment.order,
             Phase::ToShop,
-            plan.to_shop_min.max(1),
+            to_shop,
             back_order,
             now,
         ));
+        // 路线：已有路线就把取餐腿插进去（自动排到第一个送达腿之前，
+        // 保证餐先取齐），没有就起一条。
+        //
+        // `held` 记「手上有哪些单」，路线记「脚步往哪迈」——合并单就是在这里发生的：
+        // 第二单不再自己找路，而是并入同一串腿。
+        if let Some(shop) = shop {
+            let leg = RouteLeg::new(assignment.order, LegKind::Pickup, shop, to_shop);
+            match rider.route.as_mut() {
+                Some(route) => route.push_leg(leg),
+                None => rider.route = Some(RouteTask::from_pickup(assignment.order, shop, to_shop)),
+            }
+        }
     }
     world.stats.claims += 1;
 }
@@ -472,6 +487,8 @@ pub fn arrive_shop(
     held.remaining_min = 0;
     held.wait_started_min = now;
     held.wait_fined = false;
+    // 到店 = 取餐腿跑完。同店多单一起出队，别让第二单再排一次到店。
+    rider.complete_pickup_legs_at_current();
     Ok(state_event(world, rider_id).into_iter().collect())
 }
 
@@ -522,7 +539,7 @@ pub fn deliver(
     let (entry, late) = economy::settle_delivery(&cfg, rider, &mut order, now);
     let takehome = rider.takehome_cents();
     let hourly = rider.hourly_wage_cents();
-    rider.held.retain(|h| h.order_id != order_id);
+    rider.drop_order(order_id);
     let rider_name = rider.name.clone();
     world.stats.orders_delivered += 1;
     if late {
@@ -636,7 +653,7 @@ pub fn reject_order(
             }
             rider.assign_pending = None;
             rider.rejected += 1;
-            rider.held.retain(|h| h.order_id != order_id);
+            rider.drop_order(order_id);
             rider.rejected
         };
         world.release_to_hall(order_id);
@@ -659,7 +676,7 @@ pub fn reject_order(
             Some(order_id),
             now,
         );
-        rider.held.retain(|h| h.order_id != order_id);
+        rider.drop_order(order_id);
 
         // 回大厅重投，**绝不流单**：窗口内还能被人抢；
         // 窗口过了还没人接，由 tick 统一走强制指派（见 `tick` 第 4 步）。

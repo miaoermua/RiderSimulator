@@ -6,13 +6,14 @@
 use super::{
     OrderId, RiderId,
     ai::{self, LlmPlan},
-    chat,
-    economy,
+    chat, economy,
     event::{DayLedger, DecisionSource, SimEvent},
     geo::LatLng,
     order::OrderStatus,
     rider::{Phase, RiderKind},
-    risk, scheduler,
+    risk,
+    route::{LegKind, RouteLeg, RouteTask},
+    scheduler,
     world::{Redispatch, World},
 };
 
@@ -191,7 +192,11 @@ pub fn ai_roster(world: &World, input: &TickInput) -> Vec<RiderId> {
 fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
     let pending = world.pending_orders();
     let idle = ai_roster(world, input);
-    if pending.is_empty() || idle.is_empty() {
+    // 「在店门口等餐」的骑手不算空闲，但同店新单能顺手塞给他们（凑单窗口）。
+    // 所以不能只看 `idle`：一屋子人全在等餐时这里要是提前 return，
+    // 凑单就永远不会发生——而那正是这套机制要覆盖的场面。
+    let merging = ai::merge_riders(world);
+    if pending.is_empty() || (idle.is_empty() && merging.is_empty()) {
         world.llm_plan = None;
         return;
     }
@@ -199,7 +204,9 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
     let plan = world.llm_plan.take();
     // (分配、来源、层、决策 id、说明)
     let (assignments, source, layer, decision_id, note) = match plan {
-        Some(p) if world.cfg.llm_brain_enabled => {
+        // 凑单是算法自己的事：LLM 拿到的名单里没有「等餐中」的人，
+        // 硬走它的计划只会把兜底说明写成「输出全被丢弃」，误导人。
+        Some(p) if world.cfg.llm_brain_enabled && !idle.is_empty() => {
             let verdict = ai::validate_llm_plan(world, &p, &idle, &pending);
             if verdict.assignments.is_empty() {
                 // LLM 一条都没通过校验 → 算法兜底
@@ -234,7 +241,16 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
             DecisionSource::Algorithm,
             "algorithm",
             0,
-            format!("贪心：{} 空闲骑手 / {} 待抢单", idle.len(), pending.len()),
+            format!(
+                "贪心：{} 空闲骑手 / {} 待抢单{}",
+                idle.len(),
+                pending.len(),
+                if merging.is_empty() {
+                    String::new()
+                } else {
+                    format!("，另有 {} 人在店等餐可凑单", merging.len())
+                }
+            ),
         ),
     };
 
@@ -292,6 +308,38 @@ fn advance_riders(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInp
     }
 }
 
+/// 骑手到了一处取餐点：把该地点**所有**取餐腿一次性出队。
+///
+/// 同店多单本来就在同一处取餐，人到店了这批餐就都算「已到取餐点」。若只弹当前
+/// 那条，第二单还得再空耗一遍到店时长——人明明已经站在店里。
+fn complete_pickup_legs(world: &mut World, rid: RiderId) {
+    if let Some(rider) = world.rider_mut(rid) {
+        rider.complete_pickup_legs_at_current();
+    }
+}
+
+/// 出餐上路：给这单挂一条送达腿，并把整队的送达段按「就近优先」重排。
+///
+/// 排序从骑手**当前位置**起算，而不是从商家起算——多单共处一车时先送谁，
+/// 取决于人此刻在哪，这才是「顺路」的定义。
+fn push_dropoff_leg(world: &mut World, rid: RiderId, oid: OrderId, travel_min: u32) {
+    let Some(dest) = world.order(oid).map(|o| o.customer_pos()) else {
+        return;
+    };
+    let Some(rider) = world.rider_mut(rid) else {
+        return;
+    };
+    let leg = RouteLeg::new(oid, LegKind::Dropoff, dest, travel_min);
+    match rider.route.as_mut() {
+        Some(route) => route.push_leg(leg),
+        None => rider.route = Some(RouteTask::from_leg(leg)),
+    }
+    let cursor = rider.pos();
+    if let Some(route) = rider.route.as_mut() {
+        route.sort_dropoffs_nearest(cursor);
+    }
+}
+
 /// 推进单个 (骑手, 手持单)。
 ///
 /// `needs_click` = 这一步要真人点按钮（取餐 / 送达）。它**不等于**「是不是真人」：
@@ -336,16 +384,24 @@ fn step_one(
         )
     };
 
-    // 位置推进：每 tick 走 1/(remaining+1) 的距离，客户端看到的是连续移动
-    if matches!(phase, Phase::ToShop | Phase::ToCustomer)
-        && let Some(rider) = world.rider_mut(rid)
-    {
-        let from = rider.pos();
-        let frac = 1.0 / (remaining as f64 + 1.0);
-        rider.set_pos(LatLng::new(
-            from.lat + (target.lat - from.lat) * frac,
-            from.lng + (target.lng - from.lng) * frac,
-        ));
+    // 位置推进：每 tick 走 1/(remaining+1) 的距离，客户端看到的是连续移动。
+    //
+    // **只有当前腿动。** 一个骑手同一时刻只有一条腿在走；多单共处一车时若每单
+    // 各推一次，同一 tick 内会互相拉扯（`held` 里最后遍历到的那单说了算），
+    // 观感就是抖动与「瞬移」。不是当前腿的单直接冻结——人还没上路去它那儿，
+    // 连倒计时都不该走。（等餐段不在此列，那边的并行等餐另算。）
+    if matches!(phase, Phase::ToShop | Phase::ToCustomer) {
+        if !world.rider(rid).is_some_and(|r| r.is_current_leg(oid)) {
+            return;
+        }
+        if let Some(rider) = world.rider_mut(rid) {
+            let from = rider.pos();
+            let frac = 1.0 / (remaining as f64 + 1.0);
+            rider.set_pos(LatLng::new(
+                from.lat + (target.lat - from.lat) * frac,
+                from.lng + (target.lng - from.lng) * frac,
+            ));
+        }
     }
 
     // 真人骑手在倒计时归零后必须点按钮，兜底 10 分钟自动推进。
@@ -384,7 +440,11 @@ fn step_one(
                     h.wait_started_min = now;
                 }
             } else {
+                // 同店同批：先把这一炉的出餐时间对齐，再进等餐状态。
+                let prep = merge_prep_for_shop(world, rid, oid, prep);
                 enter_waiting_food(world, rid, oid, prep, now, events);
+                // 到店 = 取餐腿跑完。同店多单一起出队，别让第二单再排一次到店。
+                complete_pickup_legs(world, rid);
             }
         }
         Phase::WaitingFood => {
@@ -435,6 +495,9 @@ fn step_one(
                 h.awaiting_ack = false;
                 h.wait_started_min = now;
             }
+            // 出餐 = 生成送达腿。多单同店时第二条腿追加进同一串路线，
+            // 再按「就近优先」重排——这就是「一起送」的排序落点。
+            push_dropoff_leg(world, rid, oid, travel);
             if let Some(order) = world.order_mut(oid) {
                 order.status = OrderStatus::PickedUp;
                 order.picked_up_at_min = Some(now);
@@ -521,6 +584,66 @@ fn set_remaining(world: &mut World, rid: RiderId, oid: OrderId, v: u32) {
     {
         h.remaining_min = v;
     }
+}
+
+/// 同店同批的餐一起出：把这一炉的等待时间对齐，但**给「一起等」设个上限**。
+///
+/// 为什么对齐：同一家店的几单出自同一个灶台。若让先到点的那单单独出餐上路，
+/// 骑手就拎着半批餐走，剩下那单还得把到店、等餐再走一遍——两头都不像话。
+///
+/// 为什么有上限：也不能让一份慢餐把已经好了的餐压在那儿干等，那是拿顾客的
+/// 时间补贴「一起送」。超过 `merge_wait_max_min` 就各出各的。
+///
+/// 返回这一炉对齐后的等待分钟（给当前这单用），并顺手把兄弟单的剩余时间改齐。
+fn merge_prep_for_shop(world: &mut World, rid: RiderId, oid: OrderId, prep: u32) -> u32 {
+    let Some(merchant_id) = world.order(oid).map(|o| o.merchant_id) else {
+        return prep;
+    };
+    let cap = world.cfg.backorder.merge_wait_max_min;
+    if cap == 0 {
+        return prep;
+    }
+
+    // 同店、且还在等餐的兄弟单：已上路的和别家店的不算。
+    let siblings: Vec<(OrderId, u32)> = world
+        .rider(rid)
+        .map(|r| {
+            r.held
+                .iter()
+                .filter(|h| h.order_id != oid && h.phase == Phase::WaitingFood)
+                .map(|h| (h.order_id, h.remaining_min))
+                .collect()
+        })
+        .unwrap_or_default();
+    let same_shop: Vec<(OrderId, u32)> = siblings
+        .into_iter()
+        .filter(|(s, _)| {
+            world
+                .order(*s)
+                .is_some_and(|o| o.merchant_id == merchant_id)
+        })
+        .collect();
+    if same_shop.is_empty() {
+        return prep;
+    }
+
+    let waits = same_shop
+        .iter()
+        .map(|(_, left)| *left)
+        .chain(std::iter::once(prep));
+    let earliest = waits.clone().min().unwrap_or(prep);
+    let latest = waits.max().unwrap_or(prep);
+    // 一起出，但最多让最早好的那份多等 cap 分钟。
+    let aligned = latest.min(earliest.saturating_add(cap)).max(1);
+
+    if let Some(rider) = world.rider_mut(rid) {
+        for (s, _) in &same_shop {
+            if let Some(h) = rider.held_mut(*s) {
+                h.remaining_min = aligned;
+            }
+        }
+    }
+    aligned
 }
 
 fn enter_waiting_food(
@@ -846,6 +969,96 @@ mod tests {
         assert!(delivered, "AutoPilot 该把掉线真人的单送到头");
     }
 
+    /// 一个骑手身上压着**两家店**的单时，只有当前那条腿在动。
+    ///
+    /// 这是「多单不再互相拉扯、不再瞬移」的落点：从前每单一腿各推一次位置，
+    /// 同一 tick 里互相覆盖，`held` 中最后遍历到的那单说了算，观感就是抖。
+    #[test]
+    fn only_the_current_leg_moves_when_a_rider_holds_two_shop_orders() {
+        use crate::sim::geo::haversine_m;
+
+        let mut cfg = SimConfig::default();
+        cfg.sim_rider_count = 0;
+        // 抬到 2 才可能让同一个人压两单（`effective_max_held` 读的就是它）
+        cfg.backorder.max_held = 2;
+        let mut w = World::new_for_test(cfg, 7);
+        let rid = w.spawn_human_rider("张三");
+        w.rider_mut(rid).unwrap().online = true;
+        w.generate_order_batch(8);
+
+        // 凑两单落在**不同**商家上——同商家会被一次到店全部出队，测不出「排队」
+        let mut picked: Vec<OrderId> = Vec::new();
+        for oid in w.pending_orders() {
+            if picked.len() == 2 {
+                break;
+            }
+            let Some(mid) = w.order(oid).map(|o| o.merchant_id) else {
+                continue;
+            };
+            let same_shop = picked
+                .iter()
+                .any(|p| w.order(*p).is_some_and(|o| o.merchant_id == mid));
+            if same_shop {
+                continue;
+            }
+            if scheduler::assign_forced(&mut w, oid, rid).is_ok() {
+                picked.push(oid);
+            }
+        }
+        assert_eq!(picked.len(), 2, "测试前提：要能凑出两单落在不同商家上");
+        let (first, second) = (picked[0], picked[1]);
+
+        // 把第一单的到店倒计时拉长，免得它第一 tick 就到店、把第二单顶成当前腿，
+        // 那样就分不清「第二单没动」是因为冻结还是因为还没轮到。
+        w.rider_mut(rid)
+            .unwrap()
+            .held_mut(first)
+            .unwrap()
+            .remaining_min = 10;
+        let second_before = w
+            .rider(rid)
+            .unwrap()
+            .held
+            .iter()
+            .find(|h| h.order_id == second)
+            .map(|h| h.remaining_min)
+            .expect("第二单得在手上");
+
+        let shop_first = w.order(first).unwrap().merchant_pos();
+        let start = w.rider(rid).unwrap().pos();
+        let dist_before = haversine_m(start, shop_first);
+
+        tick(
+            &mut w,
+            TickInput {
+                ai_off: true,
+                hosted_humans: vec![rid],
+                ..Default::default()
+            },
+        );
+
+        let rider = w.rider(rid).unwrap();
+        assert!(
+            rider.route.as_ref().is_some_and(|r| r.is_current(first)),
+            "先接的那单才是当前腿"
+        );
+        let dist_after = haversine_m(rider.pos(), shop_first);
+        assert!(
+            dist_after < dist_before,
+            "当前腿该朝第一单的商家挪：{dist_before:.0}m → {dist_after:.0}m"
+        );
+        let second_after = rider
+            .held
+            .iter()
+            .find(|h| h.order_id == second)
+            .map(|h| h.remaining_min);
+        assert_eq!(
+            second_after,
+            Some(second_before),
+            "第二单不是当前腿，倒计时一步都不该走"
+        );
+    }
+
     /// 真人在线时 AI 必须让位：哪怕他手上没单，也不进 AI 的派单名单。
     #[test]
     fn an_online_human_is_left_alone_by_the_ai() {
@@ -987,6 +1200,81 @@ mod tests {
         };
         assert_eq!(*source, DecisionSource::Algorithm);
         assert!(!source.is_llm());
+    }
+
+    /// 「合适就合并」的端到端验证：**全员都在等餐、一个空闲骑手都没有**时，
+    /// 同店新单仍然要并到那位在店门口等餐的骑手手上。
+    ///
+    /// 这条测试盯的是 `run_ai` 那道「没空闲就提前 return」的闸门——漏了它，
+    /// 凑单只会在「恰好还有闲人」时才发生，而那恰恰不是它要解决的场面。
+    #[test]
+    fn a_waiting_rider_picks_up_a_same_shop_order_even_with_no_idle_rider() {
+        use crate::sim::{rider::Phase, world::CustomOrderSpec};
+
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            // 关掉自然出单：不然大厅里会冒出别家的单，把唯一一个名额占掉。
+            order_spawn_interval_min: 10_000,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 11);
+        let rid = w.sim_rider_ids()[0];
+
+        w.generate_order_batch(1);
+        let first = w.pending_orders()[0];
+        scheduler::assign_forced(&mut w, first, rid).expect("先塞一单给他");
+        // 到店倒计时压到 1 分钟，下一 tick 就到店进等餐。
+        w.rider_mut(rid)
+            .unwrap()
+            .held_mut(first)
+            .unwrap()
+            .remaining_min = 1;
+
+        tick(&mut w, TickInput::default());
+        assert!(
+            w.rider(rid)
+                .unwrap()
+                .held
+                .iter()
+                .any(|h| h.phase == Phase::WaitingFood),
+            "测试前提：他得先在店门口等餐"
+        );
+
+        // 同一家店又来一单，报价给高些，肯定越过接单意愿门槛。
+        let shop = w.order(first).unwrap().merchant_pos();
+        let shop_name = w.order(first).unwrap().merchant_name.clone();
+        let second = w.create_custom_order(CustomOrderSpec {
+            merchant_name: shop_name,
+            merchant_lat: shop.lat,
+            merchant_lng: shop.lng,
+            customer_name: None,
+            customer_address: None,
+            customer_lat: shop.lat + 0.01,
+            customer_lng: shop.lng,
+            fee_cents: Some(20_000),
+        });
+
+        tick(&mut w, TickInput::default());
+
+        let held = w.rider(rid).unwrap().held_ids();
+        assert!(
+            held.contains(&second),
+            "店里又来一单，该顺手并给他，实际手持 {held:?}"
+        );
+
+        // 控制台看到的路线：取餐腿必须排在送达腿前面（不能拎着半批餐去送）。
+        let r = w.rider(rid).unwrap();
+        let brief = crate::sim::event::RiderBrief::control(r, &w.cfg, w.elapsed_min);
+        let first_dropoff = brief.route.iter().position(|l| l.kind == LegKind::Dropoff);
+        let last_pickup = brief.route.iter().rposition(|l| l.kind == LegKind::Pickup);
+        if let (Some(d), Some(p)) = (first_dropoff, last_pickup) {
+            assert!(p < d, "取餐腿不该排在送达腿后面：{:?}", brief.route);
+        }
+        assert_eq!(
+            brief.route.iter().filter(|l| l.current).count(),
+            1,
+            "同一时刻只有一条当前腿"
+        );
     }
 
     /// `is_llm` 只承认真模型：救单、兜底、人工、托管都不算 LLM 决策。

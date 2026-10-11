@@ -10,8 +10,41 @@ use super::{
     config::SimConfig,
     order::Order,
     rider::{Phase, Rider, RiderKind, SpeedMode},
+    route::LegKind,
     weather::Weather,
 };
+
+/// 路线任务里的一腿。**只给控制台看**「这趟串了什么」：
+///
+/// `held` 只说明手上有哪几张单，看不出先后；合并单之后「先送谁」才是关键信息，
+/// 所以这里把队首顺序原样下发，`current` 标出他正在跑的那一腿。
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteLegBrief {
+    pub order_id: OrderId,
+    pub kind: LegKind,
+    /// 这一腿还要多少分钟：取餐腿是等餐时间，送达腿是骑行时间。
+    pub remaining_min: u32,
+    /// 是不是当前这一腿（队首）。
+    pub current: bool,
+}
+
+/// 路线快照。老存档 / 还没接单的骑手没有路线，给空数组——
+/// 控制台就能用同一套渲染，不用为「有没有路线」分叉。
+fn route_brief(r: &Rider) -> Vec<RouteLegBrief> {
+    let Some(task) = r.route.as_ref() else {
+        return Vec::new();
+    };
+    task.legs()
+        .iter()
+        .enumerate()
+        .map(|(i, leg)| RouteLegBrief {
+            order_id: leg.order_id,
+            kind: leg.kind,
+            remaining_min: leg.remaining_min,
+            current: i == 0,
+        })
+        .collect()
+}
 
 /// 骑手对外快照。财务字段按角色决定是否填充。
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +64,8 @@ pub struct RiderBrief {
     /// 今日已用掉的拒单次数。配合 `ConfigView::max_rejects_per_day` 显示额度。
     pub rejects_today: u32,
     pub held: Vec<OrderId>,
+    /// 路线任务：队首是当前腿，走完出队（见 [`RouteLegBrief`]）。
+    pub route: Vec<RouteLegBrief>,
     pub phase: Option<Phase>,
     pub lat: f64,
     pub lng: f64,
@@ -61,6 +96,7 @@ impl RiderBrief {
             completed: r.completed,
             rejects_today: r.rejected,
             held: r.held_ids(),
+            route: route_brief(r),
             phase,
             lat: r.lat,
             lng: r.lng,

@@ -17,6 +17,7 @@ pub mod merchant;
 pub mod order;
 pub mod rider;
 pub mod risk;
+pub mod route;
 pub mod scheduler;
 pub mod station;
 pub mod task;

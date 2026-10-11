@@ -28,6 +28,93 @@ const LAYER_MODEL_FIELDS: Array<[string, string]> = [
 ];
 
 /**
+ * 模型选择框。
+ *
+ * 为什么不直接用 antd `AutoComplete`：它**没有下拉箭头**，候选要点进输入框才弹出来，
+ * 于是「共 27 个可选模型」这句话对用户等于没说——看不出这里能选。
+ * 为什么不直接用 `Select`：`Select` 一旦有 `options` 就**不能自由输入**，
+ * 而上游可能不给 `/models` 接口（404、鉴权、企业网关屏蔽），那时用户连模型名都填不进去。
+ *
+ * 所以两者取长补短：**候选够用时给一个带箭头的 `Select`**，
+ * **候选为空（或用户想填清单外的名字）时退回 `AutoComplete`**。
+ * 两种形态都保留「能打字」，这是这个控件的底线。
+ */
+function ModelPicker({
+  value,
+  options,
+  onChange,
+  disabled,
+  error,
+  allowClear,
+}: {
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  onChange: (v: string) => void;
+  disabled?: boolean;
+  /** 上游拉取失败的原因；`null` = 没失败。类型对齐 store 的 `ModelListState`。 */
+  error?: string | null;
+  allowClear?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const errText = error || null;
+
+  if (options.length === 0) {
+    // 没有候选：保留输入框，但**自动展开空面板**并说清原因，
+    // 用户就不会在这里反复点、怀疑控件坏了。
+    return (
+      <AutoComplete
+        style={{ width: "100%" }}
+        disabled={disabled}
+        allowClear={allowClear}
+        value={value}
+        options={[]}
+        open={open}
+        onOpenChange={setOpen}
+        onChange={onChange}
+        placeholder="模型名"
+        notFoundContent={errText ? `上游拉取失败：${errText}` : "上游没给模型清单，可直接手填"}
+      >
+        <Input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="模型名，如 deepseek-chat"
+          suffix={
+          <span
+            aria-hidden
+            style={{ color: "rgba(0,0,0,0.25)", cursor: "pointer" }}
+            onClick={() => setOpen((v) => !v)}
+          >
+            ▾
+          </span>
+        }
+        />
+      </AutoComplete>
+    );
+  }
+
+  return (
+    <Select
+      showSearch
+      allowClear={allowClear}
+      disabled={disabled}
+      open={open}
+      onOpenChange={setOpen}
+      placeholder="点箭头选，或直接输入"
+      value={value || undefined}
+      options={options}
+      // showSearch 自己会过滤；这里再过一遍会把它筛空。
+      filterOption={() => true}
+      onChange={(v) => onChange(v ?? "")}
+      // 允许填清单外的模型名（上游刚上新、或清单被截断）。
+      onSearch={(s) => {
+        if (s && !options.some((o) => o.value === s)) onChange(s);
+      }}
+      style={{ width: "100%" }}
+    />
+  );
+}
+
+/**
  * 设置面板。
  *
  * 两部分：控制项（每次快照都可重建，直接读 store）与接入配置
@@ -74,12 +161,58 @@ export function SettingsPanel() {
 
       <Heading>AI</Heading>
       <Row label="AI 骑手数量" hint="0~8；减少时手上有单的先跑完">
+        <Space>
+          <InputNumber
+            min={0}
+            max={8}
+            disabled={!isControl}
+            value={c.sim_rider_count}
+            onChange={(v) => v != null && store.send("set_config", { sim_rider_count: v })}
+          />
+          <Button
+            disabled={!isControl || c.sim_rider_count >= 8}
+            onClick={() =>
+              store.send("set_config", { sim_rider_count: Math.min(8, c.sim_rider_count + 1) })
+            }
+          >
+            ＋ 加一个
+          </Button>
+        </Space>
+      </Row>
+      <Row
+        label="算法每骑手上限"
+        hint="同一轮里一个 AI 骑手最多吃几单；1 = 一轮一单"
+      >
+        <InputNumber
+          min={1}
+          max={3}
+          disabled={!isControl}
+          value={c.merge_max_per_rider}
+          onChange={(v) => v != null && store.send("set_config", { merge_max_per_rider: v })}
+        />
+      </Row>
+      <Row
+        label="单店未完成上限"
+        hint="同一家店同时压着几单未完成；0 = 不限。压太多谁也合不成"
+      >
         <InputNumber
           min={0}
-          max={8}
+          max={6}
           disabled={!isControl}
-          value={c.sim_rider_count}
-          onChange={(v) => v != null && store.send("set_config", { sim_rider_count: v })}
+          value={c.merge_merchant_cap}
+          onChange={(v) => v != null && store.send("set_config", { merge_merchant_cap: v })}
+        />
+      </Row>
+      <Row
+        label="凑单窗口"
+        hint="在店等餐的骑手愿为同店新单多等几分钟；0 = 不等，直接按原计划走"
+      >
+        <InputNumber
+          min={0}
+          max={10}
+          disabled={!isControl}
+          value={c.merge_wait_min}
+          onChange={(v) => v != null && store.send("set_config", { merge_wait_min: v })}
         />
       </Row>
       <Row
@@ -326,7 +459,11 @@ function AdvancedSection({
   }, [models]);
 
   /** 上游给的模型名做成下拉候选；输入框仍允许自由填（上游可能不给 models 接口）。 */
-  const modelOptions = (models?.models ?? []).map((m) => ({ value: m.id, label: m.id }));
+  const modelOptions: Array<{ value: string; label: string }> = (models?.models ?? [])
+    // 上游偶尔给出空 id 或非字符串（见过 `{id: null}` 的脏数据）。
+    // 过滤掉而不是让它们进 options，否则 Select 会拿 undefined 当 value。
+    .filter((m): m is typeof m & { id: string } => typeof m?.id === "string" && m.id !== "")
+    .map((m) => ({ value: m.id, label: m.id }));
 
   const saveNames = () => {
     const list = names
@@ -385,7 +522,7 @@ function AdvancedSection({
           onChange={(e) => setKey(e.target.value)}
         />
       </Row>
-      <Row label="Base URL" hint="OpenAI 兼容端点，留空 = 用默认" stack>
+      <Row label="Base URL" hint="OpenAI 兼容端点的根，一般到 /v1 为止；留空 = 用默认" stack>
         <Input
           disabled={disabled}
           placeholder="https://api.openai.com/v1"
@@ -396,22 +533,16 @@ function AdvancedSection({
           }}
         />
       </Row>
-      <Row label="模型" hint="三层没有单独指定时都用它" stack>
-        <AutoComplete
-          style={{ width: "100%" }}
+      <Row label="模型" hint="三层没有单独指定时都用它；点右侧箭头看候选" stack>
+        <ModelPicker
           disabled={disabled}
-          options={modelOptions}
-          placeholder="gpt-4o-mini"
           value={model}
+          options={modelOptions}
+          error={models?.error}
           onChange={(v) => {
             modelTouched.current = true;
             setModel(v);
           }}
-          filterOption={(input, opt) =>
-            String(opt?.value ?? "")
-              .toLowerCase()
-              .includes(input.toLowerCase())
-          }
         />
       </Row>
 
@@ -423,7 +554,7 @@ function AdvancedSection({
             : models?.error
               ? `拉取失败：${models.error}`
               : models
-                ? `共 ${models.models.length} 个可选模型（下拉候选）`
+                ? `共 ${models.models.length} 个模型，可在上方「模型」与各层模型里点箭头选择`
                 : "进面板时自动拉取"
         }
       >
@@ -433,23 +564,22 @@ function AdvancedSection({
       </Row>
 
       {LAYER_MODEL_FIELDS.map(([field, label]) => (
-        <Row key={field} label={`${label}层模型`} hint="留空 = 用全局模型" stack>
-          <AutoComplete
-            style={{ width: "100%" }}
+        <Row
+          key={field}
+          label={`${label}层模型`}
+          hint={`留空 = 用全局模型${modelOptions.length ? "；点箭头看候选" : ""}`}
+          stack
+        >
+          <ModelPicker
             disabled={disabled}
             allowClear
-            options={modelOptions}
-            placeholder={model || "全局模型"}
             value={layerModels[field] ?? ""}
+            options={modelOptions}
+            error={models?.error}
             onChange={(v) => {
               layerTouched.current = true;
-              setLayerModels((d) => ({ ...d, [field]: v ?? "" }));
+              setLayerModels((d) => ({ ...d, [field]: v }));
             }}
-            filterOption={(input, opt) =>
-              String(opt?.value ?? "")
-                .toLowerCase()
-                .includes(input.toLowerCase())
-            }
           />
         </Row>
       ))}

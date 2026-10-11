@@ -60,10 +60,7 @@ fn offenders(needle: &str) -> Vec<String> {
 #[test]
 fn sim_never_depends_on_human() {
     let hits = offenders("crate::human");
-    let hits: Vec<String> = hits
-        .into_iter()
-        .chain(offenders("human::"))
-        .collect();
+    let hits: Vec<String> = hits.into_iter().chain(offenders("human::")).collect();
 
     assert!(
         hits.is_empty(),
@@ -94,10 +91,7 @@ fn sim_has_no_io_and_no_wall_clock() {
         "thread::sleep",
     ];
 
-    let hits: Vec<String> = banned
-        .iter()
-        .flat_map(|needle| offenders(needle))
-        .collect();
+    let hits: Vec<String> = banned.iter().flat_map(|needle| offenders(needle)).collect();
 
     assert!(
         hits.is_empty(),
