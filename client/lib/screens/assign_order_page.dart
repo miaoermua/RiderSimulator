@@ -63,6 +63,16 @@ class _AssignOrderPageState extends State<AssignOrderPage> {
       Navigator.of(context).maybePop();
       return;
     }
+    if (state.assignRemainingMs <= 0) {
+      // 30 秒到点。额度用尽时「自动拒绝」根本发不出去，只能自动收下——
+      // 不然骑手会卡在一张既拒不掉、又没确认的单上。
+      if (state.rejectQuotaExhausted) {
+        _accept(auto: true);
+      } else {
+        _reject(auto: true);
+      }
+      return;
+    }
     if (state.assignOrder == null && !_resynced) {
       // 单还在路上（order_claimed 不带订单体），补一次快照。
       _resynced = true;
@@ -71,16 +81,29 @@ class _AssignOrderPageState extends State<AssignOrderPage> {
     setState(() {});
   }
 
-  void _accept() {
-    // 服务端已经把这单挂上来了，接受 = 确认，不发上行指令。
-    widget.state.resolveAssign();
+  /// 接受。**必须发上行**：服务端靠 `assign_pending` 区分「拒掉一张没确认的
+  /// 指派单」（吃额度）和「取消一张已经接下的单」（罚钱）。不确认就退单，
+  /// 会被当成前者，白吃一次额度。
+  void _accept({bool auto = false}) {
+    final state = widget.state;
+    final id = state.assignOrder?.id ?? state.assignOrderId;
+    if (id != null) widget.client.acceptAssign(id);
+    if (auto) state.note('30 秒未确认，这单已自动接下', kind: LogKind.info);
+    state.resolveAssign();
     Navigator.of(context).maybePop();
   }
 
-  void _reject() {
-    final order = widget.state.assignOrder;
+  void _reject({bool auto = false}) {
+    final state = widget.state;
+    if (state.rejectQuotaExhausted) {
+      // 服务端一定会挡回来，就地提示比让骑手以为拒成功了强。
+      state.note('你今天拒绝已超出上限', kind: LogKind.bad);
+      return;
+    }
+    final order = state.assignOrder;
     if (order != null) widget.client.reject(order.id);
-    widget.state.resolveAssign();
+    if (auto) state.note('30 秒未确认，已自动拒单', kind: LogKind.info);
+    state.resolveAssign();
     Navigator.of(context).maybePop();
   }
 
@@ -119,6 +142,7 @@ class _AssignOrderPageState extends State<AssignOrderPage> {
                               style: TextStyle(fontSize: 12, color: Colors.grey),
                             ),
                           ),
+                          _QuotaBanner(state: widget.state),
                           OrderCard(
                             order: order,
                             state: widget.state,
@@ -134,6 +158,45 @@ class _AssignOrderPageState extends State<AssignOrderPage> {
                 ),
         );
       },
+    );
+  }
+}
+
+/// 拒单额度条。
+///
+/// 额度是当天的一次性资源，骑手拒绝之前必须知道还剩几次——拒超了就是
+/// 「这一单只能收下」，是本页最该说清楚的一件事。
+class _QuotaBanner extends StatelessWidget {
+  const _QuotaBanner({required this.state});
+
+  final GameState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final left = state.rejectQuotaLeft;
+    final used = state.me?.rejectsToday ?? 0;
+    final limit = state.config.maxRejectsPerDay;
+
+    final (text, fg, bg, icon) = state.rejectQuotaExhausted
+        ? ('你今天拒绝已超出上限，这一单拒不掉、只能收下', Colors.red.shade800, Colors.red.shade50, Icons.block)
+        : left == null
+            ? ('今日拒单不限次数（已拒 $used 单）', Colors.grey.shade800, Colors.grey.shade100, Icons.info_outline)
+            : ('今日还能拒 $left 单（已用 $used/$limit）', Colors.orange.shade900, Colors.orange.shade50, Icons.info_outline);
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(8)),
+      child: Row(
+        children: [
+          Icon(icon, size: 16, color: fg),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(text, style: TextStyle(fontSize: 12, color: fg)),
+          ),
+        ],
+      ),
     );
   }
 }

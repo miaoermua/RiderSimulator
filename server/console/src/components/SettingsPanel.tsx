@@ -205,6 +205,15 @@ export function SettingsPanel() {
           onChange={(v) => v != null && store.send("set_config", { backorder_max: v })}
         />
       </Row>
+      <Row label="每日拒单上限" hint="0 = 不限；拒完额度后系统塞来的指派单也拒不掉">
+        <InputNumber
+          min={0}
+          max={999}
+          disabled={!isControl}
+          value={c.max_rejects_per_day}
+          onChange={(v) => store.send("set_config", { max_rejects_per_day: Math.max(0, v ?? 0) })}
+        />
+      </Row>
       <SwitchRow
         label="允许超速"
         hint="骑手可切到 45km/h 档"

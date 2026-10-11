@@ -15,7 +15,7 @@ use super::{
     event::{DayLedger, RiderBrief},
     geo::{CoordSystem, LatLng, bearing_deg, haversine_m},
     merchant::Merchant,
-    order::{ExtraTask, Order, OrderStatus, OrderTier},
+    order::{ExtraTask, FeeBreakdown, Order, OrderStatus, OrderTier},
     rider::{Phase, Rider, RiderKind, SpeedMode},
     task::TaskTemplate,
     weather::{Weather, WeatherEvent},
@@ -53,6 +53,28 @@ pub enum Redispatch {
     /// （[`crate::sim::scheduler::rescue_nearest`]）。它绝不会被判流单。
     NeedsRescue,
 }
+
+/// 临时插单的入参。坐标**已经**是内部坐标系（GCJ-02，入口处换算过）。
+///
+/// 与控制台「临时创建订单」面板一一对应：商家名 / 两端坐标 / 金额，
+/// 其余字段（距离、承诺时限、抽水）由服务端按与自然生成单同一套规则补齐。
+#[derive(Debug, Clone)]
+pub struct CustomOrderSpec {
+    pub merchant_name: String,
+    pub merchant_lat: f64,
+    pub merchant_lng: f64,
+    pub customer_name: Option<String>,
+    pub customer_address: Option<String>,
+    pub customer_lat: f64,
+    pub customer_lng: f64,
+    /// 这张单的报价（分）。`Some` 时**直接**当最终报价，`None` 才按计价规则算。
+    pub fee_cents: Option<i64>,
+}
+
+/// 临时单报价的下界（1 元）：手滑输 0 会算出一张白跑的单。
+pub const MIN_CUSTOM_FEE_CENTS: i64 = 100;
+/// 临时单报价的上界（2000 元）：防止一个天文数字把整局流水玩坏。
+pub const MAX_CUSTOM_FEE_CENTS: i64 = 200_000;
 
 /// 计价规则的只读视图（「单价系统」的对外口径）。
 ///
@@ -93,6 +115,8 @@ pub struct ConfigView {
     pub backorder_enabled: bool,
     pub backorder_max: u32,
     pub max_orders_per_day: u32,
+    /// 每天能拒掉多少张指派单，`0` = 不限。
+    pub max_rejects_per_day: u32,
     pub ai_batch_enabled: bool,
     pub llm_brain_enabled: bool,
     pub show_expected_value: bool,
@@ -563,8 +587,14 @@ impl World {
         // 承诺时间与「骑手真正跑一趟」同源：到店 + 出餐（含高峰）+ 送到，再加分档缓冲。
         // 老实现只算「出餐均值 + 一段固定速度的路程」，到店段与高峰出餐都没进承诺，
         // 高峰期因此几乎每一单都注定超时（见 `ai::promise_minutes`）。
-        let promised_minutes =
-            ai::promise_minutes(self, merchant_id, road_distance_m, shop_walk, cust_walk, tier);
+        let promised_minutes = ai::promise_minutes(
+            self,
+            merchant_id,
+            road_distance_m,
+            shop_walk,
+            cust_walk,
+            tier,
+        );
 
         let fee = economy::quote(
             &self.cfg,
@@ -636,6 +666,116 @@ impl World {
         });
         self.stats.orders_created += 1;
         Some(id)
+    }
+
+    /// 临时插一张订单（控制端调试 / 演示用）。
+    ///
+    /// 与 [`World::generate_order`] 共用同一套字段填充与物理量推导，区别只有三点：
+    ///
+    /// 1. 商家名与两端坐标由调用方给定（入口处已换算回 GCJ-02）；
+    /// 2. `fee_cents` 给了就直接当最终报价（夹在
+    ///    [`MIN_CUSTOM_FEE_CENTS`]..[`MAX_CUSTOM_FEE_CENTS`]），不给才走计价规则；
+    /// 3. 商家 id 按名字回查，查不到记 `0`（未知商家）——`avg_prep_minutes`
+    ///    对此有 10 分钟的兜底，不会因此算出荒唐的承诺时限。
+    ///
+    /// 生成后**不进大厅广播**，由调用方决定怎么通知客户端。
+    pub fn create_custom_order(&mut self, spec: CustomOrderSpec) -> OrderId {
+        let merchant_pos = LatLng::new(spec.merchant_lat, spec.merchant_lng);
+        let customer = LatLng::new(spec.customer_lat, spec.customer_lng);
+
+        let merchant_name = match spec.merchant_name.trim() {
+            "" => "临时商家".to_string(),
+            s => s.chars().take(24).collect(),
+        };
+
+        // 按名字回查商户：名字对上就用它真实的步行难度（出餐时长由
+        // `avg_prep_minutes` 按 `merchant_id` 自己取）。对不上（控制台随手编的
+        // 名字）就记 0，走未知商家兜底。
+        let (merchant_id, shop_walk) = match self.merchants.iter().find(|m| m.name == merchant_name)
+        {
+            Some(m) => (m.id, m.walk_difficulty.min(2)),
+            None => (0, 0u8),
+        };
+
+        let road_distance_m = (haversine_m(merchant_pos, customer) * ROAD_FACTOR)
+            .round()
+            .max(1.0) as u32;
+        let tier = OrderTier::Normal;
+        let promised_minutes =
+            ai::promise_minutes(self, merchant_id, road_distance_m, shop_walk, 0, tier);
+
+        let mut fee = economy::quote(
+            &self.cfg,
+            road_distance_m,
+            self.weather,
+            self.sim_minute,
+            1,
+            tier,
+            self.cfg.commission_rate,
+        );
+        if let Some(cents) = spec.fee_cents {
+            // 手填报价：其余分项清零，只留「报价 + 抽水 + 到手」三件对得上的账，
+            // 免得控制台看到一串与总额无关的里程/雨补明细还要自己心算。
+            let quoted = cents.clamp(MIN_CUSTOM_FEE_CENTS, MAX_CUSTOM_FEE_CENTS);
+            let commission = (quoted as f32 * self.cfg.commission_rate).round() as i64;
+            fee = FeeBreakdown {
+                base_fee_cents: quoted,
+                distance_extra_cents: 0,
+                rain_bonus_cents: 0,
+                level_bonus_cents: 0,
+                surge_multiplier: 1.0,
+                commission_cents: commission,
+                quoted_fee_cents: quoted,
+                takehome_cents: quoted - commission,
+            };
+        }
+
+        let id = self.next_order_id;
+        self.next_order_id += 1;
+        let now = self.elapsed_min;
+        let customer_name = match spec.customer_name.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s.chars().take(24).collect(),
+            _ => format!("顾客{}", self.rng.random_range(1000..9999)),
+        };
+        let customer_address = match spec.customer_address.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s.chars().take(48).collect(),
+            _ => format!("{}附近", merchant_name),
+        };
+
+        self.orders.push(Order {
+            id,
+            merchant_id,
+            merchant_name,
+            merchant_lat: merchant_pos.lat,
+            merchant_lng: merchant_pos.lng,
+            customer_name,
+            customer_address,
+            remark: String::new(),
+            customer_lat: customer.lat,
+            customer_lng: customer.lng,
+            distance_m: road_distance_m,
+            promised_minutes,
+            tier,
+            merchant_walk_difficulty: shop_walk,
+            customer_walk_difficulty: 0,
+            created_at_min: now,
+            claim_deadline_min: now + self.cfg.claim_window_ticks() as u64,
+            picked_up_at_min: None,
+            delivered_at_min: None,
+            fee,
+            redispatch_count: 0,
+            surcharge_cents: 0,
+            status: OrderStatus::Pending,
+            assigned_to: None,
+            forced: false,
+            back_order: false,
+            back_order_bonus_cents: 0,
+            task: None,
+            urge_count: 0,
+            prep_minutes: None,
+        });
+        self.stats.orders_created += 1;
+        id
     }
 
     /// 把订单退回大厅重投：阶梯加价、重置抢单窗口、累加重投次数。
@@ -801,6 +941,7 @@ impl World {
             backorder_enabled: self.cfg.backorder_enabled,
             backorder_max: self.cfg.backorder.max_held,
             max_orders_per_day: self.cfg.max_orders_per_day,
+            max_rejects_per_day: self.cfg.max_rejects_per_day,
             ai_batch_enabled: self.cfg.ai_batch_enabled,
             llm_brain_enabled: self.cfg.llm_brain_enabled,
             show_expected_value: self.cfg.show_expected_value,
@@ -1073,6 +1214,93 @@ mod tests {
             assert!(o.merchant_pos().is_valid());
             assert_eq!(o.status, OrderStatus::Pending);
         }
+    }
+
+    /// 临时插的单要把调用方填的东西原样带上，且补齐的物理量与自然单同源。
+    #[test]
+    fn custom_order_keeps_the_handed_in_fields() {
+        let mut w = World::new_for_test(SimConfig::default(), 5);
+        let known = w.merchants[0].name.clone();
+        let id = w.create_custom_order(CustomOrderSpec {
+            // 名字带空白：trim 之后应该还能命中真实商户。
+            merchant_name: format!("  {known}  "),
+            merchant_lat: 30.5,
+            merchant_lng: 114.4,
+            customer_name: Some("测试顾客".into()),
+            customer_address: None,
+            customer_lat: 30.51,
+            customer_lng: 114.41,
+            fee_cents: None,
+        });
+        let o = w.order(id).expect("订单在");
+        assert_eq!(o.merchant_name, known);
+        assert_ne!(o.merchant_id, 0, "名字对得上就该回填真实商户 id");
+        assert_eq!(o.customer_name, "测试顾客");
+        assert_eq!((o.merchant_lat, o.merchant_lng), (30.5, 114.4));
+        assert_eq!((o.customer_lat, o.customer_lng), (30.51, 114.41));
+        assert!(o.distance_m >= 1);
+        assert!(
+            crate::sim::config::PROMISE_MINUTES_RANGE.0 <= o.promised_minutes
+                && o.promised_minutes <= crate::sim::config::PROMISE_MINUTES_RANGE.1
+        );
+        assert!(o.fee.quoted_fee_cents > 0);
+        assert_eq!(o.status, OrderStatus::Pending);
+        assert_eq!(o.assigned_to, None);
+        assert!(!o.forced, "临时单不是强制指派单");
+        assert!(o.customer_pos().is_valid());
+    }
+
+    /// 手填金额：给了就直接当报价，越界夹取；不给才走计价规则。
+    #[test]
+    fn custom_order_fee_can_be_forced_and_is_clamped() {
+        let mut w = World::new_for_test(SimConfig::default(), 5);
+        let spec = |fee: Option<i64>| CustomOrderSpec {
+            // 编造的名字一定不在商户表里 → merchant_id 0，出餐走兜底。
+            merchant_name: "自造商家".into(),
+            merchant_lat: 30.5,
+            merchant_lng: 114.4,
+            customer_name: None,
+            customer_address: None,
+            customer_lat: 30.6,
+            customer_lng: 114.5,
+            fee_cents: fee,
+        };
+
+        let id = w.create_custom_order(spec(Some(1234)));
+        let o = w.order(id).expect("订单在");
+        assert_eq!(o.merchant_id, 0);
+        assert_eq!(o.merchant_name, "自造商家");
+        assert_eq!(o.fee.base_fee_cents, 1234);
+        assert_eq!(o.fee.quoted_fee_cents, 1234);
+        assert_eq!(
+            o.fee.takehome_cents,
+            1234 - o.fee.commission_cents,
+            "到手必须 = 报价 - 抽水"
+        );
+
+        // 手滑 0 元会造出一张白跑的单，夹到下界；天文数字夹到上界。
+        let low_id = w.create_custom_order(spec(Some(0)));
+        assert_eq!(
+            w.order(low_id).expect("订单在").fee.quoted_fee_cents,
+            MIN_CUSTOM_FEE_CENTS
+        );
+        let high_id = w.create_custom_order(spec(Some(i64::MAX)));
+        assert_eq!(
+            w.order(high_id).expect("订单在").fee.quoted_fee_cents,
+            MAX_CUSTOM_FEE_CENTS
+        );
+
+        // 不填金额时回到计价规则：报价为正，且明细能对上总额。
+        let auto_id = w.create_custom_order(spec(None));
+        let auto = w.order(auto_id).expect("订单在");
+        assert!(auto.fee.quoted_fee_cents > 0);
+        assert_eq!(
+            auto.fee.quoted_fee_cents,
+            auto.fee.base_fee_cents
+                + auto.fee.distance_extra_cents
+                + auto.fee.level_bonus_cents
+                + auto.fee.rain_bonus_cents
+        );
     }
 
     /// 退回大厅的单要给接手骑手重新留出时限。

@@ -63,6 +63,8 @@ export interface RiderBrief {
   level: number;
   rating: number;
   completed: number;
+  /** 今日已用掉的拒单次数。配合 `ConfigView.max_rejects_per_day` 显示额度。 */
+  rejects_today: number;
   held: number[];
   phase: Phase | null;
   lat: number;
@@ -178,6 +180,8 @@ export interface ConfigView {
   backorder_enabled: boolean;
   backorder_max: number;
   max_orders_per_day: number;
+  /** 每日拒单额度。**0 = 不限**。拒完额度后指派单就拒不掉了。 */
+  max_rejects_per_day: number;
   ai_batch_enabled: boolean;
   llm_brain_enabled: boolean;
   show_expected_value: boolean;
@@ -389,6 +393,15 @@ export interface EventPayloads {
     forced: boolean;
   };
   order_expired: { order_id: number };
+  /** 骑手拒掉了一张还没确认的指派单。只推给本人和控制端。 */
+  assign_rejected: {
+    rider_id: number;
+    order_id: number;
+    /** 含这一次，今日已用掉的额度。 */
+    used: number;
+    /** 上限；`0` = 不限。 */
+    limit: number;
+  };
   order_picked_up: { order_id: number; rider_id: number; prep_minutes: number };
   order_delivered: {
     order_id: number;

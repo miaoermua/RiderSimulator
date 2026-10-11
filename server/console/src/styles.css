@@ -73,6 +73,16 @@ body {
   background: var(--rs-bg-layout);
 }
 
+/* 临时插单弹窗里的选点地图。必须有显式高度——Leaflet 靠容器尺寸
+   算瓦片，高度为 0 时会渲染出一片空白。 */
+.pick-map {
+  height: 320px;
+  width: 100%;
+  border: 1px solid var(--rs-border-secondary);
+  border-radius: 6px;
+  background: var(--rs-bg-layout);
+}
+
 .leaflet-container {
   background: var(--rs-bg-layout);
   font: inherit;

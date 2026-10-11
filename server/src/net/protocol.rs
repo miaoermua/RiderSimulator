@@ -79,8 +79,18 @@ pub enum ClientMessage {
         #[serde(default)]
         back_order: bool,
     },
-    /// 拒单（把已指派但未取货的单退回大厅）。
+    /// 拒单。
+    ///
+    /// 代价取决于这张单的来历：拒绝一张**还没接受的系统指派单**只吃当日
+    /// 拒单额度（`max_rejects_per_day`），额度用完会被 `REJECT_LIMIT_REACHED`
+    /// 挡回来；取消一张**已经接下的单**照旧罚 `fine.cancel_cents`。
     Reject { order_id: OrderId },
+    /// 接受一张系统强制指派的单。
+    ///
+    /// 订单在指派那一刻就已经挂到骑手身上了（世界状态必须立刻自洽），
+    /// 所以这条指令**不改调度状态**，只是把「待确认」标记摘掉——
+    /// 从那以后这单就是骑手自己接的，再取消就得罚款。
+    AcceptAssign { order_id: OrderId },
     /// 催单。
     Urge { order_id: OrderId },
     /// 到店确认（真人骑手必须点）。
@@ -167,6 +177,33 @@ pub enum ClientMessage {
     SetAi(AiPatch),
     /// 人工否决一条 AI 决策。
     RejectAi { decision_id: u64 },
+
+    /// 临时插一张订单（调试 / 演示用）。
+    ///
+    /// 坐标是**控制台底图坐标系**下的值（= 当前 `coord_system`），
+    /// 服务端入口就换算回内部的 GCJ-02——两个坐标系的换算只在这一处入口
+    /// 发生，不让它渗进业务层。
+    CreateOrder {
+        merchant_name: String,
+        merchant_lat: f64,
+        merchant_lng: f64,
+        #[serde(default)]
+        customer_name: Option<String>,
+        #[serde(default)]
+        customer_address: Option<String>,
+        customer_lat: f64,
+        customer_lng: f64,
+        /// 这张单的报价（分）。给了就**直接**当最终报价，不给才按计价规则算。
+        /// 上界在服务端夹取，免得手滑输个天文数字把流水玩坏。
+        #[serde(default)]
+        fee_cents: Option<i64>,
+    },
+
+    /// 把某个骑手的钱包清零（余额、当日流水、罚款、保险、欠款、账单）。
+    ///
+    /// 纯给控制端「测试把账弄乱了，重来」用的，**不做任何业务校验**——
+    /// 二次确认的责任在控制台那一侧。
+    ResetRiderWallet { rider_id: RiderId },
 }
 
 /// 三层 AI 的开关补丁。**每个字段都可选**，缺省 = 这一项不动。
@@ -219,6 +256,9 @@ pub struct ConfigPatch {
     /// 每日单量上限，0 = 不限。
     #[serde(default)]
     pub max_orders_per_day: Option<u32>,
+    /// 每日拒单额度，0 = 不限。
+    #[serde(default)]
+    pub max_rejects_per_day: Option<u32>,
     /// 下发坐标的坐标系。内部始终 GCJ-02，这里只影响出口转换。
     #[serde(default)]
     pub coord_system: Option<CoordSystem>,

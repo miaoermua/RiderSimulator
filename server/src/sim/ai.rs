@@ -408,7 +408,7 @@ pub fn validate_llm_plan(
 mod tests {
     use super::*;
     use crate::sim::{
-        config::{PEAK_PREP_FACTOR, TYPICAL_TO_SHOP_M, SimConfig},
+        config::{PEAK_PREP_FACTOR, SimConfig, TYPICAL_TO_SHOP_M},
         geo::LatLng,
         world::World,
     };
@@ -438,10 +438,7 @@ mod tests {
             // 把骑手放到「典型接单距离」上：承诺估的就是这一段。
             // 取 0.9 倍留点余量，免得在 ceil 边界上抖。
             let m = order.merchant_pos();
-            let pos = LatLng::new(
-                m.lat + (TYPICAL_TO_SHOP_M as f64 * 0.9) / 111_320.0,
-                m.lng,
-            );
+            let pos = LatLng::new(m.lat + (TYPICAL_TO_SHOP_M as f64 * 0.9) / 111_320.0, m.lng);
             w.rider_mut(rid).expect("骑手在").set_pos(pos);
 
             let rider = w.rider(rid).expect("骑手在").clone();

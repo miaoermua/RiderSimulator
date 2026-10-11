@@ -166,6 +166,17 @@ class GameState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 今日还剩几次拒单额度。`null` = 不限（服务端 `max_rejects_per_day == 0`）。
+  int? get rejectQuotaLeft {
+    final limit = config.maxRejectsPerDay;
+    if (limit <= 0) return null;
+    final left = limit - (me?.rejectsToday ?? 0);
+    return left < 0 ? 0 : left;
+  }
+
+  /// 拒单额度已用尽：系统塞来的指派单**拒不掉**，只能接下。
+  bool get rejectQuotaExhausted => rejectQuotaLeft == 0;
+
   // ---------------------------------------------------------------------
   // 通知
   // ---------------------------------------------------------------------
@@ -223,6 +234,8 @@ class GameState extends ChangeNotifier {
         _applyOrderDelivered(frame.payload);
       case Ev.orderExpired:
         _removeOrder(reqInt(frame.payload['order_id']));
+      case Ev.assignRejected:
+        _applyAssignRejected(frame.payload);
       case Ev.riderStateChanged:
         _applyRiderState(frame.payload);
       case Ev.riderFinance:
@@ -294,6 +307,7 @@ class GameState extends ChangeNotifier {
         Msg.arriveShop => '已到店',
         Msg.arriveCustomer => '已到客户',
         Msg.reject => '已拒单',
+        Msg.acceptAssign => '已接下指派单',
         Msg.urge => '已催单',
         Msg.setOnline => '在线状态已更新',
         Msg.setSpeedMode => '骑行模式已更新',
@@ -346,6 +360,9 @@ class GameState extends ChangeNotifier {
       activeOrders.add(_copyOrder(old, status: OrderStatus.assigned, assignedTo: by));
     }
     // 系统塞的单要骑手当面确认，先弹界面再算数。
+    //
+    // 额度已用尽时也照弹——那正是要让骑手看见「你今天拒绝已超出上限」小窗的
+    // 时刻；只是确认界面里「拒绝」会被禁掉，只剩接受（见 AssignOrderPage）。
     if (mine && forced) {
       assignOrderId = id;
       _assignAt = DateTime.now();
@@ -355,6 +372,18 @@ class GameState extends ChangeNotifier {
           ? (forced ? '平台指派：${reqStr(p['rider_name'], '你')} 塞来一单' : '抢到了：${reqStr(p['rider_name'], '你')} → ${yuan(reqInt(p['quoted_fee_cents']))} 元')
           : '单 ${reqStr(p['rider_name'], '他人')} 抢走了',
       kind: mine ? LogKind.good : LogKind.info,
+    );
+  }
+
+  /// 拒掉了一张还没确认的指派单：单退回大厅，额度 +1。
+  void _applyAssignRejected(Map<String, dynamic> p) {
+    final id = reqInt(p['order_id']);
+    final used = reqInt(p['used']);
+    final limit = reqInt(p['limit']);
+    if (assignOrderId == id) resolveAssign();
+    note(
+      limit > 0 ? '拒单已记入额度：今日 $used/$limit' : '拒单已记入额度：今日 $used（不限）',
+      kind: LogKind.info,
     );
   }
 
@@ -526,6 +555,7 @@ class GameState extends ChangeNotifier {
         level: r.level,
         rating: r.rating,
         completed: r.completed,
+        rejectsToday: r.rejectsToday,
         held: r.held,
         phase: r.phase,
         lat: r.lat,

@@ -119,7 +119,11 @@ pub fn quote(
     }
 }
 
-/// 入账，先抵扣欠款。返回实际到手。
+/// 入账。返回实际到手。
+///
+/// 会先抵扣 `debt_cents`——那是旧版本「扣款扣到 0 为止」留下的欠款字段，
+/// 现在 `debit` 不再产生欠款（余额直接为负），这里保留抵扣只是为了
+/// 让旧存档里的欠款能被还得掉，不会凭空消失。
 pub fn credit(rider: &mut Rider, amount_cents: i64) -> i64 {
     if amount_cents <= 0 {
         return 0;
@@ -131,14 +135,32 @@ pub fn credit(rider: &mut Rider, amount_cents: i64) -> i64 {
     net
 }
 
-/// 扣款。扣到 0 为止，余额不足记欠款。
+/// 扣款。**余额允许为负。**
+///
+/// 罚单是可能超过当日收入的：跑一整天赚 30 元、撞一次车赔 50 元，
+/// 账上就该老老实实显示 -20 元。旧实现把余额夹在 0、把差额塞进
+/// `debt_cents`，账单上根本看不出骑手在倒欠平台——测试时尤其会被藏住，
+/// 所以这里改成直接扣成负数。
 pub fn debit(rider: &mut Rider, amount_cents: i64) {
     if amount_cents <= 0 {
         return;
     }
-    let from_cash = rider.cash_cents.min(amount_cents);
-    rider.cash_cents -= from_cash;
-    rider.debt_cents += amount_cents - from_cash;
+    rider.cash_cents -= amount_cents;
+}
+
+/// 清空钱包：余额、当日流水、罚款、保险、欠款全部归零，账单也清干净。
+///
+/// 给控制端「测试把账弄乱了，重来」用，**不做任何校验**——
+/// 调用方（控制台）负责二次确认。返回清空前的余额，供提示语使用。
+pub fn reset_wallet(rider: &mut Rider) -> i64 {
+    let before = rider.cash_cents;
+    rider.cash_cents = 0;
+    rider.gross_cents = 0;
+    rider.fines_cents = 0;
+    rider.insurance_cents = 0;
+    rider.debt_cents = 0;
+    rider.last_ledger.clear();
+    before
 }
 
 /// 开罚单：记钱 + 记明细（必须带原因）。
@@ -265,6 +287,9 @@ pub fn close_day(cfg: &SimConfig, rider: &mut Rider) -> (i64, i64, i64, i64) {
     rider.insurance_cents = 0;
     rider.completed = 0;
     rider.rejected = 0;
+    // 跨天了，昨天那张还没确认的指派单不该继续挂着——不然今天的第一次
+    // 拒单会被算成「拒绝一张昨天塞过来的单」，额度和提示都会对不上。
+    rider.assign_pending = None;
     rider.late_count = 0;
     rider.online_minutes = 0;
     rider.fatigue = 0.0;
@@ -371,17 +396,45 @@ mod tests {
     }
 
     #[test]
-    fn debit_never_goes_negative_and_records_debt() {
+    fn debit_can_push_the_wallet_negative() {
         let cfg = SimConfig::default();
         let mut r = rider(&cfg);
         r.cash_cents = 100;
         debit(&mut r, 300);
-        assert_eq!(r.cash_cents, 0);
-        assert_eq!(r.debt_cents, 200);
-        // 下一单优先抵扣
-        let credited = credit(&mut r, 500);
-        assert_eq!(credited, 300);
+        // 罚款超过余额就显示负的，不再夹到 0
+        assert_eq!(r.cash_cents, -200);
         assert_eq!(r.debt_cents, 0);
+        // 入账原样加回来
+        let credited = credit(&mut r, 500);
+        assert_eq!(credited, 500);
+        assert_eq!(r.cash_cents, 300);
+    }
+
+    #[test]
+    fn reset_wallet_zeroes_everything() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        r.cash_cents = -1234;
+        r.gross_cents = 900;
+        r.fines_cents = 2500;
+        r.insurance_cents = 200;
+        debit(&mut r, 0);
+        r.push_ledger(LedgerEntry {
+            at_min: 1,
+            order_id: None,
+            kind: "fine".to_string(),
+            amount_cents: -500,
+            reason: "测试".to_string(),
+        });
+
+        let before = reset_wallet(&mut r);
+        assert_eq!(before, -1234);
+        assert_eq!(r.cash_cents, 0);
+        assert_eq!(r.gross_cents, 0);
+        assert_eq!(r.fines_cents, 0);
+        assert_eq!(r.insurance_cents, 0);
+        assert_eq!(r.debt_cents, 0);
+        assert!(r.last_ledger.is_empty());
     }
 
     #[test]

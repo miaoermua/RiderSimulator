@@ -341,6 +341,14 @@ pub struct Rider {
     pub lifetime_completed: u32,
 
     pub held: Vec<HeldOrder>,
+    /// 系统刚指派过来、骑手还没点「接受」的那张单。
+    ///
+    /// 为什么需要单独标记：「拒绝一张还没接受的指派单」和「取消一张
+    /// 已经接下的单」代价完全不同——前者只吃每日拒单额度，后者要罚
+    /// `fine.cancel_cents`（见 `scheduler::reject_order`）。而指派发生时
+    /// 订单就已经挂进 `held` 了，光看 `held` 分不出这两种情况。
+    #[serde(default)]
+    pub assign_pending: Option<OrderId>,
     /// 被拍冻结到（自开局起算的模拟分钟）。
     pub frozen_until_min: u64,
     /// 事故停工到。
@@ -395,6 +403,7 @@ impl Rider {
             fines_cents: 0,
             insurance_cents: 0,
             debt_cents: 0,
+            assign_pending: None,
             rating: cfg.rating_rules.initial,
             level: 1,
             completed: 0,
@@ -527,10 +536,13 @@ impl Rider {
 
     /// 时薪（分/小时）。**这是整个模拟器的核心 KPI。**
     ///
-    /// 注意：`cash_cents` 是**已经**扣过抽水、罚单、保险，并抵扣过欠款的净额
+    /// 注意：`cash_cents` 是**已经**扣过抽水、罚单、保险的净额
     /// （见 `economy::debit` / `economy::credit`）。所以这里不能再减一次
     /// `fines_cents` / `insurance_cents`，否则就是重复扣款。`fines_cents` 与
     /// `insurance_cents` 只用于账单明细展示。
+    ///
+    /// 罚得比赚得多时这个值会是负的，这是有意的——跑一天倒欠钱，
+    /// 时薪就该显示负数，不然「这趟白干还赔钱」这件事在 KPI 上完全看不到。
     pub fn hourly_wage_cents(&self) -> i64 {
         let hours = self.online_hours();
         if hours < 0.05 {
@@ -539,7 +551,7 @@ impl Rider {
         (self.cash_cents as f32 / hours).round() as i64
     }
 
-    /// 今日到手 = 真正落袋的净额。恒 ≥ 0（扣不到的部分记在 `debt_cents`）。
+    /// 今日到手 = 真正落袋的净额。**可以为负**（罚单超过收入时倒欠）。
     pub fn takehome_cents(&self) -> i64 {
         self.cash_cents
     }

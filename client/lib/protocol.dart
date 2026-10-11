@@ -21,6 +21,8 @@ abstract final class Msg {
   static const ping = 'ping';
   static const claim = 'claim';
   static const reject = 'reject';
+  /// 确认收下系统指派来的单（指派单在点「接受」之前一直挂着待确认标记）。
+  static const acceptAssign = 'accept_assign';
   static const urge = 'urge';
   static const arriveShop = 'arrive_shop';
   static const arriveCustomer = 'arrive_customer';
@@ -46,6 +48,8 @@ abstract final class Ev {
   static const orderBroadcast = 'order_broadcast';
   static const orderClaimed = 'order_claimed';
   static const orderExpired = 'order_expired';
+  /// 拒掉了一张待确认的指派单。只推给本人与控制端。
+  static const assignRejected = 'assign_rejected';
   static const orderPickedUp = 'order_picked_up';
   static const orderDelivered = 'order_delivered';
   static const riderStateChanged = 'rider_state_changed';
@@ -89,6 +93,8 @@ abstract final class ErrCode {
   static const backOrderDetourTooLong = 'BACK_ORDER_DETOUR_TOO_LONG';
   static const wrongPhase = 'WRONG_PHASE';
   static const notAssignedToYou = 'NOT_ASSIGNED_TO_YOU';
+  /// 今日拒单额度已用尽，这张指派单拒不掉了。
+  static const rejectLimitReached = 'REJECT_LIMIT_REACHED';
 
   /// 给用户看的短提示。未知码原样返回，方便发现契约漂移。
   static String humanize(String? code) => switch (code) {
@@ -102,6 +108,7 @@ abstract final class ErrCode {
         riderInjured => '你受伤了，先歇会儿',
         wrongPhase => '当前状态不允许这个操作',
         notAssignedToYou => '这不是你的订单',
+        rejectLimitReached => '你今天拒绝已超出上限',
         noTask => '这一单没有附加任务',
         taskFinished => '任务已经做完了',
         notARider => '观战者不能跑单',
@@ -515,6 +522,7 @@ class RiderView {
     required this.level,
     required this.rating,
     required this.completed,
+    required this.rejectsToday,
     required this.held,
     required this.phase,
     required this.lat,
@@ -536,6 +544,8 @@ class RiderView {
   final int level;
   final double rating;
   final int completed;
+  /// 今日已用掉的拒单次数（配合 [ConfigView.maxRejectsPerDay] 显示额度）。
+  final int rejectsToday;
   final List<int> held;
   final RiderPhase? phase;
   final double lat;
@@ -560,6 +570,7 @@ class RiderView {
         level: reqInt(j['level']),
         rating: reqDouble(j['rating']),
         completed: reqInt(j['completed']),
+        rejectsToday: reqInt(j['rejects_today']),
         held: j['held'] is List
             ? (j['held'] as List).whereType<num>().map((e) => e.toInt()).toList()
             : const [],
@@ -640,6 +651,7 @@ class ConfigView {
     required this.backorderEnabled,
     required this.backorderMax,
     required this.maxOrdersPerDay,
+    required this.maxRejectsPerDay,
     required this.isPeak,
     required this.surgeMultiplier,
     required this.coordSystem,
@@ -657,6 +669,8 @@ class ConfigView {
   final bool backorderEnabled;
   final int backorderMax;
   final int maxOrdersPerDay;
+  /// 每日拒单额度。**0 = 不限**。
+  final int maxRejectsPerDay;
   final bool isPeak;
   final double surgeMultiplier;
   /// 下发坐标的坐标系。地图底图必须跟着它走，否则点位整体偏几百米。
@@ -677,6 +691,7 @@ class ConfigView {
         backorderEnabled: reqBool(j['backorder_enabled']),
         backorderMax: reqInt(j['backorder_max']),
         maxOrdersPerDay: reqInt(j['max_orders_per_day']),
+        maxRejectsPerDay: reqInt(j['max_rejects_per_day']),
         isPeak: reqBool(j['is_peak']),
         surgeMultiplier: reqDouble(j['surge_multiplier'], 1),
         coordSystem: CoordSystem.parse(reqStr(j['coord_system'], 'gcj02')),

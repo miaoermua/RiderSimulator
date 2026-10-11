@@ -218,12 +218,16 @@ class _Actions extends StatelessWidget {
         );
 
       case OrderCardMode.assign:
+        // 额度用尽时这一单本来就不许拒。按钮挂着「拒不掉」而不是置灰：
+        // 点下去会弹中心通知把原因说清楚（见 AssignOrderPage._reject），
+        // 置灰的按钮只能让人猜。
+        final noQuota = state.rejectQuotaExhausted;
         return Wrap(
           spacing: 8,
           children: [
             OutlinedButton(
               onPressed: onReject,
-              child: const Text('拒绝'),
+              child: Text(noQuota ? '拒不掉' : '拒绝'),
             ),
             FilledButton(
               onPressed: onAccept,
@@ -314,13 +318,17 @@ class _AssignBar extends StatelessWidget {
     final ms = state.assignRemainingMs;
     final sec = ((ms + 999) ~/ 1000).clamp(0, 1 << 30);
     final frac = (ms / GameState.assignWindow.inMilliseconds).clamp(0.0, 1.0);
-    // 30 秒的窗口，最后 5 秒才转红。
-    final color = sec <= 5 ? Colors.red : Colors.deepOrange;
+    final exhausted = state.rejectQuotaExhausted;
+    // 30 秒的窗口，最后 5 秒才转红。额度用尽时整条也不该再是「橙色的催促」，
+    // 因为到点之后的归宿已经变了：不是自动拒单，是自动收下。
+    final color = exhausted ? Colors.red : (sec <= 5 ? Colors.red : Colors.deepOrange);
 
     return _Bar(
       frac: frac,
       color: color,
-      trailing: sec == 0 ? '已超时，尽快处理' : '${sec}s 内确认',
+      trailing: exhausted
+          ? '拒单额度已用尽，到点自动收下'
+          : (sec == 0 ? '已超时，尽快处理' : '${sec}s 内确认'),
     );
   }
 }

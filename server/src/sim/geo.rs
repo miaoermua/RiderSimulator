@@ -129,6 +129,17 @@ pub fn to_coord_system(p: LatLng, target: CoordSystem) -> LatLng {
     }
 }
 
+/// [`to_coord_system`] 的反向：把某个坐标系下的点换回内部 GCJ-02。
+///
+/// 控制台底图给的是**当前下发坐标系**下的坐标（`ConfigView::coord_system`），
+/// 而世界内部一律 GCJ-02。换算只在入口这一处发生，不让它渗进业务层。
+pub fn from_coord_system(p: LatLng, source: CoordSystem) -> LatLng {
+    match source {
+        CoordSystem::Gcj02 => p,
+        CoordSystem::Wgs84 => wgs84_to_gcj02(p),
+    }
+}
+
 /// 保留 6 位小数（契约要求）。
 pub fn round6(v: f64) -> f64 {
     (v * 1_000_000.0).round() / 1_000_000.0

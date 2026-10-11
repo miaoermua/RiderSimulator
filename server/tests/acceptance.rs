@@ -1,7 +1,7 @@
 //! 设计文档 §九 的验收测试。
 //!
 //! 这五项是「不做完不许进入下一阶段」的硬指标：
-//!   1. 连续 10 万 tick 不 panic，所有金额非负；
+//!   1. 连续 10 万 tick 不 panic，账目自洽（现金**允许为负**，其余分项非负）；
 //!   2. 10 个客户端抢 1 单，成功者恰好 1 个；
 //!   3. 同一个种子跑两遍，结果完全一致；
 //!   4. 时间不漂移（tick 数与模拟分钟严格 1:1）；
@@ -25,30 +25,43 @@ fn world(seed: u64) -> World {
     World::new_for_test(SimConfig::default(), seed)
 }
 
-fn assert_money_non_negative(w: &World, at_tick: u64) {
+/// 账目自洽性检查。
+///
+/// 关键变化：**现金允许为负**。罚单超过当日收入时骑手就是在倒欠平台，
+/// 这是设计要的结果（见 `economy::debit` 的说明），不能再像旧版那样把余额
+/// 夹在 0、把差额藏进 `debt_cents`——那会让「跑一天倒贴钱」这件事在账单上
+/// 彻底消失。所以这里改成检查：现金不为溢出产物、其余分项非负、欠款字段
+/// 在新版逻辑下恒为 0。
+fn assert_books_consistent(w: &World, at_tick: u64) {
     for r in &w.riders {
-        assert!(
-            r.cash_cents >= 0,
-            "tick {at_tick}: 骑手 {} 现金为负 {}",
-            r.id,
-            r.cash_cents
-        );
         assert!(r.fines_cents >= 0, "tick {at_tick}: 骑手 {} 罚单为负", r.id);
         assert!(
             r.insurance_cents >= 0,
             "tick {at_tick}: 骑手 {} 保险为负",
             r.id
         );
-        assert!(r.debt_cents >= 0, "tick {at_tick}: 骑手 {} 欠款为负", r.id);
-        assert!(
-            r.takehome_cents() >= 0,
-            "tick {at_tick}: 骑手 {} 到手为负 {}",
-            r.id,
-            r.takehome_cents()
-        );
         assert!(
             r.gross_cents >= 0,
             "tick {at_tick}: 骑手 {} 毛收入为负",
+            r.id
+        );
+        // 新版 `debit` 只扣现金、不写欠款，所以欠款必须一直是 0。
+        // 若哪天又有人把它当「夹到 0 的垃圾桶」用，这里会立刻炸。
+        assert_eq!(
+            r.debt_cents, 0,
+            "tick {at_tick}: 骑手 {} 欠款应为 0，实际 {}",
+            r.id, r.debt_cents
+        );
+        assert!(
+            r.cash_cents > i64::MIN / 2,
+            "tick {at_tick}: 骑手 {} 现金离谱 {}（疑似金额溢出）",
+            r.id,
+            r.cash_cents
+        );
+        assert_eq!(
+            r.takehome_cents(),
+            r.cash_cents,
+            "tick {at_tick}: 骑手 {} 到手口径与现金对不上",
             r.id
         );
         assert!(r.lifetime_completed >= r.completed);
@@ -67,7 +80,7 @@ fn assert_ledger_consistent(w: &World) {
 }
 
 #[test]
-fn hundred_thousand_ticks_no_panic_and_money_non_negative() {
+fn hundred_thousand_ticks_no_panic_and_books_stay_consistent() {
     let mut w = world(20260407);
     // 故意让一部分骑手开到「无所谓」档，好把事故 / 罚单 / 欠款这些分支跑出来。
     for (i, r) in w.riders.iter_mut().enumerate() {
@@ -81,11 +94,11 @@ fn hundred_thousand_ticks_no_panic_and_money_non_negative() {
     for i in 1..=100_000u64 {
         let _events = tick(&mut w, TickInput::default());
         if i % 1_000 == 0 {
-            assert_money_non_negative(&w, i);
+            assert_books_consistent(&w, i);
             assert_ledger_consistent(&w);
         }
     }
-    assert_money_non_negative(&w, 100_000);
+    assert_books_consistent(&w, 100_000);
     assert!(w.elapsed_min == 100_000, "tick 数必须等于模拟分钟数");
     assert!(w.stats.orders_created > 0, "跑了 10 万分钟居然一单没出");
     assert!(

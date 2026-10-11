@@ -35,6 +35,8 @@ pub enum ClaimError {
     WrongPhase,
     NotAssignedToYou,
     FeatureDisabled,
+    /// 今日拒单额度已用完——指派单拒不掉了，只能送。
+    RejectLimitReached,
 }
 
 impl ClaimError {
@@ -59,6 +61,7 @@ impl ClaimError {
             ClaimError::WrongPhase => "WRONG_PHASE",
             ClaimError::NotAssignedToYou => "NOT_ASSIGNED_TO_YOU",
             ClaimError::FeatureDisabled => "FEATURE_DISABLED",
+            ClaimError::RejectLimitReached => "REJECT_LIMIT_REACHED",
         }
     }
 
@@ -79,6 +82,7 @@ impl ClaimError {
             ClaimError::WrongPhase => "当前状态不允许这个操作",
             ClaimError::NotAssignedToYou => "这不是你的单",
             ClaimError::FeatureDisabled => "该功能未开启",
+            ClaimError::RejectLimitReached => "你今天拒绝已超出上限",
         }
     }
 }
@@ -162,7 +166,35 @@ pub fn assign_forced(
     if let Some(o) = world.order_mut(order_id) {
         o.forced = true;
     }
+    // 记下「还没被接受」。骑手点接受走 `accept_assign`，点拒绝走
+    // `reject_order`——后者靠这个标记才知道该吃拒单额度而不是扣 5 元罚款。
+    if let Some(r) = world.rider_mut(rider_id) {
+        r.assign_pending = Some(order_id);
+    }
     Ok(assignment)
+}
+
+/// 骑手确认接受一张强制指派单。
+///
+/// 订单在 `assign_forced` 时就已经挂到骑手身上了（世界状态必须立刻自洽，
+/// 否则这单在别的端看起来还是无主的）。所以这里**不改任何调度状态**，
+/// 只把 `assign_pending` 摘掉——从此这单就是骑手自己接的了，
+/// 后面再取消就要按「主动取消」罚钱。
+pub fn accept_assign(
+    world: &mut World,
+    rider_id: RiderId,
+    order_id: OrderId,
+) -> Result<(), ClaimError> {
+    let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
+    match rider.assign_pending {
+        Some(id) if id == order_id => {
+            rider.assign_pending = None;
+            Ok(())
+        }
+        // 不是待确认的指派单：可能已经接受过，或者已经拒绝了。
+        // 不报错——客户端的「接受」是幂等的，重发不该弹错。
+        _ => Ok(()),
+    }
 }
 
 /// 背单：绕路不超阈值就允许叠一单。
@@ -558,11 +590,19 @@ pub fn deliver(
     Ok(events)
 }
 
-/// 主动拒单（未接的单不能拒，只能忽略）。
+/// 拒绝订单。
 ///
-/// 骑手取消已接单时，订单**退回大厅加价重投**，而不是就此作废——
-/// 真实场景里骑手取消了，平台会把单转给下一个骑手，不能让顾客的饭凭空消失。
-/// 罚金照扣（`fine.cancel_cents`），且重投次数照算。
+/// 分两种情况，代价**完全不同**：
+///
+/// 1. **拒绝系统指派单**（`rider.assign_pending` 正指向它）——骑手还没点接受，
+///    这单是平台硬塞过来的。代价是吃掉一次**每日拒单额度**（`max_rejects_per_day`），
+///    **不罚款**；额度用完就直接拒不掉（[`ClaimError::RejectLimitReached`]），
+///    指派什么就得送什么。
+/// 2. **取消已经接下的单**——骑手自己反悔，罚 `fine.cancel_cents`（5 元），
+///    重投次数照算。
+///
+/// 两种情况订单都**退回大厅加价重投**，绝不流单——真实场景里骑手不要这单，
+/// 平台会把单转给下一个骑手，不能让顾客的饭凭空消失。
 pub fn reject_order(
     world: &mut World,
     rider_id: RiderId,
@@ -570,9 +610,42 @@ pub fn reject_order(
 ) -> Result<Vec<SimEvent>, ClaimError> {
     let now = world.elapsed_min;
     let cfg = world.cfg.clone();
+
+    // ---- 情况 1：拒绝一张还没接受的指派单 ----
+    let pending = world
+        .rider(rider_id)
+        .is_some_and(|r| r.assign_pending == Some(order_id));
+    if pending {
+        let limit = cfg.max_rejects_per_day;
+        let used = {
+            let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
+            if limit > 0 && rider.rejected >= limit {
+                // 额度已满。这一单**拒不掉**——它就是你的了，所以顺手摘掉
+                // 「待确认」标记：否则骑手会卡在一个既拒不掉、又退不掉的单上
+                // （拒绝被额度挡住，退回又要先过同一个判断）。
+                //
+                // 命令仍然算失败，客户端据此弹「你今天拒绝已超出上限」——
+                // 这是唯一会让骑手看见「拒绝被拒」的路径。
+                rider.assign_pending = None;
+                return Err(ClaimError::RejectLimitReached);
+            }
+            rider.assign_pending = None;
+            rider.rejected += 1;
+            rider.held.retain(|h| h.order_id != order_id);
+            rider.rejected
+        };
+        world.release_to_hall(order_id);
+        return Ok(vec![SimEvent::AssignRejected {
+            rider_id,
+            order_id,
+            used,
+            limit,
+        }]);
+    }
+
+    // ---- 情况 2：取消一张已经接下的单 ----
     let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
     if rider.is_holding(order_id) {
-        // 已接的单只能取消，扣 5 元
         economy::issue_fine(
             rider,
             cfg.fine.cancel_cents,
@@ -642,4 +715,142 @@ pub fn tier_available(cfg: &SimConfig, rating: f32) -> Vec<OrderTier> {
 /// 骑手是否是真人的辅助判断。
 pub fn is_human(rider: &Rider) -> bool {
     rider.kind == RiderKind::Human
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::{config::SimConfig, world::World};
+
+    /// 造一个「骑手手上有一张还没确认的指派单」的世界。
+    fn world_with_pending_assign(limit: u32) -> (World, RiderId, OrderId) {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            max_rejects_per_day: limit,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 42);
+        let rid = w.sim_rider_ids()[0];
+        let oid = w.generate_order_batch(1)[0];
+        assign_forced(&mut w, oid, rid).expect("能强制指派");
+        (w, rid, oid)
+    }
+
+    #[test]
+    fn rejecting_a_forced_assign_eats_quota_and_returns_to_hall() {
+        let (mut w, rid, oid) = world_with_pending_assign(6);
+        let evs = reject_order(&mut w, rid, oid).expect("第一次拒单应成功");
+        assert!(
+            matches!(
+                evs.as_slice(),
+                [SimEvent::AssignRejected {
+                    rider_id,
+                    order_id,
+                    used: 1,
+                    limit: 6,
+                }] if *rider_id == rid && *order_id == oid
+            ),
+            "拒指派单要回一条 assign_rejected，带上已用/上限：{evs:?}"
+        );
+
+        let r = w.rider(rid).expect("骑手在");
+        assert_eq!(r.rejected, 1);
+        assert_eq!(r.assign_pending, None, "拒完就不该再挂着待确认");
+        assert!(r.held.is_empty(), "单要从骑手手上摘掉");
+        // 拒一张**没接受的指派单**只是把单还给平台，不罚钱——那是「取消已接单」的代价。
+        assert_eq!(r.cash_cents, 0);
+        assert_eq!(r.fines_cents, 0);
+        assert_eq!(
+            w.order(oid).expect("订单在").status,
+            OrderStatus::Pending,
+            "退回大厅继续等人接，绝不流单"
+        );
+    }
+
+    #[test]
+    fn reject_limit_blocks_further_rejections() {
+        let (mut w, rid, oid) = world_with_pending_assign(1);
+        reject_order(&mut w, rid, oid).expect("用掉唯一一次额度");
+
+        let oid2 = w.generate_order_batch(1)[0];
+        assign_forced(&mut w, oid2, rid).expect("能强制指派");
+        let held_before = w.rider(rid).expect("骑手在").held.len();
+
+        let err = reject_order(&mut w, rid, oid2).expect_err("额度用完必须拒绝");
+        assert_eq!(err, ClaimError::RejectLimitReached);
+        assert_eq!(err.code(), "REJECT_LIMIT_REACHED");
+        assert_eq!(err.message(), "你今天拒绝已超出上限");
+
+        let r = w.rider(rid).expect("骑手在");
+        assert_eq!(r.rejected, 1, "被挡下的拒绝不许把额度继续往上加");
+        assert_eq!(r.held.len(), held_before, "单还是骑手的，不许被摘走");
+        assert_eq!(
+            w.order(oid2).expect("订单在").status,
+            OrderStatus::Assigned,
+            "拒不掉就等于接下了"
+        );
+        assert_eq!(
+            r.assign_pending, None,
+            "拒不掉要顺手摘掉待确认标记，否则骑手会卡在拒不掉也退不掉的单上"
+        );
+
+        // 既然归他了，后面再退就是「取消已接单」：罚钱，且不再受额度阻拦。
+        let cancel_cents = w.cfg.fine.cancel_cents;
+        let evs = reject_order(&mut w, rid, oid2).expect("归他的单应该能退掉");
+        assert!(matches!(evs.as_slice(), [SimEvent::FineIssued { .. }]));
+        assert_eq!(w.rider(rid).expect("骑手在").cash_cents, -cancel_cents);
+        assert_eq!(w.rider(rid).expect("骑手在").rejected, 1, "退款不算拒单");
+    }
+
+    #[test]
+    fn zero_limit_means_no_cap() {
+        let (mut w, rid, oid) = world_with_pending_assign(0);
+        let evs = reject_order(&mut w, rid, oid).expect("0 表示不限，第一次当然能拒");
+        assert!(
+            matches!(
+                evs.as_slice(),
+                [SimEvent::AssignRejected {
+                    limit: 0,
+                    used: 1,
+                    ..
+                }]
+            ),
+            "上限 0 要原样透传成「不限」：{evs:?}"
+        );
+
+        // 再拒几轮也不该被挡住。
+        for _ in 0..3 {
+            let id = w.generate_order_batch(1)[0];
+            assign_forced(&mut w, id, rid).expect("能强制指派");
+            reject_order(&mut w, rid, id).expect("0 = 不限，永远拒得掉");
+        }
+        assert_eq!(w.rider(rid).expect("骑手在").rejected, 4);
+    }
+
+    /// 接受之后再取消 = 主动取消，罚钱但**不吃拒单额度**。
+    ///
+    /// 这是 `assign_pending` 存在的全部理由：分不清这两种情况，就会把
+    /// 「不要系统塞来的单」和「自己反悔不送了」按同一个代价处理。
+    #[test]
+    fn accepting_then_cancelling_costs_a_fine_not_quota() {
+        let (mut w, rid, oid) = world_with_pending_assign(6);
+        accept_assign(&mut w, rid, oid).expect("接受应成功");
+        assert_eq!(w.rider(rid).expect("骑手在").assign_pending, None);
+        // 幂等：重复接受不报错、不改状态（客户端重发不该弹错）。
+        accept_assign(&mut w, rid, oid).expect("重复接受是幂等的");
+
+        let cancel_cents = w.cfg.fine.cancel_cents;
+        let evs = reject_order(&mut w, rid, oid).expect("取消已接单应成功");
+        assert!(
+            matches!(evs.as_slice(), [SimEvent::FineIssued { .. }]),
+            "取消已接单要开罚单：{evs:?}"
+        );
+        let r = w.rider(rid).expect("骑手在");
+        assert_eq!(r.rejected, 0, "取消已接单不该算作拒单");
+        assert_eq!(
+            r.cash_cents, -cancel_cents,
+            "钱包允许为负：罚单直接扣成负数"
+        );
+        assert_eq!(r.fines_cents, cancel_cents);
+    }
 }

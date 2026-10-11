@@ -260,6 +260,37 @@ class ConsoleStore {
     this.send("reject_ai", { decision_id: decisionId });
   }
 
+  // ---------------- 调试动作 ----------------
+
+  /**
+   * 临时插一张订单。
+   *
+   * 坐标按**当前下发坐标系**（`ConfigView::coord_system`）传——底图也是那个系，
+   * 换算交给服务端入口，控制台不自己造第二套坐标。
+   */
+  createOrder(fields: {
+    merchant_name: string;
+    merchant_lat: number;
+    merchant_lng: number;
+    customer_name?: string;
+    customer_address?: string;
+    customer_lat: number;
+    customer_lng: number;
+    fee_cents?: number;
+  }) {
+    this.send("create_order", fields);
+  }
+
+  /**
+   * 清空某个骑手的钱包。
+   *
+   * 纯测试辅助。**二次确认由调用方负责**——这个动作不可撤销，
+   * 服务端不做任何业务校验，也不给撤销入口。
+   */
+  resetRiderWallet(riderId: number) {
+    this.send("reset_rider_wallet", { rider_id: riderId });
+  }
+
   // ---------------- 骑手账号（HTTP） ----------------
 
   /**
@@ -397,6 +428,13 @@ class ConsoleStore {
       case "order_expired":
         this.log(`#${(p as EventPayloads["order_expired"]).order_id} 无人接，流单`);
         break;
+      case "assign_rejected": {
+        const r = p as EventPayloads["assign_rejected"];
+        // 上限 0 = 不限，别把它念成「0/0」。
+        const quota = r.limit === 0 ? "不限" : `${r.used}/${r.limit}`;
+        this.log(`骑手 #${r.rider_id} 拒掉指派单 #${r.order_id}（今日 ${quota}）`);
+        break;
+      }
       case "order_picked_up": {
         const u = p as EventPayloads["order_picked_up"];
         this.log(`#${u.order_id} 已取货（出餐 ${u.prep_minutes} 分钟）`);
@@ -550,6 +588,21 @@ class ConsoleStore {
     // resync / ai_query / list_models 是内部动作，不该弹提示
     // （list_models 的真实结果随后由 `ai_models` 事件专门呈现）。
     if (a.action === "resync" || a.action === "ai_query" || a.action === "list_models") return;
+    // 调试动作说清楚「动了哪一个、动了多少」，比一句「成功」有用。
+    if (a.action === "reset_rider_wallet") {
+      const cleared = Number(a.data?.cleared_cents ?? 0);
+      this.notifier(
+        "success",
+        `已清空骑手 #${a.data?.rider_id} 的钱包（清空前 ¥${yuan(cleared)}）`,
+      );
+      this.resync();
+      return;
+    }
+    if (a.action === "create_order") {
+      this.notifier("success", `已创建订单 #${a.data?.order_id}`);
+      this.resync();
+      return;
+    }
     this.notifier("success", `${a.action} 成功`);
     // 控制类指令的 ack 里带回了配置片段（如倍率、实时档），
     // 就地合并能让顶栏立刻响应，不必等下一次快照。

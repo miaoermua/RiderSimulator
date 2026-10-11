@@ -3,6 +3,7 @@ import { STATUS_LABEL } from "../const";
 import { useIsControl, useStore } from "../hooks";
 import type { Order } from "../protocol";
 import { store, yuan } from "../store";
+import { CreateOrderButton } from "./CreateOrderModal";
 import { Metric, MetricRow } from "./Metric";
 
 /**
@@ -25,7 +26,13 @@ export function OrdersPanel() {
     <div className="console-scroll">
       <List
         size="small"
-        header="大厅待抢"
+        header={
+          <Space style={{ width: "100%", justifyContent: "space-between" }}>
+            <span>大厅待抢</span>
+            {/* 临时插单放在列表头上：造出来的单立刻出现在下面，因果挨着。 */}
+            <CreateOrderButton />
+          </Space>
+        }
         itemLayout="vertical"
         rowKey="id"
         dataSource={snap.hall}

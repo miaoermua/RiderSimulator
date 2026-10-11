@@ -46,13 +46,14 @@ use crate::sim::{
     ai::LlmPlan,
     economy,
     event::{AiOpBrief, DecisionSource, SimEvent},
+    geo::{LatLng, from_coord_system},
     host::{self, HostMode},
     rider::RiderKind,
     rider_key,
     scheduler::{self, ClaimError},
     station::{Station, StationKpi},
     tick::{self, TickInput},
-    world::World,
+    world::{CustomOrderSpec, World},
 };
 use crate::store::Store;
 
@@ -1408,6 +1409,16 @@ impl App {
                 }
                 None => self.not_a_rider(conn_id, "reject"),
             },
+            // 接受指派单只是把「待确认」标记摘掉，世界状态早在指派那一刻就定死了，
+            // 所以这里不产生任何要广播的事件。
+            M::AcceptAssign { order_id } => match role.rider_id() {
+                Some(rid) => {
+                    let r =
+                        scheduler::accept_assign(&mut self.world, rid, order_id).map(|()| vec![]);
+                    self.finish_simple(conn_id, "accept_assign", r)
+                }
+                None => self.not_a_rider(conn_id, "accept_assign"),
+            },
             M::Urge { order_id } => match role.rider_id() {
                 Some(rid) => {
                     let r = scheduler::urge_order(&mut self.world, rid, order_id);
@@ -1673,6 +1684,70 @@ impl App {
                 app.push_ai_state();
                 Some(out)
             }),
+            // 临时插单：控制台地图上点两个点就能造一张单。
+            M::CreateOrder {
+                merchant_name,
+                merchant_lat,
+                merchant_lng,
+                customer_name,
+                customer_address,
+                customer_lat,
+                customer_lng,
+                fee_cents,
+            } => {
+                if !valid_latlng(merchant_lat, merchant_lng)
+                    || !valid_latlng(customer_lat, customer_lng)
+                {
+                    self.ack_fail(
+                        conn_id,
+                        "create_order",
+                        code::BAD_REQUEST,
+                        "两端坐标都得是有效经纬度",
+                    );
+                } else {
+                    self.control(conn_id, role, "create_order", |app| {
+                        // 控制台给的是**当前下发坐标系**下的坐标，世界内部一律 GCJ-02。
+                        // 换算只在这一处入口发生，不让它渗进业务层。
+                        let cs = app.world.cfg.coord_system;
+                        let m = from_coord_system(LatLng::new(merchant_lat, merchant_lng), cs);
+                        let c = from_coord_system(LatLng::new(customer_lat, customer_lng), cs);
+                        let id = app.world.create_custom_order(CustomOrderSpec {
+                            merchant_name,
+                            merchant_lat: m.lat,
+                            merchant_lng: m.lng,
+                            customer_name,
+                            customer_address,
+                            customer_lat: c.lat,
+                            customer_lng: c.lng,
+                            fee_cents,
+                        });
+                        // 不等下一拍 tick：控制台点完「创建」就该在大厅看见它。
+                        if let Some(order) = app.world.order(id) {
+                            let window_ms = app.world.cfg.claim_window_secs as u64 * 1000;
+                            app.outbox.push(SimEvent::OrderBroadcast {
+                                order: Box::new(order.clone()),
+                                window_ms,
+                                expires_in_ms: window_ms,
+                            });
+                        }
+                        Some(json!({ "order_id": id }))
+                    })
+                }
+            }
+            // 清空钱包：纯测试辅助，**不给任何业务校验**——二次确认在控制台那侧。
+            M::ResetRiderWallet { rider_id } => {
+                self.control(conn_id, role, "reset_rider_wallet", |app| {
+                    let Some(rider) = app.world.rider_mut(rider_id) else {
+                        app.outbox_err = Some(ClaimError::RiderNotFound);
+                        return None;
+                    };
+                    let cleared = economy::reset_wallet(rider);
+                    if let Some(ev) = scheduler::state_event(&app.world, rider_id) {
+                        app.outbox.push(ev);
+                    }
+                    Some(json!({ "rider_id": rider_id, "cleared_cents": cleared }))
+                })
+            }
         }
     }
 
@@ -1841,6 +1916,11 @@ impl App {
         }
         if let Some(v) = p.max_orders_per_day {
             cfg.max_orders_per_day = v;
+        }
+        // 改上限**不回滚**已用掉的额度：拒单次数是当天既成事实，
+        // 调低上限只会让「额度已满」更早出现，不会把已拒的还回去。
+        if let Some(v) = p.max_rejects_per_day {
+            cfg.max_rejects_per_day = v.min(999);
         }
         // 只影响下发时的坐标转换，世界状态不动。
         if let Some(v) = p.coord_system {
@@ -2135,6 +2215,18 @@ fn parse_token(raw: &str) -> Option<Token<'_>> {
 /// 给 `ClaimError` 找一个协议错误码。**`scheduler` 是唯一权威。**
 fn claim_code(e: &ClaimError) -> &'static str {
     e.code()
+}
+
+/// 经纬度是否落在合法范围。控制台地图选点偶尔会漏传字段（默认 0.0），
+/// 而 `(0, 0)` 是几内亚湾——真让它进世界会算出一张飞越大洋的单。
+fn valid_latlng(lat: f64, lng: f64) -> bool {
+    lat.is_finite()
+        && lng.is_finite()
+        && (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lng)
+        // (0, 0) 本身就是合法坐标，但它同时是「字段漏传」的缺省值，
+        // 在这个界面里只可能是误操作，直接当非法处理。
+        && !(lat == 0.0 && lng == 0.0)
 }
 
 /// 控制端指令的执行结果占位。`control` 用它区分「成功」和「业务失败」。
@@ -2560,7 +2652,7 @@ fn utc_minute_of_day() -> u32 {
 mod tests {
     use super::*;
     use crate::llm::{RulingSource, TaskRuling};
-    use crate::sim::order::ExtraTask;
+    use crate::sim::order::{ExtraTask, OrderStatus};
     use tokio::sync::mpsc::UnboundedReceiver;
 
     fn world() -> World {
@@ -2944,6 +3036,231 @@ mod tests {
         );
         assert_eq!(app.world.rider(ids[1]).unwrap().name, "李四");
         assert_eq!(app.world.sim_rider_names()[1], "李四");
+    }
+
+    #[test]
+    fn control_can_create_a_custom_order_that_lands_in_the_hall() {
+        let mut app = control_app();
+        let (mut ctrl, _) = hello(&mut app, 1, None);
+        drain(&mut ctrl);
+        let before = app.world.orders.len();
+
+        send(
+            &mut app,
+            1,
+            ClientMessage::CreateOrder {
+                merchant_name: "  夜宵摊 ".into(),
+                merchant_lat: 30.5,
+                merchant_lng: 114.4,
+                customer_name: Some("小张".into()),
+                customer_address: None,
+                customer_lat: 30.55,
+                customer_lng: 114.45,
+                fee_cents: Some(2222),
+            },
+        );
+        let v = drain(&mut ctrl);
+        assert_eq!(ack(&v)["payload"]["ok"].as_bool(), Some(true));
+        let id = ack(&v)["payload"]["data"]["order_id"]
+            .as_u64()
+            .expect("要回订单号") as OrderId;
+
+        assert_eq!(app.world.orders.len(), before + 1);
+        let o = app.world.order(id).expect("订单在");
+        assert_eq!(o.merchant_name, "夜宵摊", "名字两端空白该被 trim");
+        assert_eq!(o.customer_name, "小张");
+        assert_eq!(o.fee.quoted_fee_cents, 2222, "手填金额要原样生效");
+        assert_eq!(o.status, OrderStatus::Pending);
+        // 不等下一拍 tick，创建完就广播，别的端立刻能在摇单池里看到。
+        assert!(
+            event(&v, "order_broadcast").is_some(),
+            "新单必须立刻广播：{v:?}"
+        );
+    }
+
+    #[test]
+    fn create_order_rejects_an_impossible_coordinate() {
+        let mut app = control_app();
+        let (mut ctrl, _) = hello(&mut app, 1, None);
+        drain(&mut ctrl);
+        let before = app.world.orders.len();
+
+        send(
+            &mut app,
+            1,
+            ClientMessage::CreateOrder {
+                merchant_name: "鬼摊".into(),
+                merchant_lat: 0.0,
+                merchant_lng: 0.0,
+                customer_name: None,
+                customer_address: None,
+                customer_lat: 30.5,
+                customer_lng: 114.4,
+                fee_cents: None,
+            },
+        );
+        let v = drain(&mut ctrl);
+        let a = ack(&v);
+        assert_eq!(a["payload"]["ok"].as_bool(), Some(false));
+        assert_eq!(a["payload"]["code"].as_str(), Some(code::BAD_REQUEST));
+        assert_eq!(app.world.orders.len(), before, "坐标不合法不许动世界");
+    }
+
+    #[test]
+    fn control_can_reset_a_rider_wallet_that_went_negative() {
+        let mut app = control_app();
+        let (mut ctrl, _) = hello(&mut app, 1, None);
+        drain(&mut ctrl);
+        let rid = app.world.sim_rider_ids()[0];
+
+        // 先把余额弄成负的（模拟测试把账玩乱了）。
+        let r = app.world.rider_mut(rid).expect("骑手在");
+        r.cash_cents = -8888;
+        r.gross_cents = 1234;
+        r.fines_cents = 10_000;
+
+        send(
+            &mut app,
+            1,
+            ClientMessage::ResetRiderWallet { rider_id: rid },
+        );
+        let v = drain(&mut ctrl);
+        assert_eq!(ack(&v)["payload"]["ok"].as_bool(), Some(true));
+        assert_eq!(
+            ack(&v)["payload"]["data"]["cleared_cents"].as_i64(),
+            Some(-8888),
+            "要把清空前的余额回给控制台写提示"
+        );
+
+        let r = app.world.rider(rid).expect("骑手在");
+        assert_eq!(r.cash_cents, 0);
+        assert_eq!(r.gross_cents, 0);
+        assert_eq!(r.fines_cents, 0);
+        assert!(r.last_ledger.is_empty());
+        // 别的端也要立刻看到钱包归零。
+        assert!(event(&v, "rider_state_changed").is_some(), "{v:?}");
+
+        // 不存在的骑手：业务失败，不改任何东西。
+        send(
+            &mut app,
+            1,
+            ClientMessage::ResetRiderWallet { rider_id: 9999 },
+        );
+        let v = drain(&mut ctrl);
+        assert_eq!(ack(&v)["payload"]["code"].as_str(), Some("RIDER_NOT_FOUND"));
+    }
+
+    #[test]
+    fn rider_accept_assign_clears_the_pending_flag() {
+        let mut app = control_app();
+        let (mut ctrl, _) = hello(&mut app, 1, None);
+        drain(&mut ctrl);
+        let rid = app.world.sim_rider_ids()[0];
+        let (mut rider_rx, _) = hello(&mut app, 2, Some(&rider_token(rid)));
+        drain(&mut rider_rx);
+
+        let oid = app.world.generate_order_batch(1)[0];
+        send(
+            &mut app,
+            1,
+            ClientMessage::ForceAssign {
+                order_id: oid,
+                rider_id: rid,
+            },
+        );
+        drain(&mut ctrl);
+        assert_eq!(
+            app.world.rider(rid).expect("骑手在").assign_pending,
+            Some(oid)
+        );
+
+        send(&mut app, 2, ClientMessage::AcceptAssign { order_id: oid });
+        let v = drain(&mut rider_rx);
+        assert_eq!(ack(&v)["payload"]["action"].as_str(), Some("accept_assign"));
+        assert_eq!(app.world.rider(rid).expect("骑手在").assign_pending, None);
+
+        // 幂等：重发不许弹错（网络重传很常见）。
+        send(&mut app, 2, ClientMessage::AcceptAssign { order_id: oid });
+        let v = drain(&mut rider_rx);
+        assert_eq!(ack(&v)["payload"]["ok"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn reject_limit_round_trips_through_config_and_the_wire() {
+        let mut app = control_app();
+        let (mut ctrl, _) = hello(&mut app, 1, None);
+        drain(&mut ctrl);
+
+        // 默认 6 单；改配置后立刻体现在下发的 config_view 里。
+        send(
+            &mut app,
+            1,
+            ClientMessage::SetConfig(crate::net::ConfigPatch {
+                max_rejects_per_day: Some(3),
+                ..Default::default()
+            }),
+        );
+        let v = drain(&mut ctrl);
+        assert_eq!(
+            ack(&v)["payload"]["data"]["max_rejects_per_day"].as_u64(),
+            Some(3)
+        );
+        assert_eq!(app.world.cfg.max_rejects_per_day, 3);
+
+        // 拒到额度用满，第 4 张指派单必须拒不掉，且骑手端收到中文提示。
+        let rid = app.world.sim_rider_ids()[0];
+        let (mut rider_rx, _) = hello(&mut app, 2, Some(&rider_token(rid)));
+        drain(&mut rider_rx);
+
+        for i in 1..=3 {
+            let oid = app.world.generate_order_batch(1)[0];
+            send(
+                &mut app,
+                1,
+                ClientMessage::ForceAssign {
+                    order_id: oid,
+                    rider_id: rid,
+                },
+            );
+            drain(&mut ctrl);
+            send(&mut app, 2, ClientMessage::Reject { order_id: oid });
+            let v = drain(&mut rider_rx);
+            assert_eq!(
+                ack(&v)["payload"]["ok"].as_bool(),
+                Some(true),
+                "第 {i} 张该拒得掉"
+            );
+            assert!(
+                event(&v, "assign_rejected").is_some(),
+                "本人要收到拒单已记：{v:?}"
+            );
+        }
+
+        let oid = app.world.generate_order_batch(1)[0];
+        send(
+            &mut app,
+            1,
+            ClientMessage::ForceAssign {
+                order_id: oid,
+                rider_id: rid,
+            },
+        );
+        drain(&mut ctrl);
+        send(&mut app, 2, ClientMessage::Reject { order_id: oid });
+        let v = drain(&mut rider_rx);
+        let a = ack(&v);
+        assert_eq!(a["payload"]["ok"].as_bool(), Some(false));
+        assert_eq!(a["payload"]["code"].as_str(), Some("REJECT_LIMIT_REACHED"));
+        assert_eq!(
+            a["payload"]["message"].as_str(),
+            Some("你今天拒绝已超出上限")
+        );
+        // 拒不掉就等于接下了：单还在骑手身上，待确认标记被摘掉，
+        // 但额度不许再涨（这是「失败」的一面）。
+        let r = app.world.rider(rid).expect("骑手在");
+        assert!(r.is_holding(oid), "拒不掉 = 归他，单不能跑");
+        assert_eq!(r.assign_pending, None, "要摘掉待确认，别让他卡死");
+        assert_eq!(r.rejected, 3, "被挡下的尝试不计入额度");
     }
 
     #[test]

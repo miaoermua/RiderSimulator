@@ -187,6 +187,10 @@ class GameClient {
       _send({ 'type': Msg.claim, 'order_id': orderId, 'back_order': backOrder });
 
   void reject(int orderId) => _send({ 'type': Msg.reject, 'order_id': orderId });
+  /// 收下系统塞来的指派单。指派后订单已在名下，这一步只是摘掉「待确认」标记；
+  /// 但必须发：不发，之后退单会被当成「拒指派」再吃一次额度。
+  void acceptAssign(int orderId) =>
+      _send({ 'type': Msg.acceptAssign, 'order_id': orderId });
   void urge(int orderId) => _send({ 'type': Msg.urge, 'order_id': orderId });
   void arriveShop(int orderId) =>
       _send({ 'type': Msg.arriveShop, 'order_id': orderId });

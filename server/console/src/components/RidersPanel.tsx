@@ -29,17 +29,43 @@ export function RidersPanel({ selected, onSelect }: Props) {
   const snap = useStore((s) => s.snap);
   const isControl = useIsControl();
   const { token } = theme.useToken();
-  const { message } = AntApp.useApp();
+  const { message, modal } = AntApp.useApp();
   const [renaming, setRenaming] = useState<RiderBrief | null>(null);
   const [draft, setDraft] = useState("");
 
   if (!snap) return <Empty style={{ marginTop: 48 }} description="等待快照…" />;
 
   const riders = [...snap.riders].sort((a, b) => a.id - b.id);
+  const rejectLimit = snap.config.max_rejects_per_day;
 
   const openRename = (r: RiderBrief) => {
     setRenaming(r);
     setDraft(r.name);
+  };
+
+  /**
+   * 清空钱包。**两次确认**：第一次表明意图，第二次把「现在是多少钱」摆到眼前。
+   *
+   * 这个动作用来做测试降噪（把账玩乱了就清零重来），本身没有任何撤销入口，
+   * 所以第二次确认必须带上具体金额——不然连点两下就把真数据抹了。
+   */
+  const confirmClearWallet = (r: RiderBrief) => {
+    modal.confirm({
+      title: `清空 ${r.name} 的钱包？`,
+      content: "只是把账清零，方便继续测试。流水与罚单也会一并抹掉，不可撤销。",
+      okText: "继续",
+      cancelText: "取消",
+      onOk: () => {
+        modal.confirm({
+          title: "再确认一次",
+          content: `当前余额 ¥${yuan(r.cash_cents ?? 0)}，清空后归零。`,
+          okText: "确认清空",
+          okButtonProps: { danger: true },
+          cancelText: "我再想想",
+          onOk: () => store.resetRiderWallet(r.id),
+        });
+      },
+    });
   };
 
   const submitRename = () => {
@@ -125,6 +151,17 @@ export function RidersPanel({ selected, onSelect }: Props) {
                     >
                       {r.online ? "下线" : "上线"}
                     </Button>,
+                    <Button
+                      key="wallet"
+                      size="small"
+                      danger
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        confirmClearWallet(r);
+                      }}
+                    >
+                      清空钱包
+                    </Button>,
                   ]
                 : undefined
             }
@@ -152,8 +189,14 @@ export function RidersPanel({ selected, onSelect }: Props) {
                   <Metric>评分 {r.rating.toFixed(2)}</Metric>
                   <Metric>完成 {r.completed}</Metric>
                   <Metric>持单 {r.held.length > 0 ? `#${r.held.join(" #")}` : "0"}</Metric>
+                  {/* 拒单额度是当天的一次性资源，用掉多少得一眼看得见。 */}
+                  <Metric>
+                    拒单 {r.rejects_today}
+                    {rejectLimit > 0 ? `/${rejectLimit}` : "（不限）"}
+                  </Metric>
                   <Metric>{r.phase ? PHASE_LABEL[r.phase] : "空闲"}</Metric>
                   <Metric>{SPEED_MODE_LABEL[r.speed_mode] ?? r.speed_mode}</Metric>
+                  <Wallet cents={r.cash_cents} />
                   {r.hourly_wage_cents != null && <Metric>时薪 ¥{yuan(r.hourly_wage_cents)}</Metric>}
                   {r.takehome_cents != null && <Metric>到手 ¥{yuan(r.takehome_cents)}</Metric>}
                   {r.fatigue != null && <Metric>疲劳 {Math.round(r.fatigue * 100)}%</Metric>}
@@ -183,4 +226,22 @@ export function RidersPanel({ selected, onSelect }: Props) {
       </Modal>
     </div>
   );
+}
+
+/**
+ * 钱包余额。
+ *
+ * **允许为负**（罚单超过当日收入时骑手就是倒欠平台），负数是真正的关键状态，
+ * 所以取语义色标出来，而不是和别的元信息一样灰着。
+ */
+function Wallet({ cents }: { cents: number | null }) {
+  if (cents == null) return null;
+  if (cents < 0) {
+    return (
+      <Typography.Text type="danger" style={{ fontSize: 12 }}>
+        钱包 -¥{yuan(-cents)}
+      </Typography.Text>
+    );
+  }
+  return <Metric>钱包 ¥{yuan(cents)}</Metric>;
 }

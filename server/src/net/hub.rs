@@ -272,6 +272,7 @@ pub fn event_name(ev: &SimEvent) -> &'static str {
         SimEvent::OrderBroadcast { .. } => "order_broadcast",
         SimEvent::OrderClaimed { .. } => "order_claimed",
         SimEvent::OrderExpired { .. } => "order_expired",
+        SimEvent::AssignRejected { .. } => "assign_rejected",
         SimEvent::OrderPickedUp { .. } => "order_picked_up",
         SimEvent::OrderDelivered { .. } => "order_delivered",
         SimEvent::RiderStateChanged { .. } => "rider_state_changed",
@@ -371,6 +372,13 @@ fn render_filtered(world: &World, ev: &SimEvent, role: Role, now_min: u64) -> Op
             payload_of(ev)
         }
         SimEvent::FineIssued { rider_id, .. } => {
+            if !gate(*rider_id) {
+                return None;
+            }
+            payload_of(ev)
+        }
+        SimEvent::AssignRejected { rider_id, .. } => {
+            // 只有本人和控制端关心「你拒掉了第几张指派单」。
             if !gate(*rider_id) {
                 return None;
             }

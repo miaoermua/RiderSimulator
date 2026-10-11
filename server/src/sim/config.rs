@@ -236,6 +236,12 @@ pub struct SimConfig {
     pub allow_unrestricted: bool,
     pub backorder_enabled: bool,
     pub max_orders_per_day: u32,
+    /// 每天能拒掉多少张**系统指派**的单，0 = 不限。
+    ///
+    /// 这是压住「指派单被随手拒掉」的唯一闸门——指派单本身不罚款
+    /// （见 `scheduler::reject_order`），额度用完就只能照单全收。
+    /// 照众包平台的现实做法：拒单是权利，但权利有配额。
+    pub max_rejects_per_day: u32,
     pub ai_batch_enabled: bool,
     pub llm_brain_enabled: bool,
     /// 控制端「显示期望值」开关，只影响下发字段。
@@ -334,6 +340,7 @@ impl Default for SimConfig {
             allow_unrestricted: false,
             backorder_enabled: true,
             max_orders_per_day: 0,
+            max_rejects_per_day: 6,
             ai_batch_enabled: true,
             // 玩法设计 §7.3：LLM 战术大脑**默认关**，由控制端 / 命令行显式打开。
             llm_brain_enabled: false,

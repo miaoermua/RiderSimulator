@@ -28,6 +28,8 @@ pub struct RiderBrief {
     pub level: u8,
     pub rating: f32,
     pub completed: u32,
+    /// 今日已用掉的拒单次数。配合 `ConfigView::max_rejects_per_day` 显示额度。
+    pub rejects_today: u32,
     pub held: Vec<OrderId>,
     pub phase: Option<Phase>,
     pub lat: f64,
@@ -57,6 +59,7 @@ impl RiderBrief {
             level: r.level,
             rating: r.rating,
             completed: r.completed,
+            rejects_today: r.rejected,
             held: r.held_ids(),
             phase,
             lat: r.lat,
@@ -214,6 +217,15 @@ pub enum SimEvent {
     },
     OrderExpired {
         order_id: OrderId,
+    },
+    /// 骑手拒掉了一张系统指派单。**不罚款**，只吃当日拒单额度。
+    AssignRejected {
+        rider_id: RiderId,
+        order_id: OrderId,
+        /// 拒完之后今天一共拒掉几张。
+        used: u32,
+        /// 当日额度上限，`0` = 不限。
+        limit: u32,
     },
     OrderPickedUp {
         order_id: OrderId,
