@@ -16,6 +16,30 @@ pub enum RiderKind {
     Human,
 }
 
+/// 完整行程：先去商家取餐，再到顾客。
+const FULL_ROUTE: [Phase; 4] = [
+    Phase::ToShop,
+    Phase::WaitingFood,
+    Phase::ToCustomer,
+    Phase::ArrivedCustomer,
+];
+
+impl RiderKind {
+    /// 这个骑手跑一单要经过的行程段，**按顺序**。
+    ///
+    /// 现在是给玩法分化留的口子：真人侧的取餐玩法（出餐慢 → 上报）还没做，
+    /// 所以两类骑手暂时走同一段路。等上报做出来了，真人的分支改成
+    /// `[Phase::ToCustomer, Phase::ArrivedCustomer]` 就是「A 到 B」的简化版，
+    /// 不用动 tick 主循环——那里只按这个列表推进。
+    ///
+    /// **改这个列表会直接改玩法**，所以两边相等这件事由单测锁着。
+    pub fn route(self) -> &'static [Phase] {
+        match self {
+            RiderKind::Simulated | RiderKind::Human => &FULL_ROUTE,
+        }
+    }
+}
+
 /// 三档速度模式（玩法设计 §3.1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -201,6 +225,20 @@ mod leg_progress_tests {
         assert_eq!(h.leg_total_min, 1);
         // 剩余为 0 = 该段已走完
         assert!((h.leg_progress() - 1.0).abs() < 1e-6);
+    }
+
+    /// 真人和模拟骑手现在走**同一段路**。
+    ///
+    /// 这条测试是「有人改玩法」的警报：哪天真人要简化成 A→B（跳过取餐），
+    /// 它会红，提醒你确认那是玩法决策而不是手滑。
+    #[test]
+    fn both_kinds_share_the_full_route_today() {
+        assert_eq!(RiderKind::Simulated.route(), RiderKind::Human.route());
+        assert_eq!(
+            RiderKind::Human.route(),
+            &[Phase::ToShop, Phase::WaitingFood, Phase::ToCustomer, Phase::ArrivedCustomer][..],
+            "真人一旦砍掉前两段，tick 里那些取餐关口就再也不会被真人碰到"
+        );
     }
 }
 
@@ -462,7 +500,7 @@ impl Rider {
     /// 手上没活 = 没单 + 没受伤 + 没被冻结 + 没到单量上限。
     ///
     /// **故意不含 `online`**：AutoPilot 下掉线的真人由 AI 代管，他本人是离线的，
-    /// 但 AI 得能给他派单（见 [`crate::sim::host::ai_idle_riders`]）。
+    /// 但 AI 得能给他派单（见 [`crate::human::host::ai_idle_riders`]）。
     /// 所以「能不能接单」和「在不在线」是两件事，前者是 `is_free`，后者是 `is_idle`。
     pub fn is_free(&self, now_min: u64, cfg: &SimConfig) -> bool {
         self.held.is_empty()

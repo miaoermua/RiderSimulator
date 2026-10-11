@@ -1,4 +1,5 @@
 use super::*;
+use crate::human::HostMode;
 use crate::llm::{RulingSource, TaskRuling};
 use crate::sim::order::{ExtraTask, OrderStatus};
 use tokio::sync::mpsc::UnboundedReceiver;

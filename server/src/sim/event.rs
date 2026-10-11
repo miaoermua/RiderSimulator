@@ -151,7 +151,7 @@ pub enum DecisionSource {
     AlgorithmRescue,
     /// 控制端手动指派。
     Manual,
-    /// AI 托管（真人骑手掉线后由 AI 自动决策，见 `sim::host`）。
+    /// AI 托管（真人骑手掉线后由 AI 自动决策，见 `human::host`）。
     AiHosted,
 }
 

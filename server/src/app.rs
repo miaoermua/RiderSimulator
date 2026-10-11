@@ -33,6 +33,7 @@ use tokio::sync::{
 };
 use tokio::time::{Instant, sleep_until};
 
+use crate::human::{self, HostMode};
 use crate::llm::{
     AiLayer, AiOrchestrator, DirectorBrain, LayerKey, LayerModels, LlmClient, LlmConfig, ModelInfo,
     PlanFetch, PreparedPlan, PreparedWorldPlan, TacticalBrain, TaskJudge, TaskRuling,
@@ -49,7 +50,6 @@ use crate::sim::{
     economy,
     event::{AiOpBrief, DecisionSource, SimEvent},
     geo::{LatLng, from_coord_system},
-    host::{self, HostMode},
     rider::RiderKind,
     rider_key,
     scheduler::{self, ClaimError},
@@ -214,7 +214,7 @@ pub struct App {
     pending_world_ops: Vec<ValidatedWorldOp>,
     /// 烽火台自己的操作史，写进下一轮 prompt（「别反复横跳」）。
     world_history: Vec<String>,
-    /// 真人在线时允许 AI 代管的模式（见 `sim::host`）。
+    /// 真人在线时允许 AI 代管的模式（见 `human::host`）。
     host_mode: HostMode,
     /// 下一个 AI 决策 id（人工否决用它点名）。
     next_decision_id: u64,
@@ -491,13 +491,14 @@ impl App {
         if plan.is_some() && matches!(self.pending_decision, Some((_, "rider"))) {
             self.pending_decision = None; // 已交给 tick，不能再撤
         }
+        // 交出去的只是结论：谁是真人、该不该托管，都由 `human/` 判完再进来。
+        let hosted_humans = self.hosted_humans();
         let events = tick::tick(
             &mut self.world,
             TickInput {
                 llm_plan: plan,
-                host_mode: self.host_mode,
-                // 每 tick 现算，**不缓存**：玩家断线要立刻让 AI 接手。
-                live_riders: self.hub.live_rider_ids(),
+                ai_off: self.host_mode == HostMode::Off,
+                hosted_humans,
             },
         );
         self.tick_count += 1;
@@ -800,15 +801,31 @@ impl App {
         }
     }
 
-    /// 骑手层该给谁派单。
+    /// 这一 tick 该交给 AI 代管的**真人**（喂给 [`TickInput::hosted_humans`]）。
     ///
-    /// 名单由 [`host::ai_idle_riders`] 决定：**在线的真人一律让位**（玩家在操作），
-    /// 掉线的真人只有在 AutoPilot 下才由 AI 接手。LLM 的 prompt 和算法兜底共用
-    /// 同一份名单，否则「LLM 推荐的人」和「校验时合法的人」会对不上。
-    fn ai_roster(&self) -> Vec<RiderId> {
-        host::ai_idle_riders(&self.world, self.host_mode, |id| {
+    /// 判定只有 [`human::ai_should_drive`] 一条。名单**每 tick 现算、不缓存**：
+    /// 玩家断线要立刻让 AI 接手，缓存一拍就会出现「玩家已经走了，骑手还杵着」。
+    fn hosted_humans(&self) -> Vec<RiderId> {
+        human::hosted_humans(&self.world, self.host_mode, |id| {
             self.hub.rider_conn_count(id) > 0
         })
+    }
+
+    /// 骑手层该给谁派单。
+    ///
+    /// 名单由 [`tick::ai_roster`] 算：**在线的真人一律让位**（玩家在操作），掉线的
+    /// 真人只有在 AutoPilot 下才由 AI 接手——那是 `human/` 的判定，这里只把结论
+    /// 翻成 `hosted_humans` 递下去。LLM 的 prompt 和算法兜底共用同一份名单，
+    /// 否则「LLM 推荐的人」和「校验时合法的人」会对不上。
+    fn ai_roster(&self) -> Vec<RiderId> {
+        tick::ai_roster(
+            &self.world,
+            &TickInput {
+                ai_off: self.host_mode == HostMode::Off,
+                hosted_humans: self.hosted_humans(),
+                ..Default::default()
+            },
+        )
     }
 
     /// 占骑手层的坑，组装一批动作 + 策略的请求。

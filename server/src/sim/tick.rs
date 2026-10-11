@@ -10,30 +10,38 @@ use super::{
     economy,
     event::{DayLedger, DecisionSource, SimEvent},
     geo::LatLng,
-    host::{self, HostMode},
     order::OrderStatus,
-    rider::{Phase, Rider, RiderKind},
+    rider::{Phase, RiderKind},
     risk, scheduler,
     world::{Redispatch, World},
 };
 
 /// tick 的外部输入。**IO 的结果只能从这里进来。**
+///
+/// 这里放的是**结论**不是事实：外圈知道网络和托管模式，`sim` 只知道
+/// 「这一 tick 谁归 AI 管」。所以 [`crate::human`] 的枚举一个都不出现在本文件里。
 #[derive(Debug, Clone, Default)]
 pub struct TickInput {
     /// app 层异步拿到的 LLM 计划（可能为 None）。
     pub llm_plan: Option<LlmPlan>,
-    /// 托管模式。`Off` = AI 全停机，这一 tick 不派单、也不需要谁去点按钮。
-    /// 默认 [`HostMode::SimulatedOnly`]，所以不开托管模式时行为与从前一致。
-    pub host_mode: HostMode,
-    /// 本 tick **有活人连着 WS** 的骑手（hub 给）。**不缓存**：玩家一断线，
-    /// 下一 tick 的 [`host::ai_should_drive`] 就该让 AI 接手。
-    pub live_riders: Vec<RiderId>,
+    /// AI 这一 tick 是不是**全停机**。
+    ///
+    /// `true` 时不派单、不救单、不留计划——纯手动跑单。
+    pub ai_off: bool,
+    /// 本 tick **交给 AI 代管的真人**。
+    ///
+    /// 只列真人：模拟骑手天生归 AI 管，不用外圈再报一遍。**空 = 只托管模拟骑手**
+    /// （与旧的 `SimulatedOnly` 默认逐字等价）；列进来的那几位意味着 AI 代他操作
+    /// （旧的 `AutoPilot` 下的掉线真人）。
+    ///
+    /// **不缓存**：玩家一断线，下一 tick 这份名单就该变。
+    pub hosted_humans: Vec<RiderId>,
 }
 
 impl TickInput {
-    /// 这个骑手这一 tick 由 AI 代管吗？判定只有 `host::ai_should_drive` 一条。
-    pub fn ai_hosts(&self, rider: &Rider) -> bool {
-        host::ai_should_drive(rider, self.live_riders.contains(&rider.id), self.host_mode)
+    /// 这一 tick 由 AI 替这个骑手操作吗？只对真人有意义。
+    pub fn hosts(&self, rid: RiderId) -> bool {
+        self.hosted_humans.contains(&rid)
     }
 }
 
@@ -41,7 +49,7 @@ impl TickInput {
 pub fn tick(world: &mut World, mut input: TickInput) -> Vec<SimEvent> {
     let mut events = Vec::new();
     // 0. 消费外部输入
-    let ai_off = input.host_mode == HostMode::Off;
+    let ai_off = input.ai_off;
     // 托管模式「全停机」：AI 彻底不碰这一 tick（计划也一并丢掉，免得下一轮补派）。
     world.llm_plan = if ai_off { None } else { input.llm_plan.take() };
 
@@ -73,9 +81,9 @@ pub fn tick(world: &mut World, mut input: TickInput) -> Vec<SimEvent> {
     // **不允许流单**：这里不会产生 `order_expired`。真派不出去（骑手全离线/全受伤）时
     // 订单继续留在大厅等着，进入下一轮。
     //
-    // 救单是 AI 动作，所以 `HostMode::Off`（AI 全停机）下不做——那时订单就在大厅里等着，
+    // 救单是 AI 动作，所以 AI 全停机（`ai_off`）下不做——那时订单就在大厅里等着，
     // 由玩家自己抢；它依然不会过期。
-    let may_rescue = input.host_mode != HostMode::Off;
+    let may_rescue = !ai_off;
     for id in world.stale_pending_orders() {
         if world.release_to_hall(id) != Some(Redispatch::NeedsRescue) {
             continue;
@@ -147,13 +155,42 @@ fn spawn_orders(world: &mut World, events: &mut Vec<SimEvent>) {
     }
 }
 
+/// 本 tick 归 AI 管的空闲骑手。**这是名单唯一的算法。**
+///
+/// 判定顺序：
+/// - [`TickInput::ai_off`] → 一个都不给（纯手动）。
+/// - 模拟骑手 → 天生归 AI。
+/// - 真人 → 只有外圈在 [`TickInput::hosted_humans`] 里明确交出来的才算；在线的真人
+///   一律让位（§6.3「骑手 AI 停止输出决策」）。
+///
+/// 「能不能接单」用 `is_free` 而不是 `is_idle`：后者含在线判定，会把 AutoPilot 下
+/// 该被接管的掉线真人挡在外面。
+///
+/// `pub` 是给 app 拼 LLM 提示词用的——**控制端看到的名单和 tick 实际派的名单
+/// 必须同源**，否则「LLM 推荐的人」和「校验时合法的人」会对不上。
+pub fn ai_roster(world: &World, input: &TickInput) -> Vec<RiderId> {
+    if input.ai_off {
+        return Vec::new();
+    }
+    world
+        .riders
+        .iter()
+        .filter(|r| r.is_free(world.elapsed_min, &world.cfg))
+        .filter(|r| match r.kind {
+            RiderKind::Human => input.hosts(r.id),
+            RiderKind::Simulated => true,
+        })
+        .map(|r| r.id)
+        .collect()
+}
+
 /// AI 分配：优先用 LLM 计划（经校验），否则算法贪心。
 ///
-/// 派单对象走 [`host::ai_idle_riders`]——**在线的真人不在名单里**（AI 让位），
+/// 派单对象走 [`ai_roster`]——**在线的真人不在名单里**（AI 让位），
 /// 掉线的真人在 AutoPilot 下才在名单里（AI 接手）。
 fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
     let pending = world.pending_orders();
-    let idle = host::ai_idle_riders(world, input.host_mode, |id| input.live_riders.contains(&id));
+    let idle = ai_roster(world, input);
     if pending.is_empty() || idle.is_empty() {
         world.llm_plan = None;
         return;
@@ -258,7 +295,8 @@ fn advance_riders(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInp
 /// 推进单个 (骑手, 手持单)。
 ///
 /// `needs_click` = 这一步要真人点按钮（取餐 / 送达）。它**不等于**「是不是真人」：
-/// 掉线的真人在 AutoPilot 下由 AI 代管，AI 替他点，所以不该卡在那里等（§6.2）。
+/// 掉线的真人在 AutoPilot 下由 AI 代管（外圈已把他列进
+/// [`TickInput::hosted_humans`]），AI 替他点，所以不该卡在那里等（§6.2）。
 fn step_one(
     world: &mut World,
     rid: RiderId,
@@ -292,7 +330,7 @@ fn step_one(
             order
                 .prep_minutes
                 .unwrap_or_else(|| world.avg_prep_minutes(order.merchant_id)),
-            rider.kind == RiderKind::Human && !input.ai_hosts(rider),
+            rider.kind == RiderKind::Human && !input.hosts(rider.id),
             rider.speed_mps(&cfg, weather),
             target,
         )
@@ -707,7 +745,7 @@ mod tests {
         let ev_off = tick(
             &mut off,
             TickInput {
-                host_mode: HostMode::Off,
+                ai_off: true,
                 ..Default::default()
             },
         );
@@ -735,14 +773,14 @@ mod tests {
             &mut w,
             TickInput {
                 llm_plan: Some(plan),
-                host_mode: HostMode::Off,
+                ai_off: true,
                 ..Default::default()
             },
         );
         assert!(w.llm_plan.is_none(), "停机时计划要当场作废");
     }
 
-    /// 只有一个掉线的真人：SimulatedOnly 时 AI 不碰他，AutoPilot 时 AI 接手。
+    /// 只有一个掉线的真人：外圈不把他交出来时 AI 不碰他，交出来（AutoPilot）时 AI 接手。
     #[test]
     fn autopilot_assigns_to_an_offline_human_but_simulated_only_does_not() {
         let cfg = SimConfig {
@@ -764,7 +802,7 @@ mod tests {
         let ev = tick(
             &mut w,
             TickInput {
-                host_mode: HostMode::AutoPilot,
+                hosted_humans: vec![human],
                 ..Default::default()
             },
         );
@@ -793,7 +831,7 @@ mod tests {
             let evs = tick(
                 &mut w,
                 TickInput {
-                    host_mode: HostMode::AutoPilot,
+                    hosted_humans: vec![human],
                     ..Default::default()
                 },
             );
@@ -820,14 +858,8 @@ mod tests {
         w.rider_mut(human).unwrap().online = true;
         w.generate_order_batch(2);
 
-        let ev = tick(
-            &mut w,
-            TickInput {
-                host_mode: HostMode::AutoPilot,
-                live_riders: vec![human],
-                ..Default::default()
-            },
-        );
+        // 玩家在线 → 外圈不会把他交给 AI，`hosted_humans` 自然是空的
+        let ev = tick(&mut w, TickInput::default());
         assert!(
             !ev.iter().any(is_ai_decision),
             "玩家自己在线，AI 不许替他接单"

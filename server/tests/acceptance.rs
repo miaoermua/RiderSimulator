@@ -11,7 +11,6 @@ use rider_sim::sim::{
     RiderId,
     config::{MAX_REDISPATCH_ATTEMPTS, SimConfig},
     event::{DecisionSource, SimEvent},
-    host::HostMode,
     order::OrderStatus,
     rider::SpeedMode,
     scheduler,
@@ -334,16 +333,16 @@ fn a_days_deliveries_are_not_all_late() {
 
 /// 没人抢的单在重投用尽后被**强制指派给最近的骑手**，而不是流掉。
 ///
-/// 前半段把 AI 全停机（`HostMode::Off`）制造「全城没人接单」，让订单一路重投到顶；
+/// 前半段把 AI 全停机（`ai_off`）制造「全城没人接单」，让订单一路重投到顶；
 /// 后半段把 AI 打开，订单必须被救单——来源标成 `algorithm_rescue`，事件带 `forced`。
 #[test]
 fn exhausted_order_is_force_assigned_to_the_nearest_rider() {
     let mut w = world(4242);
     let off = TickInput {
-        host_mode: HostMode::Off,
+        ai_off: true,
         ..Default::default()
     };
-    let on = TickInput::default(); // SimulatedOnly
+    let on = TickInput::default(); // 只托管模拟骑手
 
     // 1. AI 全停机：没人抢单，订单反复重投直到把次数耗光。
     for _ in 0..60u64 {

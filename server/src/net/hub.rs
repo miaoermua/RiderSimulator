@@ -165,7 +165,7 @@ impl Hub {
 
     /// **所有连着活人客户端的骑手**（去重、升序）。
     ///
-    /// 这是 [`crate::sim::host::ai_should_drive`] 的 `has_live_conn` 的数据源：
+    /// 这是 [`crate::human::ai_should_drive`] 的 `has_live_conn` 的数据源：
     /// 玩家断线 = 从这个列表里消失 = AI 下一 tick 接手。
     pub fn live_rider_ids(&self) -> Vec<RiderId> {
         let mut ids: Vec<RiderId> = self

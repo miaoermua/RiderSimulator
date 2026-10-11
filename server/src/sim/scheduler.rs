@@ -13,7 +13,7 @@ use super::{
     economy,
     event::{DecisionSource, SimEvent},
     order::{OrderStatus, OrderTier},
-    rider::{HeldOrder, Phase, Rider, RiderKind, SpeedMode},
+    rider::{HeldOrder, Phase, RiderKind, SpeedMode},
     world::World,
 };
 
@@ -715,11 +715,6 @@ pub fn tier_available(cfg: &SimConfig, rating: f32) -> Vec<OrderTier> {
         .into_iter()
         .filter(|t| economy::can_claim_tier(cfg, rating, *t))
         .collect()
-}
-
-/// 骑手是否是真人的辅助判断。
-pub fn is_human(rider: &Rider) -> bool {
-    rider.kind == RiderKind::Human
 }
 
 #[cfg(test)]

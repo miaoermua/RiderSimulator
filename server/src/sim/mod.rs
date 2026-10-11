@@ -2,6 +2,10 @@
 //!
 //! 本模块内**禁止**出现：日志、文件读写、网络请求、系统时间。
 //! 唯一的时间来源是 `World::tick_count` / `World::sim_minute`。
+//!
+//! 同样**禁止** `crate::human`：真人的判定归 [`crate::human`]，这里只收结论
+//! （见 [`tick::TickInput`]）。本模块是被所有上层依赖的一层，不许反向依赖。
+//! 源码级断言见 `server/tests/layering.rs`。
 
 pub mod ai;
 pub mod chat;
@@ -9,7 +13,6 @@ pub mod config;
 pub mod economy;
 pub mod event;
 pub mod geo;
-pub mod host;
 pub mod merchant;
 pub mod order;
 pub mod rider;

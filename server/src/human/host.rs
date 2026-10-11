@@ -3,10 +3,16 @@
 //! 「开服即玩」的地基：玩家不碰控制台，世界由 AI 自己跑；玩家手机扫码接入，
 //! AI 立刻让位。这中间的判定**只有这一条规则**，所以它值得单独一个文件、
 //! 单独一堆单测——判错了就是「AI 跟玩家抢操作」或者「玩家掉线被扣一堆钱」。
+//!
+//! ## 为什么在 `human/` 而不是 `sim/`
+//!
+//! 本文件问的是「**现在谁是真人**」。`sim/` 其余代码都不需要知道这件事，
+//! 而它依赖的「谁连着 WS」本来就是外圈的事实——所以依赖方向是 `human → sim`，
+//! 落到 `sim` 手上的只有结论（见 [`crate::sim::tick::TickInput::hosted_humans`]）。
 
 use serde::{Deserialize, Serialize};
 
-use super::{
+use crate::sim::{
     RiderId,
     rider::{Rider, RiderKind},
     world::World,
@@ -92,6 +98,9 @@ pub fn ai_should_drive(rider: &Rider, has_live_conn: bool, mode: HostMode) -> bo
 /// - 掉线的真人只有在 `AutoPilot` 下才**被纳入**——否则单会派给他然后卡死在那儿。
 ///
 /// `is_live` 由连接层（hub）给，**不缓存**：玩家断线要立刻让 AI 接手。
+///
+/// 名单的**算**只有一份，在 [`crate::sim::tick::ai_roster`]；这份是为了给
+/// 「还没进 tick」的场合（拼 LLM 提示词）用。两边条件同源，不会漂。
 pub fn ai_idle_riders(
     world: &World,
     mode: HostMode,
@@ -102,6 +111,26 @@ pub fn ai_idle_riders(
         .iter()
         .filter(|r| ai_should_drive(r, is_live(r.id), mode))
         .filter(|r| r.is_free(world.elapsed_min, &world.cfg))
+        .map(|r| r.id)
+        .collect()
+}
+
+/// 这一 tick 该交给 AI 代管的**真人**。产物直接喂给
+/// [`TickInput::hosted_humans`]。
+///
+/// 只挑真人：模拟骑手天生归 AI 管，不用外圈再报一遍。
+///
+/// [`TickInput::hosted_humans`]: crate::sim::tick::TickInput::hosted_humans
+pub fn hosted_humans(
+    world: &World,
+    mode: HostMode,
+    is_live: impl Fn(RiderId) -> bool,
+) -> Vec<RiderId> {
+    world
+        .riders
+        .iter()
+        .filter(|r| r.kind == RiderKind::Human)
+        .filter(|r| ai_should_drive(r, is_live(r.id), mode))
         .map(|r| r.id)
         .collect()
 }
@@ -201,5 +230,25 @@ mod tests {
 
         let off = ai_idle_riders(&world, HostMode::Off, |_| false);
         assert!(off.is_empty(), "全停机谁都不派");
+    }
+
+    /// `hosted_humans` 只挑真人：模拟骑手天生归 AI，不该混进这份名单。
+    #[test]
+    fn hosted_humans_lists_only_humans() {
+        let mut world = World::new_for_test(SimConfig::default(), 7);
+        let human = world.spawn_human_rider("张三");
+        assert!(!world.rider(human).unwrap().online, "真人默认离线");
+        let sim_count = world
+            .riders
+            .iter()
+            .filter(|r| r.kind == RiderKind::Simulated)
+            .count();
+        assert!(sim_count > 0, "前提：默认世界里得有模拟骑手");
+
+        let hosted = hosted_humans(&world, HostMode::AutoPilot, |_| false);
+        assert_eq!(hosted, vec![human], "AutoPilot 下掉线真人该被交出去");
+
+        let waiting = hosted_humans(&world, HostMode::SimulatedOnly, |_| false);
+        assert!(waiting.is_empty(), "SimulatedOnly 谁都不交");
     }
 }
