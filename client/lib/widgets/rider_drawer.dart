@@ -133,7 +133,7 @@ class _Header extends StatelessWidget {
         ],
       ),
       accountEmail: me == null
-          ? Text('未登录骑手身份')
+          ? const Text('未登录骑手身份')
           : Row(
               children: [
                 Icon(

@@ -109,7 +109,8 @@ abstract final class ErrCode {
         noAccount => '这个名字还没在烽火台建号，找调度要二维码',
         badCredentials => '名字或密码不对',
         protocolMismatch => '客户端版本与服务端不一致',
-        _ => code ?? '未知错误',
+        // 前面已经吃掉 null 与空串，到这里 code 必定非空。
+        _ => code,
       };
 }
 
@@ -139,7 +140,7 @@ ServerFrame? parseFrame(Object? raw) {
 
 int? optInt(Object? v) => v is num ? v.toInt() : null;
 int reqInt(Object? v, [int fallback = 0]) => optInt(v) ?? fallback;
-double optDouble(Object? v) => v is num ? v.toDouble() : null;
+double? optDouble(Object? v) => v is num ? v.toDouble() : null;
 double reqDouble(Object? v, [double fallback = 0]) => optDouble(v) ?? fallback;
 bool reqBool(Object? v, [bool fallback = false]) => v is bool ? v : fallback;
 String reqStr(Object? v, [String fallback = '']) => v is String ? v : fallback;

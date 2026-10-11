@@ -223,7 +223,7 @@ class _StatusStrip extends StatelessWidget {
     final online = me.online;
     return Container(
       width: double.infinity,
-      color: online ? Colors.green.withOpacity(0.10) : Colors.black12,
+      color: online ? Colors.green.withValues(alpha: 0.10) : Colors.black12,
       padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
       child: Row(
         children: [
@@ -286,7 +286,7 @@ class _Badge extends StatelessWidget {
         margin: const EdgeInsets.only(right: 6),
         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
         decoration: BoxDecoration(
-          color: color.withOpacity(0.15),
+          color: color.withValues(alpha: 0.15),
           borderRadius: BorderRadius.circular(6),
         ),
         child: Text(text, style: TextStyle(color: color, fontSize: 11)),

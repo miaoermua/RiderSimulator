@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/foundation.dart';
 
 import 'protocol.dart';
@@ -484,6 +482,8 @@ class GameState extends ChangeNotifier {
         pickedUpAtMin: o.pickedUpAtMin,
         deliveredAtMin: o.deliveredAtMin,
         fee: o.fee,
+        redispatchCount: o.redispatchCount,
+        surchargeCents: o.surchargeCents,
         status: status ?? o.status,
         assignedTo: assignedTo ?? o.assignedTo,
         forced: o.forced,
