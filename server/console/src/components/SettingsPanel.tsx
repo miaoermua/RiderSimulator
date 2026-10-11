@@ -141,9 +141,9 @@ export function SettingsPanel() {
           onChange={(v) => store.send("set_config", { base_fee_cents: toCents(v) })}
         />
       </Row>
-      <Row label="里程阶梯" hint="按距离取不超过本单的最大档">
+      <Row label="里程阶梯" hint="整段总价，不是每段累加；区间左闭右开">
         <Typography.Text type="secondary">
-          {tierRanges(c.fee.distance_tiers)}
+          {tierRanges(c.fee.distance_tiers, c.fee.per_km_over_cents)}
         </Typography.Text>
       </Row>
       <Row label="超出后每公里" hint="超出最后一档的单价；单位：元/km">
@@ -540,28 +540,47 @@ function toCents(yuanValue: number | null): number {
 /**
  * 把里程阶梯念成「几公里到几公里加多少钱」。
  *
- * 加价未变的相邻档会被合并——默认配置里 `(5000,350) (8000,350)` 就是这种，
- * 逐档平铺会念出两句一模一样的「+¥3.50」，看着像 bug。
+ * 三处必须和 `economy::distance_extra_cents` 对齐，否则界面会说谎：
+ *
+ * 1. **区间是左闭右开**。门槛值算进高档，所以 1.5km 整就该是 +¥1.00，
+ *    念成「<1.5km 不加价 · 1.5~3.0km」正好对；用 `<1.5km` 而非 `≤1.5km`
+ *    就会让人以为 1.5km 不加价。
+ *
+ * 2. **加价未变的相邻档可以合并**，但**末档不能合并掉上界**。
+ *    默认配置 `(5000,350) (8000,350)`：8km 是「超出后按每公里叠加」的分界，
+ *    合并成一句「5.0km 起 +¥3.50」会让人以为 8km 之后也是 3.50 平的——
+ *    实际 8.5km 是 3.80，10km 是 4.70。所以末档一律带上界，
+ *    把「超出后每公里」交给下一行那个输入框说。
+ *
+ * 3. **首档之前不是 0**，除非首档门槛就是 0。默认首档 1500m 表示
+ *    「1.5km 以内不加里程费」，但起步价本身另算，不能混为一谈。
  */
-function tierRanges(tiers: [number, number][]): string {
+function tierRanges(tiers: [number, number][], perKmCents: number): string {
   if (tiers.length === 0) return "—";
   const km = (m: number) => (m / 1000).toFixed(1);
+  const yuanOf = (c: number) => (c / 100).toFixed(2);
 
+  // 合并加价相同的相邻档，但**永远保留最后一档**——它带着「超出后叠加」的分界。
   const steps: Array<[number, number]> = [];
   for (const [m, cents] of tiers) {
     const prev = steps[steps.length - 1];
-    if (prev && prev[1] === cents) continue;
+    const isLast = m === tiers[tiers.length - 1][0];
+    if (prev && prev[1] === cents && !isLast) continue;
     steps.push([m, cents]);
   }
 
-  const parts = [`<${km(steps[0][0])}km 不加价`];
+  const parts: string[] = [`≤${km(steps[0][0])}km 不加`];
   steps.forEach(([m, cents], i) => {
     const next = steps[i + 1];
     parts.push(
       next
-        ? `${km(m)}~${km(next[0])}km +¥${yuan(cents)}`
-        : `${km(m)}km 起 +¥${yuan(cents)}`,
+        ? `${km(m)}~${km(next[0])}km +¥${yuanOf(cents)}`
+        : `>${km(m)}km +¥${yuanOf(cents)}`,
     );
   });
+  // 末档之上还有每公里叠加，说清楚它从哪儿开始，别让人按平价理解。
+  if (perKmCents > 0) {
+    parts.push(`超出部分 ¥${(perKmCents / 100).toFixed(2)}/km`);
+  }
   return parts.join(" · ");
 }

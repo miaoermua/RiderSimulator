@@ -283,6 +283,8 @@ pub fn event_name(ev: &SimEvent) -> &'static str {
         SimEvent::AiDecision { .. } => "ai_decision",
         SimEvent::Narration { .. } => "narration",
         SimEvent::TaskMessage { .. } => "task_message",
+        SimEvent::ChatOpen { .. } => "chat_open",
+        SimEvent::ChatMessage { .. } => "chat_message",
         SimEvent::DayClosed { .. } => "day_closed",
     }
 }

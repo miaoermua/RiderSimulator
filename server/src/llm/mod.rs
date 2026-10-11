@@ -38,6 +38,7 @@
 
 pub mod brain;
 pub mod client;
+pub mod customer;
 pub mod director_brain;
 pub mod orchestrator;
 pub mod protocol;

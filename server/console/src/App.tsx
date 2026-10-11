@@ -40,12 +40,17 @@ export function App() {
 
   return (
     <Layout style={{ height: "100vh" }}>
-      {/* 页头是容器面（白），与页面底板（#F5F5F5）靠一条弱边框分层，不用阴影。 */}
+      {/* 页头是容器面（白），与页面底板（#F5F5F5）靠一条弱边框分层，不用阴影。
+          高度固定成 56px：顶栏内部所有控件已统一到 32 高，这里只需保证外框
+          不会被内容撑开，否则某一项字号变化就会让整条页头跟着抖。 */}
       <Layout.Header
         style={{
           display: "flex",
           alignItems: "center",
           gap: 16,
+          height: 56,
+          padding: "0 16px",
+          lineHeight: "normal",
           borderBottom: `1px solid ${token.colorBorderSecondary}`,
         }}
       >

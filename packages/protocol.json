@@ -67,6 +67,19 @@
       "comment": "立刻回 ack(status=judging)，判定结果稍后以 task_message 事件下发。"
     },
 
+    {
+      "type": "chat_say",
+      "roles": ["rider"],
+      "fields": { "order_id": "u32", "text": "string" },
+      "comment": "订单级会话（末端交付沟通），与挂在附加任务上的 task_message 不同：任何一单在末端窗口 5–60 模拟分钟内都能说话。骑手这句立刻以 chat_message(from=rider) 广播；顾客是否回应、回应什么由服务端决定，回应稍后下发。"
+    },
+    {
+      "type": "chat_preset",
+      "roles": ["rider"],
+      "fields": { "order_id": "u32", "preset": "leave_at_door | leave_at_desk | hand_to_me | call_me | sorry_late | report_damage" },
+      "comment": "预设话术。文本由服务端按枚举补全（ChatPreset::text），客户端只传枚举名——骑手说了什么永远可审计。"
+    },
+
     { "type": "set_paused", "roles": ["control"], "fields": { "paused": "bool" } },
     { "type": "set_speed_multiplier", "roles": ["control"], "fields": { "multiplier": "u32 (1|2|4|8|10|60)" } },
     {
@@ -135,6 +148,7 @@
       "config_changed": { "audience": "public", "payload": "{ speed_multiplier, commission_rate, weather }" },
       "ai_decision": { "audience": "public", "payload": "{ source, assignments, note }" },
       "task_message": { "audience": "owner+control", "payload": "{ order_id, from: rider|customer|system, text, step, task_id }" },
+      "chat_message": { "audience": "public", "payload": "{ order_id, from: rider|customer|system, kind: preset|free|reply|ruling, text, day, sim_minute, compensation_cents, fault: rider|merchant|none }" },
       "day_closed": { "audience": "public (ledgers 只保留本人/控制端可见的部分)", "payload": "{ day, ledgers, total_takehome_cents, total_orders }" }
     }
   },

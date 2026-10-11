@@ -6,6 +6,7 @@
 use super::{
     OrderId, RiderId,
     ai::{self, LlmPlan},
+    chat,
     economy,
     event::{DayLedger, DecisionSource, SimEvent},
     geo::LatLng,
@@ -413,6 +414,9 @@ fn step_one(
                 set_remaining(world, rid, oid, remaining - 1);
                 return;
             }
+            // 到门口：先掷末端放置窗口，再掷一次「顾客会不会开口」。
+            // 两件事都走 `world.rng`，与种子绑定、可复现（玩法设计 §九）。
+            let (window, chat_open) = arrival_roll(world, rid, oid);
             if let Some(rider) = world.rider_mut(rid)
                 && let Some(h) = rider.held_mut(oid)
             {
@@ -421,23 +425,46 @@ fn step_one(
                 h.leg_total_min = 1;
                 h.awaiting_ack = needs_click;
                 h.wait_started_min = now;
+                h.arrive_at_min = Some(now);
+                h.deliver_window_min = window;
+                if chat_open.is_some() {
+                    h.chat_opened = true;
+                }
             }
-            if let Some(rider) = world.rider(rid)
-                && let Some(order) = world.order(oid)
-            {
+            if let Some(order) = world.order(oid) {
                 let p = order.customer_pos();
-                let _ = rider;
                 if let Some(r) = world.rider_mut(rid) {
                     r.set_pos(p);
                 }
             }
-            if !needs_click {
-                to_deliver.push((rid, oid));
+            if let Some((context, fallback)) = chat_open {
+                // 顾客开口是 IO 前的事：这里只报「要开口」，
+                // 「说什么、要不要索赔」由 app 层拿走去调 LLM。
+                events.push(SimEvent::ChatOpen {
+                    order_id: oid,
+                    rider_id: rid,
+                    context,
+                    fallback,
+                });
             }
+            // **注意**：这里不再立刻 `to_deliver`。末端窗口的推进挪到下一 tick 的
+            // `Phase::ArrivedCustomer` 分支——AI 托管也要停够窗口时间，
+            // 否则「到达即送达」，顾客根本没机会说话。
         }
         Phase::ArrivedCustomer => {
-            // 到门口了：玩家要自己点「送达」，AI 代管时替他按下这个按钮。
-            if !needs_click {
+            // 到门口了。窗口走完才算「放置完成」：
+            // - 真人骑手：窗口内自己点「送达」（`awaiting_ack` 闸门在函数开头管着）；
+            // - AI 托管：不看闸门，但要等窗口到点。
+            let placed = world
+                .rider(rid)
+                .and_then(|r| r.held.iter().find(|h| h.order_id == oid))
+                .map(|h| match h.arrive_at_min {
+                    Some(t) => now.saturating_sub(t) >= h.deliver_window_min as u64,
+                    // 老存档 / 手工构造的手持单没有到达时刻：不拦，免得卡死。
+                    None => true,
+                })
+                .unwrap_or(true);
+            if placed && !needs_click {
                 to_deliver.push((rid, oid));
             }
             if let Some(ev) = scheduler::state_event(world, rid) {
@@ -476,6 +503,59 @@ fn enter_waiting_food(
     }
     if let Some(ev) = scheduler::state_event(world, rid) {
         events.push(ev);
+    }
+}
+
+/// 到门口那一下：掷末端放置窗口 + 掷「顾客会不会开口」。
+///
+/// **纯计算**，随机性全部来自 `world.rng`（绑世界种子，可复现、零 token）。
+/// 返回 `(窗口分钟, 顾客要开口时的画像摘要与兜底开场白)`。
+fn arrival_roll(world: &mut World, rid: RiderId, oid: OrderId) -> (u32, Option<(String, String)>) {
+    let window = chat::roll_window(&mut world.rng);
+
+    // 先把画像抄出来再动 rng：`world.rider()` 是只读借用，
+    // 和 `world.rng` 的可变借用不能同时活着。
+    let profile = {
+        let rider = world.rider(rid);
+        let order = world.order(oid);
+        match (rider, order) {
+            (Some(r), Some(o)) => {
+                let signature = world
+                    .merchant(o.merchant_id)
+                    .map(|m| m.signature.clone())
+                    .unwrap_or_default();
+                let buffer = if o.back_order {
+                    world.cfg.backorder.late_buffer_min
+                } else {
+                    0
+                };
+                Some((
+                    r.rating,
+                    world.sim_minute,
+                    signature,
+                    o.remark.clone(),
+                    o.is_late(world.elapsed_min, buffer),
+                ))
+            }
+            _ => None,
+        }
+    };
+    let Some((rider_rating, sim_minute, signature, remark, late)) = profile else {
+        return (window, None);
+    };
+
+    let ctx = chat::ChatContext {
+        signature,
+        remark,
+        rider_rating,
+        sim_minute,
+        late,
+    };
+    if chat::should_open(&mut world.rng, &ctx) {
+        let fallback = chat::opening_line(&ctx).to_string();
+        (window, Some((ctx.brief(), fallback)))
+    } else {
+        (window, None)
     }
 }
 

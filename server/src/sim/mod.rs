@@ -4,6 +4,7 @@
 //! 唯一的时间来源是 `World::tick_count` / `World::sim_minute`。
 
 pub mod ai;
+pub mod chat;
 pub mod config;
 pub mod economy;
 pub mod event;

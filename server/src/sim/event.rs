@@ -300,6 +300,39 @@ pub enum SimEvent {
         step: usize,
         task_id: String,
     },
+    /// 顾客想开口了（**服务端内部信号，不下发给客户端**）。
+    ///
+    /// sim 层只负责掷骰子（见 [`crate::sim::chat`]）；「说什么、要不要索赔」
+    /// 是 IO，必须由 app 层拿走去调 LLM。带上画像摘要，免得 app 层再回查世界。
+    ChatOpen {
+        order_id: OrderId,
+        rider_id: RiderId,
+        /// 画像一行摘要，直接进提示词。
+        context: String,
+        /// LLM 不可用时的兜底开场白（零延迟，可复现）。
+        fallback: String,
+    },
+    /// **订单会话消息**（末端交付沟通）。骑手端与烽火台都能看到。
+    ///
+    /// 与 [`SimEvent::TaskMessage`] 分开：那条绑在附加任务上，这条是订单级的，
+    /// 末端窗口里任何一单都可能有。会话**按单聚合**，前端拿 `order_id` 归并。
+    ChatMessage {
+        order_id: OrderId,
+        /// `rider` | `customer` | `system`
+        from: &'static str,
+        text: String,
+        /// 消息类型：`preset`（预设话术）| `free`（骑手打字）| `reply`（顾客回应）
+        /// | `ruling`（裁决结论）。前端据此换头像 / 配色。
+        kind: &'static str,
+        /// 归属天（0:00 起算的第几天）。**会话时效按它算**，过期即删。
+        day: u32,
+        /// 发生时的当日分钟（0..1439），仅用于展示时间戳。
+        sim_minute: u32,
+        /// 这条消息带来的赔付金额（分）。恒 ≥ 0，`0` = 无经济后果。
+        compensation_cents: i64,
+        /// 责任方：`rider` | `merchant` | `none`。钱从谁身上出由它决定。
+        fault: &'static str,
+    },
     /// 日结。
     DayClosed {
         day: u32,

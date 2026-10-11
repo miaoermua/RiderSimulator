@@ -457,6 +457,21 @@ impl App {
             },
         );
         self.tick_count += 1;
+
+        // 顾客开口是**内部信号**：sim 层只负责掷骰子（可复现、零 token），
+        // 「说什么」归 app 层。先在这里落地，别让它流到 `publish` 里当普通事件广播。
+        for ev in &events {
+            if let SimEvent::ChatOpen {
+                order_id,
+                rider_id,
+                fallback,
+                ..
+            } = ev
+            {
+                self.open_chat(*order_id, *rider_id, fallback.clone());
+            }
+        }
+
         self.publish(&events);
 
         if self.opts.server_info_every_ticks > 0
@@ -472,6 +487,11 @@ impl App {
     /// 广播事件，并顺手处理需要落库的部分。
     fn publish(&mut self, events: &[SimEvent]) {
         for ev in events {
+            // `ChatOpen` 是内部信号，`on_tick` 已经把它落成一条 `ChatMessage` 了；
+            // 这里再发一遍，客户端会收到一条没有内容的空消息。
+            if matches!(ev, SimEvent::ChatOpen { .. }) {
+                continue;
+            }
             if let SimEvent::DayClosed { day, ledgers, .. } = ev {
                 match self.store.save_day(*day, ledgers) {
                     Ok(r) => tracing::info!(day, ledgers = r.ledgers, "日结已落库"),
@@ -1481,6 +1501,17 @@ impl App {
                 Some(rid) => self.do_task_message(conn_id, rid, order_id, text),
                 None => self.not_a_rider(conn_id, "task_message"),
             },
+            // 订单会话（末端交付沟通）：**不要求挂任务**，任何到手单都能说。
+            M::ChatSay { order_id, text } => match role.rider_id() {
+                Some(rid) => self.do_chat_say(conn_id, rid, order_id, text, "chat_say"),
+                None => self.not_a_rider(conn_id, "chat_say"),
+            },
+            M::ChatPreset { order_id, preset } => match role.rider_id() {
+                Some(rid) => {
+                    self.do_chat_say(conn_id, rid, order_id, preset.text().to_string(), "chat_preset")
+                }
+                None => self.not_a_rider(conn_id, "chat_preset"),
+            },
 
             // ---------------- 控制端 ----------------
             M::SetPaused { paused } => self.control(conn_id, role, "set_paused", |app| {
@@ -2391,6 +2422,87 @@ impl App {
             weather: self.world.weather,
         };
         self.publish(&[ev]);
+    }
+
+    // -----------------------------------------------------------------
+    // 订单会话（末端交付沟通）
+    // -----------------------------------------------------------------
+
+    /// 骑手在订单会话里说一句话。
+    ///
+    /// 与 [`App::do_task_message`] 的关键区别：**不要求订单挂任务**，也不推进
+    /// 任何进度——它纯粹是末端沟通。骑手这句立刻广播；顾客是否回应由末端窗口
+    /// 与订单画像决定（见 [`crate::sim::chat`]），**说了话不等于一定有人回**。
+    ///
+    /// `action` 是回执里的动作名（`chat_say` / `chat_preset`），只影响客户端
+    /// 怎么匹配回执，不影响行为。
+    fn do_chat_say(
+        &mut self,
+        conn_id: ConnId,
+        rid: RiderId,
+        order_id: OrderId,
+        text: String,
+        action: &'static str,
+    ) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return self
+                .hub
+                .send_ack(conn_id, &Ack::err(action, code::BAD_REQUEST, "不能发空消息"));
+        }
+        if text.chars().count() > crate::llm::customer::MAX_REPLY_CHARS {
+            return self.hub.send_ack(
+                conn_id,
+                &Ack::err(action, code::BAD_REQUEST, "消息太长了，说重点"),
+            );
+        }
+        if let Err(e) = self.check_chat_target(rid, order_id) {
+            return self.ack_err(conn_id, action, e);
+        }
+
+        self.publish(&[SimEvent::ChatMessage {
+            order_id,
+            from: "rider",
+            text,
+            kind: "free",
+            day: self.world.day,
+            sim_minute: self.world.sim_minute,
+            compensation_cents: 0,
+            fault: "none",
+        }]);
+        self.hub
+            .send_ack(conn_id, &Ack::ok_with(action, json!({ "status": "said" })));
+    }
+
+    /// 会话准入：单子存在，且是你的。
+    ///
+    /// **不检查末端窗口**——骑手想在窗口外补一句「餐放门口了」是合理的，
+    /// 硬卡窗口只会让人困惑。
+    fn check_chat_target(&self, rid: RiderId, order_id: OrderId) -> Result<(), ClaimError> {
+        let Some(order) = self.world.order(order_id) else {
+            return Err(ClaimError::OrderNotFound);
+        };
+        if order.assigned_to != Some(rid) {
+            return Err(ClaimError::NotAssignedToYou);
+        }
+        Ok(())
+    }
+
+    /// 顾客开口。**先用兜底话术立刻广播，不让人干等 LLM。**
+    ///
+    /// 接上 `CustomerBrain` 之后，这里会先广播兜底句、再把精修后的回应补上；
+    /// 无论模型多慢，都**不会卡住交付**。
+    fn open_chat(&mut self, order_id: OrderId, _rider_id: RiderId, fallback: String) {
+        self.publish(&[SimEvent::ChatMessage {
+            order_id,
+            from: "customer",
+            text: fallback,
+            kind: "reply",
+            day: self.world.day,
+            sim_minute: self.world.sim_minute,
+            compensation_cents: 0,
+            fault: "none",
+        }]);
     }
 
     // -----------------------------------------------------------------

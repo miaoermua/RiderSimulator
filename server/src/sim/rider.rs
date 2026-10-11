@@ -114,6 +114,20 @@ pub struct HeldOrder {
     pub wait_started_min: u64,
     /// 等餐超时罚单是否已经开过（每单只罚一次）。
     pub wait_fined: bool,
+    /// 到达顾客的时刻（`elapsed_min`）。`None` = 还没到门口。
+    ///
+    /// 末端放置窗口与订单会话都按它起算：窗口到点没、顾客该不该开口，
+    /// 都得先知道「到多久了」。
+    pub arrive_at_min: Option<u64>,
+    /// 末端放置窗口长度（模拟分钟，5–60）。到达时由
+    /// [`crate::sim::chat::roll_window`] 掷出。
+    ///
+    /// 1x 时它正好是 5–60 真实秒——停车、上楼、放门口的实际耗时。
+    /// 真人骑手在窗口内可随时点「送达」；AI 托管则等窗口走完再自动交付，
+    /// 否则「到达即送达」根本不给对话留缝。
+    pub deliver_window_min: u32,
+    /// 这单的顾客是否已经开过口。**每单最多触发一次会话**，免得同一单反复骚扰。
+    pub chat_opened: bool,
 }
 
 impl HeldOrder {
@@ -134,6 +148,9 @@ impl HeldOrder {
             back_order,
             wait_started_min: now_min,
             wait_fined: false,
+            arrive_at_min: None,
+            deliver_window_min: 0,
+            chat_opened: false,
         }
     }
 

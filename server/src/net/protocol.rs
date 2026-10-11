@@ -115,6 +115,26 @@ pub enum ClientMessage {
     /// 骑手在任务对话里说一句话。顾客回复由服务端（LLM 或关键词）生成。
     TaskMessage { order_id: OrderId, text: String },
 
+    /// 骑手在**订单会话**里打一句话（末端交付沟通）。
+    ///
+    /// 与 [`ClientMessage::TaskMessage`] 的区别：任务对话绑在「附加任务」上，
+    /// 没挂任务的单会被直接拒掉；这里是**订单级**会话，任何一单在末端窗口
+    /// （到达顾客后的 5–60 模拟分钟）里都能说话。
+    ///
+    /// 写回分两路：骑手这句立刻广播（`chat_message`，`from = "rider"`），
+    /// 顾客的回应 / 索赔稍后由主循环裁决后再广播。**顾客是否开口由服务端决定**，
+    /// 骑手说了话不等于顾客一定回。
+    ChatSay { order_id: OrderId, text: String },
+
+    /// 骑手点一条**预设话术**（不想打字时用）。
+    ///
+    /// 文本由服务端按 [`ChatPreset::text`] 补全，客户端只传枚举名——
+    /// 「骑手说了什么」永远可审计，也不会因为客户端版本不同冒出两套话术。
+    ChatPreset {
+        order_id: OrderId,
+        preset: ChatPreset,
+    },
+
     /// 心跳。服务端回 `pong`。
     Ping,
 
@@ -204,6 +224,76 @@ pub enum ClientMessage {
     /// 纯给控制端「测试把账弄乱了，重来」用的，**不做任何业务校验**——
     /// 二次确认的责任在控制台那一侧。
     ResetRiderWallet { rider_id: RiderId },
+}
+
+/// 骑手端的**预设话术**。末端交付沟通里最常见的那几句。
+///
+/// **文本在服务端补全**：客户端只发枚举名，服务端查表拿文本。这样既保证
+/// 「骑手说了什么」永远可审计（不会有人把任意字符串伪装成"预设"），
+/// 也不会因为客户端版本不同而出现两套话术。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatPreset {
+    /// 放门口。
+    LeaveAtDoor,
+    /// 放前台 / 门卫 / 指定位置。
+    LeaveAtDesk,
+    /// 当面交付，我在门口等。
+    HandToMe,
+    /// 到了，电话联系。
+    CallMe,
+    /// 路上耽搁了，抱歉。
+    SorryLate,
+    /// 主动报备餐品有损，问怎么处理。
+    ReportDamage,
+}
+
+impl ChatPreset {
+    /// 全部选项。客户端渲染预设按钮、控制台做对照表都用它，**顺序即展示顺序**。
+    pub const ALL: [ChatPreset; 6] = [
+        ChatPreset::LeaveAtDoor,
+        ChatPreset::LeaveAtDesk,
+        ChatPreset::HandToMe,
+        ChatPreset::CallMe,
+        ChatPreset::SorryLate,
+        ChatPreset::ReportDamage,
+    ];
+
+    /// 对外短码（事件 / 审计日志里记这个，不记中文）。
+    pub fn key(self) -> &'static str {
+        match self {
+            ChatPreset::LeaveAtDoor => "leave_at_door",
+            ChatPreset::LeaveAtDesk => "leave_at_desk",
+            ChatPreset::HandToMe => "hand_to_me",
+            ChatPreset::CallMe => "call_me",
+            ChatPreset::SorryLate => "sorry_late",
+            ChatPreset::ReportDamage => "report_damage",
+        }
+    }
+
+    /// 按钮上的短标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            ChatPreset::LeaveAtDoor => "放门口",
+            ChatPreset::LeaveAtDesk => "放前台",
+            ChatPreset::HandToMe => "当面交付",
+            ChatPreset::CallMe => "电话联系",
+            ChatPreset::SorryLate => "抱歉晚了",
+            ChatPreset::ReportDamage => "餐品有损",
+        }
+    }
+
+    /// 骑手实际"说"出来的那句话。**这是唯一的文本来源。**
+    pub fn text(self) -> &'static str {
+        match self {
+            ChatPreset::LeaveAtDoor => "您好，餐给您放门口了，麻烦您取一下。",
+            ChatPreset::LeaveAtDesk => "您好，餐放到前台了，麻烦您取一下。",
+            ChatPreset::HandToMe => "您好，我到门口了，当面交给您。",
+            ChatPreset::CallMe => "您好，我到楼下了，方便的话我给您打个电话。",
+            ChatPreset::SorryLate => "实在抱歉，路上耽搁了，餐马上送到。",
+            ChatPreset::ReportDamage => "不好意思，路上有点颠簸，餐可能洒了一点，您看怎么处理？",
+        }
+    }
 }
 
 /// 三层 AI 的开关补丁。**每个字段都可选**，缺省 = 这一项不动。
