@@ -384,6 +384,11 @@ fn attach(world: &mut World, assignment: &Assignment) {
         order.status = OrderStatus::Assigned;
         order.assigned_to = Some(assignment.rider);
         order.prep_minutes = Some(prep);
+        // 订单在大厅里空转的那段时间不是接单骑手的账。
+        // 骑手刚接单就出发，却要替平台在大厅里待的那十几分钟买单，
+        // 等于「接单即超时」。重投退回时已有 `renew_promise` 兜底，
+        // 但**首次**派出去之前的空转没人管——这里补上（见 `Order::credit_hall_idle`）。
+        order.credit_hall_idle(now);
     }
 
     if let Some(rider) = world.rider_mut(assignment.rider) {

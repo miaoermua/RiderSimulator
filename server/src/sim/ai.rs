@@ -104,11 +104,15 @@ pub fn customer_leg_min(world: &World, rider: &Rider, order: &Order) -> u32 {
 /// 生成订单时定「承诺送达时限」（分钟）。
 ///
 /// 必须和 [`plan_for`] 算的是同一件事——「一个骑手跑完这一单要多久」——
-/// 否则承诺与真实行程脱节，超时就变成必然。这里补上两段最常被漏掉的时间：
+/// 否则承诺与真实行程脱节，超时就变成必然。这里补上三段最常被漏掉的时间：
 ///
 /// 1. **骑手到店**（含取餐步行）：下单时还不知道谁会接，按 [`TYPICAL_TO_SHOP_M`] 估；
 /// 2. **高峰出餐**：用与 `scheduler::attach` 同一个 [`PEAK_PREP_FACTOR`]，
-///    而不是商家均值——高峰的实际出餐是均值的两倍。
+///    而不是商家均值——高峰的实际出餐是均值的两倍；
+/// 3. **末端放置窗口**：到门口之后还要停车、上楼、放门口，
+///    这段时间由 [`chat::roll_window`] 掷出来（每单都有，5~60 分钟）。
+///    **漏掉这一段会导致「到达即超时」**——交付回归测试
+///    `a_days_deliveries_are_not_all_late` 就是在守这条线。
 ///
 /// 速度一律按合规档的 [`SimConfig::speed`] 基准算：骑手跑得更快是自己省下的时间，
 /// 不该写进承诺。暴雨叠加与疲劳同样不进承诺，那是留给玩家的博弈空间。
@@ -141,6 +145,11 @@ pub fn promise_minutes(
     let to_customer_secs =
         road_distance_m as f32 / base_mps + customer_walk_secs_of(cfg, customer_walk_difficulty);
 
+    // 末端放置窗口：到门口之后还要停车 / 上楼 / 放门口的实打实的时间。
+    // 这一段**每单都有**（与顾客开不开口无关，见 `chat::roll_window` 注释），
+    // 所以取窗口的**期望值**——用上限会让所有单都显得宽裕，用下限又必然超时。
+    let window_secs = expected_window_min() * 60.0;
+
     // 分档缓冲：急单给得少，那是它加价的来源。
     let buffer_min = match tier {
         OrderTier::Normal => 12.0,
@@ -148,9 +157,19 @@ pub fn promise_minutes(
         OrderTier::Express => 6.0,
     };
 
-    let total_min = (to_shop_secs + prep_min * 60.0 + to_customer_secs) / 60.0 + buffer_min;
+    let total_min =
+        (to_shop_secs + prep_min * 60.0 + to_customer_secs + window_secs) / 60.0 + buffer_min;
     let (lo, hi) = PROMISE_MINUTES_RANGE;
     ((total_min / 5.0).ceil() * 5.0).clamp(lo as f32, hi as f32) as u32
+}
+
+/// 末端放置窗口的**期望值**（模拟分钟）。
+///
+/// `roll_window` 在 `[MIN, MAX]` 上均匀掷，所以期望就是中点。
+/// 抽成函数是为了让承诺计算和测试用同一个口径——将来若把掷法改成
+/// 偏态分布（比如多数 3~8 分钟、偶尔 60 分钟），只改这一处。
+pub fn expected_window_min() -> f32 {
+    (super::chat::MIN_WINDOW_MIN + super::chat::MAX_WINDOW_MIN) as f32 / 2.0
 }
 
 /// 估算行程（骑行 + 步行）。

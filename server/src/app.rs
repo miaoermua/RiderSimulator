@@ -1469,6 +1469,12 @@ impl App {
         self.push_server_info();
     }
 
+    /// 客户端消息总入口。**只做分流，不干活。**
+    ///
+    /// 三个分支按「谁能发」划分，不按消息类型划分——因为权限边界才是这里
+    /// 最容易出错的地方：漏掉一次 `role.rider_id()` 或 `self.control()`
+    /// 就是越权（观战端能抢单、控制端能改配置）。分流写在一处、
+    /// 每处内部再 match，新增消息只要放进正确的那个方法就自带正确权限。
     fn on_client(&mut self, conn_id: ConnId, msg: ClientMessage) {
         use ClientMessage as M;
 
@@ -1491,7 +1497,128 @@ impl App {
             return;
         };
 
+        // 分流只做「消息族」判断，具体的字段解构留给各方法内部。
+        // **不用 or-pattern列举具体变体**：这些变体的字段各不相同
+        // （order_id / online / mode / patch），Rust 要求 or-pattern 各分支
+        // 绑定一致，硬凑可读性反而更差。
         match msg {
+            // ---- 骑手动作：全部要 `role.rider_id()``----
+            M::Claim { .. }
+            | M::Reject { .. }
+            | M::AcceptAssign { .. }
+            | M::Urge { .. }
+            | M::ArriveShop { .. }
+            | M::ArriveCustomer { .. }
+            | M::Deliver { .. }
+            | M::SetOnline { .. }
+            | M::SetSpeedMode { .. }
+            | M::TaskMessage { .. }
+            | M::ChatSay { .. }
+            | M::ChatPreset { .. }
+            | M::ChangePassword { .. } => self.rider_action(conn_id, role, msg),
+
+            // ---- 其余（控制端 + 杂项）----
+            _ => self.control_or_misc(conn_id, role, msg),
+        }
+    }
+
+    /// 骑手动作。**每一条都必须先过 `role.rider_id()`**。
+    ///
+    /// 单独成方法是为了让「这条消息要骑手身份」这件事在函数入口就成立——
+    /// 审阅时只需确认这个方法里每个分支都拿得到 `rid`。
+    fn rider_action(&mut self, conn_id: ConnId, role: Role, msg: ClientMessage) {
+        use ClientMessage as M;
+
+        // 一次性取骑手 id：拿不到就整组拒绝。这比每个分支各写一遍
+        // `match role.rider_id() { Some(..) => .., None => not_a_rider }` 更短，
+        // 也更难漏——新加分支时不会忘了写兜底。
+        let Some(rid) = role.rider_id() else {
+            let action = client_action_name(&msg);
+            return self.not_a_rider(conn_id, action);
+        };
+
+        match msg {
+            M::Claim {
+                order_id,
+                back_order,
+            } => self.do_claim(conn_id, rid, order_id, back_order),
+            M::Reject { order_id } => {
+                let r = scheduler::reject_order(&mut self.world, rid, order_id);
+                self.finish_simple(conn_id, "reject", r)
+            }
+            // 接受指派单只是把「待确认」标记摘掉，世界状态早在指派那一刻就定死了，
+            // 所以这里不产生任何要广播的事件。
+            M::AcceptAssign { order_id } => {
+                let r = scheduler::accept_assign(&mut self.world, rid, order_id).map(|()| vec![]);
+                self.finish_simple(conn_id, "accept_assign", r)
+            }
+            M::Urge { order_id } => {
+                let r = scheduler::urge_order(&mut self.world, rid, order_id);
+                match r {
+                    Ok((success, events)) => {
+                        self.publish(&events);
+                        self.hub.send_ack(
+                            conn_id,
+                            &Ack::ok_with("urge", json!({ "success": success })),
+                        );
+                    }
+                    Err(e) => self.ack_err(conn_id, "urge", e),
+                }
+            }
+            M::ArriveShop { order_id } => {
+                let r = scheduler::arrive_shop(&mut self.world, rid, order_id);
+                self.finish_simple(conn_id, "arrive_shop", r)
+            }
+            M::ArriveCustomer { order_id } => {
+                let r = scheduler::arrive_customer(&mut self.world, rid, order_id);
+                self.finish_simple(conn_id, "arrive_customer", r)
+            }
+            M::Deliver { order_id } => {
+                let r = scheduler::deliver(&mut self.world, rid, order_id);
+                self.finish_simple(conn_id, "deliver", r)
+            }
+            M::SetOnline { online } => {
+                let r = scheduler::set_online(&mut self.world, rid, online);
+                self.finish_simple(conn_id, "set_online", r)
+            }
+            M::SetSpeedMode { mode } => {
+                let r = scheduler::set_speed_mode(&mut self.world, rid, mode);
+                self.finish_simple(conn_id, "set_speed_mode", r)
+            }
+            M::ChangePassword {
+                old_password,
+                new_password,
+            } => self.do_change_password(conn_id, rid, old_password, new_password),
+            M::TaskMessage { order_id, text } => self.do_task_message(conn_id, rid, order_id, text),
+            // 订单会话（末端交付沟通）：**不要求挂任务**，任何到手单都能说。
+            M::ChatSay { order_id, text } => {
+                self.do_chat_say(conn_id, rid, order_id, text, "chat_say")
+            }
+            M::ChatPreset { order_id, preset } => self.do_chat_say(
+                conn_id,
+                rid,
+                order_id,
+                preset.text().to_string(),
+                "chat_preset",
+            ),
+
+            // 分流保证只有骑手动作会进到这里；其余消息不该出现。
+            _ => self
+                .hub
+                .send_error(conn_id, code::BAD_REQUEST, "该消息不属于骑手动作"),
+        }
+    }
+
+    /// 控制端指令 + 杂项（非骑手动作的消息）。
+    ///
+    /// 控制端分支几乎都用 [`Self::control`] 包一层——它统一检查
+    /// `Role::Control`、统一发 ack、统一把闭包产生的事件塞进 `outbox`。
+    /// 新增控制端指令请沿用这个包装，别手写权限判断。
+    fn control_or_misc(&mut self, conn_id: ConnId, role: Role, msg: ClientMessage) {
+        use ClientMessage as M;
+
+        match msg {
+            // ---------------- 杂项：任何角色都能发 ----------------
             M::Hello { .. } => self.hub.send_error(conn_id, code::BAD_REQUEST, "重复握手"),
             M::Resync => self.send_snapshot(conn_id, role),
             M::Ping => {
@@ -1500,105 +1627,7 @@ impl App {
                     .send_to(conn_id, &Envelope::new("pong", json!({ "elapsed_min": t })));
             }
 
-            // ---------------- 骑手动作 ----------------
-            M::Claim {
-                order_id,
-                back_order,
-            } => match role.rider_id() {
-                Some(rid) => self.do_claim(conn_id, rid, order_id, back_order),
-                None => self.not_a_rider(conn_id, "claim"),
-            },
-            M::Reject { order_id } => match role.rider_id() {
-                Some(rid) => {
-                    let r = scheduler::reject_order(&mut self.world, rid, order_id);
-                    self.finish_simple(conn_id, "reject", r)
-                }
-                None => self.not_a_rider(conn_id, "reject"),
-            },
-            // 接受指派单只是把「待确认」标记摘掉，世界状态早在指派那一刻就定死了，
-            // 所以这里不产生任何要广播的事件。
-            M::AcceptAssign { order_id } => match role.rider_id() {
-                Some(rid) => {
-                    let r =
-                        scheduler::accept_assign(&mut self.world, rid, order_id).map(|()| vec![]);
-                    self.finish_simple(conn_id, "accept_assign", r)
-                }
-                None => self.not_a_rider(conn_id, "accept_assign"),
-            },
-            M::Urge { order_id } => match role.rider_id() {
-                Some(rid) => {
-                    let r = scheduler::urge_order(&mut self.world, rid, order_id);
-                    match r {
-                        Ok((success, events)) => {
-                            self.publish(&events);
-                            self.hub.send_ack(
-                                conn_id,
-                                &Ack::ok_with("urge", json!({ "success": success })),
-                            );
-                        }
-                        Err(e) => self.ack_err(conn_id, "urge", e),
-                    }
-                }
-                None => self.not_a_rider(conn_id, "urge"),
-            },
-            M::ArriveShop { order_id } => match role.rider_id() {
-                Some(rid) => {
-                    let r = scheduler::arrive_shop(&mut self.world, rid, order_id);
-                    self.finish_simple(conn_id, "arrive_shop", r)
-                }
-                None => self.not_a_rider(conn_id, "arrive_shop"),
-            },
-            M::ArriveCustomer { order_id } => match role.rider_id() {
-                Some(rid) => {
-                    let r = scheduler::arrive_customer(&mut self.world, rid, order_id);
-                    self.finish_simple(conn_id, "arrive_customer", r)
-                }
-                None => self.not_a_rider(conn_id, "arrive_customer"),
-            },
-            M::Deliver { order_id } => match role.rider_id() {
-                Some(rid) => {
-                    let r = scheduler::deliver(&mut self.world, rid, order_id);
-                    self.finish_simple(conn_id, "deliver", r)
-                }
-                None => self.not_a_rider(conn_id, "deliver"),
-            },
-            M::SetOnline { online } => match role.rider_id() {
-                Some(rid) => {
-                    let r = scheduler::set_online(&mut self.world, rid, online);
-                    self.finish_simple(conn_id, "set_online", r)
-                }
-                None => self.not_a_rider(conn_id, "set_online"),
-            },
-            M::SetSpeedMode { mode } => match role.rider_id() {
-                Some(rid) => {
-                    let r = scheduler::set_speed_mode(&mut self.world, rid, mode);
-                    self.finish_simple(conn_id, "set_speed_mode", r)
-                }
-                None => self.not_a_rider(conn_id, "set_speed_mode"),
-            },
-            M::ChangePassword {
-                old_password,
-                new_password,
-            } => match role.rider_id() {
-                Some(rid) => self.do_change_password(conn_id, rid, old_password, new_password),
-                None => self.not_a_rider(conn_id, "change_password"),
-            },
-            M::TaskMessage { order_id, text } => match role.rider_id() {
-                Some(rid) => self.do_task_message(conn_id, rid, order_id, text),
-                None => self.not_a_rider(conn_id, "task_message"),
-            },
-            // 订单会话（末端交付沟通）：**不要求挂任务**，任何到手单都能说。
-            M::ChatSay { order_id, text } => match role.rider_id() {
-                Some(rid) => self.do_chat_say(conn_id, rid, order_id, text, "chat_say"),
-                None => self.not_a_rider(conn_id, "chat_say"),
-            },
-            M::ChatPreset { order_id, preset } => match role.rider_id() {
-                Some(rid) => {
-                    self.do_chat_say(conn_id, rid, order_id, preset.text().to_string(), "chat_preset")
-                }
-                None => self.not_a_rider(conn_id, "chat_preset"),
-            },
-
+            // ---------------- 控制端 ----------------
             // ---------------- 控制端 ----------------
             M::SetPaused { paused } => self.control(conn_id, role, "set_paused", |app| {
                 if paused {
@@ -1865,6 +1894,15 @@ impl App {
                     Some(json!({ "rider_id": rider_id, "cleared_cents": cleared }))
                 })
             }
+
+            // 骑手动作理论上已被 `on_client` 的分流拦走；走到这里说明
+            // `on_client` 的分流表和这个 match 不同步。报明确错误，
+            // 好过静默吞掉——同步漏了要立刻发现，而不是等到功能失灵。
+            _ => self.hub.send_error(
+                conn_id,
+                code::BAD_REQUEST,
+                "该消息不属于控制端指令",
+            ),
         }
     }
 
@@ -2942,6 +2980,51 @@ fn load_layer_models(store: &Store) -> Option<LayerModels> {
 fn load_rider_names(store: &Store) -> Option<Vec<String>> {
     let raw = store.meta("rider_names").ok().flatten()?;
     serde_json::from_str::<Vec<String>>(&raw).ok()
+}
+
+/// 消息 → 协议里的动作名。给「不是骑手身份」的拒绝回执用。
+///
+/// 拆出 [`Self::rider_action`] 之后，权限兜底只需要知道**是哪条消息**，
+/// 不再逐分支硬编码字符串。控制端的同类需求走 [`App::control`]，
+/// 它自己带 action 参数，不依赖这里。
+fn client_action_name(msg: &ClientMessage) -> &'static str {
+    use ClientMessage as M;
+    match msg {
+        M::Hello { .. } => "hello",
+        M::Resync => "resync",
+        M::Ping => "ping",
+        M::Claim { .. } => "claim",
+        M::Reject { .. } => "reject",
+        M::AcceptAssign { .. } => "accept_assign",
+        M::Urge { .. } => "urge",
+        M::ArriveShop { .. } => "arrive_shop",
+        M::ArriveCustomer { .. } => "arrive_customer",
+        M::Deliver { .. } => "deliver",
+        M::SetOnline { .. } => "set_online",
+        M::SetSpeedMode { .. } => "set_speed_mode",
+        M::ChangePassword { .. } => "change_password",
+        M::TaskMessage { .. } => "task_message",
+        M::ChatSay { .. } => "chat_say",
+        M::ChatPreset { .. } => "chat_preset",
+        M::SetPaused { .. } => "set_paused",
+        M::SetSpeedMultiplier { .. } => "set_speed_multiplier",
+        M::SetWeather { .. } => "set_weather",
+        M::SetCommissionRate { .. } => "set_commission_rate",
+        M::ForceAssign { .. } => "force_assign",
+        M::SetLlmEnabled { .. } => "set_llm_enabled",
+        M::SetConfig { .. } => "set_config",
+        M::SetRiderOnline { .. } => "set_rider_online",
+        M::SetRealtime { .. } => "set_realtime",
+        M::RenameRider { .. } => "rename_rider",
+        M::SetRiderNames { .. } => "set_rider_names",
+        M::SetLlmConfig { .. } => "set_llm_config",
+        M::ListModels => "list_models",
+        M::AiQuery => "ai_query",
+        M::SetAi { .. } => "set_ai",
+        M::RejectAi { .. } => "reject_ai",
+        M::CreateOrder { .. } => "create_order",
+        M::ResetRiderWallet { .. } => "reset_rider_wallet",
+    }
 }
 
 /// 兜底：按 UTC 折算「当日第几分钟」（0..1439）。

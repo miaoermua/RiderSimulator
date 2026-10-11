@@ -1313,7 +1313,14 @@ mod tests {
         let id = w.generate_order_batch(1)[0];
 
         // 让单子在大厅干等，直到承诺被空转吃干净。
-        for _ in 0..60 {
+        //
+        // **空转时长按承诺长短算，不写死60。** 承诺现在含末端放置窗口
+        // （见 `ai::promise_minutes`），比以前长；写死 60 会在承诺
+        // 超过 60 时「还没吃完就断言」，测试会因前提不成立而失败——
+        // 那不是逻辑坏了，是假设过时了。
+        let promised0 = w.order(id).expect("订单在").promised_minutes;
+        let wait = promised0 + 10;
+        for _ in 0..wait {
             w.advance_clock();
         }
         let created = w.order(id).expect("订单在").created_at_min;
@@ -1330,7 +1337,7 @@ mod tests {
         );
 
         // 再空转同样久：只补回空转掉的那一段，不会越滚越长。
-        for _ in 0..60 {
+        for _ in 0..wait {
             w.advance_clock();
         }
         let idle2 = (w.elapsed_min - created) as u32;
