@@ -446,6 +446,8 @@ pub fn set_online(
     rider.online = online;
     if !online {
         rider.fatigue = (rider.fatigue - cfg.fatigue.per_rest_10min).max(0.0);
+        // 收工是唯一「主动回情绪」的手段：下线喘口气，心情回来一点。
+        rider.shift_mood(cfg.mood.per_rest, &cfg);
     }
     Ok(state_event(world, rider_id).into_iter().collect())
 }
@@ -591,6 +593,7 @@ pub fn deliver(
             if let Some(r) = world.rider_mut(rider_id) {
                 economy::issue_fine(
                     r,
+                    &cfg,
                     cfg.fine.backorder_collapse_cents,
                     "backorder_collapse",
                     format!("背单全崩：订单 #{order_id} 超时，手持单 #{other} 连坐"),
@@ -670,6 +673,7 @@ pub fn reject_order(
     if rider.is_holding(order_id) {
         economy::issue_fine(
             rider,
+            &cfg,
             cfg.fine.cancel_cents,
             "cancel",
             format!("主动取消已接订单 #{order_id}"),

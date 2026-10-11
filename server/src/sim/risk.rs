@@ -2,6 +2,11 @@
 //!
 //! 设计意图（玩法设计 §3.2）：**档位 2 的期望值是负的**。
 //! 算下来亏 8.9 元/单，但玩家在赌的时候不知道这个数字。
+//!
+//! **实掷与展示同源**：事故率一律取 [`SpeedRules::accident_rate`] 的档位基准值，
+//! 期望值面板（[`Rider::expected_value_cents`]）读的是同一个数。从前这边自己
+//! 硬编码 0.005 再加超速惩罚，解除限速档因为标称限速 999 把惩罚算爆、
+//! 被夹到 95%，面板却还写着 22%——「出事率太高」的根因就在这个脱节。
 
 use rand::{Rng, RngExt};
 
@@ -10,9 +15,6 @@ use super::{
     rider::{Rider, SpeedMode},
     weather::Weather,
 };
-
-/// 基准速度（合规档 30km/h），用于算超速比。
-pub const BASE_SPEED_KMH: f32 = 30.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AccidentOutcome {
@@ -25,28 +27,36 @@ pub struct AccidentOutcome {
     pub severity: u8,
 }
 
-/// 事故概率 = 基准 × 天气加成 + 超速惩罚 + 疲劳惩罚。
+/// 事故概率 = 档位基准率 × 天气加成 × 全局倍率 + 疲劳惩罚。
+///
+/// 最后被 [`AccidentRules::max_probability`] 夹一刀：暴雨（×6）叠满疲劳时，
+/// 解除限速档算出来会超过 100%，不夹就是「必定进医院」。
+///
+/// [`AccidentRules::max_probability`]: super::config::AccidentRules::max_probability
 pub fn accident_probability(
     cfg: &SimConfig,
-    speed_ratio: f32,
+    mode: SpeedMode,
     weather: Weather,
     fatigue: f32,
 ) -> f32 {
-    let base = 0.005 * weather.accident_multiplier();
-    let speed_penalty = (speed_ratio - 1.0).max(0.0) * 0.08;
+    if !cfg.accident.enabled {
+        return 0.0;
+    }
+    let base = cfg.speed.accident_rate[mode.index()] * weather.accident_multiplier();
     let fatigue_penalty = fatigue.clamp(0.0, 1.0) * cfg.fatigue.accident_weight;
-    (base + speed_penalty + fatigue_penalty).clamp(0.0, 0.95)
+    let p = (base + fatigue_penalty) * cfg.accident.rate_multiplier.max(0.0);
+    p.clamp(0.0, cfg.accident.max_probability.clamp(0.0, 1.0))
 }
 
 /// 掷一次事故。
 pub fn roll_accident(
     rng: &mut impl Rng,
     cfg: &SimConfig,
-    speed_ratio: f32,
+    mode: SpeedMode,
     weather: Weather,
     fatigue: f32,
 ) -> Option<AccidentOutcome> {
-    let p = accident_probability(cfg, speed_ratio, weather, fatigue);
+    let p = accident_probability(cfg, mode, weather, fatigue);
     if !rng.random_bool(p as f64) {
         return None;
     }
@@ -116,11 +126,6 @@ pub fn camera_rating_delta(cfg: &SimConfig, mode: SpeedMode) -> f32 {
     mode.rating_delta(cfg)
 }
 
-/// 骑手的当前超速比。
-pub fn speed_ratio(rider: &Rider, cfg: &SimConfig, weather: Weather) -> f32 {
-    rider.speed_kmh(cfg, weather) / BASE_SPEED_KMH
-}
-
 impl Rider {
     /// 期望值（分）。控制端「显示期望值」开关打开时下发。
     ///
@@ -149,23 +154,43 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
+    /// 实掷率必须**逐位等于**档位基准率——面板上写 22%，掷出来就得是 22%。
     #[test]
-    fn accident_probability_grows_with_speed_and_fatigue() {
+    fn accident_rate_matches_the_panel_and_grows_with_tier() {
         let cfg = SimConfig::default();
-        let slow = accident_probability(&cfg, 1.0, Weather::Clear, 0.0);
-        let fast = accident_probability(&cfg, 999.0 / 30.0, Weather::Clear, 0.0);
-        let tired = accident_probability(&cfg, 1.0, Weather::Clear, 1.0);
-        assert!(fast > slow * 20.0);
-        assert!(tired > slow);
-        assert_eq!(slow, 0.005);
+        let calm = accident_probability(&cfg, SpeedMode::Compliant, Weather::Clear, 0.0);
+        let tolerant = accident_probability(&cfg, SpeedMode::Tolerant, Weather::Clear, 0.0);
+        let fast = accident_probability(&cfg, SpeedMode::Unrestricted, Weather::Clear, 0.0);
+        let tired = accident_probability(&cfg, SpeedMode::Compliant, Weather::Clear, 1.0);
+        assert_eq!(calm, 0.005);
+        assert_eq!(tolerant, 0.04);
+        assert_eq!(fast, 0.22, "解除限速档不该再被标称限速 999 撑爆");
+        assert!(tired > calm);
     }
 
+    /// 总开关、全局倍率、概率上限三个旋钮都得真的管用。
     #[test]
-    fn weather_multiplies_accidents() {
+    fn weather_switch_and_multiplier_all_take_effect() {
         let cfg = SimConfig::default();
-        let clear = accident_probability(&cfg, 1.0, Weather::Clear, 0.0);
-        let storm = accident_probability(&cfg, 1.0, Weather::Rainstorm, 0.0);
+        let clear = accident_probability(&cfg, SpeedMode::Compliant, Weather::Clear, 0.0);
+        let storm = accident_probability(&cfg, SpeedMode::Compliant, Weather::Rainstorm, 0.0);
         assert!((storm / clear - 6.0).abs() < 1e-4);
+
+        // 解除限速 + 暴雨 + 全疲劳：算出来 134%，必须被上限夹住
+        let worst = accident_probability(&cfg, SpeedMode::Unrestricted, Weather::Rainstorm, 1.0);
+        assert_eq!(worst, cfg.accident.max_probability);
+
+        let mut off = cfg.clone();
+        off.accident.enabled = false;
+        assert_eq!(
+            accident_probability(&off, SpeedMode::Unrestricted, Weather::Rainstorm, 1.0),
+            0.0
+        );
+
+        let mut half = cfg.clone();
+        half.accident.rate_multiplier = 0.5;
+        let p = accident_probability(&half, SpeedMode::Tolerant, Weather::Clear, 0.0);
+        assert!((p - 0.02).abs() < 1e-6, "p={p}");
     }
 
     #[test]
@@ -204,7 +229,13 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let mut hits = 0;
         for _ in 0..10_000 {
-            if let Some(a) = roll_accident(&mut rng, &cfg, 1.0, Weather::LightRain, 0.3) {
+            if let Some(a) = roll_accident(
+                &mut rng,
+                &cfg,
+                SpeedMode::Compliant,
+                Weather::LightRain,
+                0.3,
+            ) {
                 hits += 1;
                 assert!(a.off_duty_min >= 60);
                 assert!(a.medical_cents >= cfg.fine.accident_medical_min_cents);
@@ -212,7 +243,7 @@ mod tests {
                 assert!((1..=3).contains(&a.severity));
             }
         }
-        // 小雨 0.5% * 1.5 = 0.75% + 疲劳 → 大约 1.35%
+        // 合规 0.5% * 小雨 1.5 = 0.75% + 疲劳 0.6% → 大约 1.35%
         assert!((60..220).contains(&hits), "hits={hits}");
     }
 }

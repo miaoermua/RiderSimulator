@@ -2108,6 +2108,20 @@ impl App {
         if let Some(v) = p.merge_wait_min {
             cfg.merge.wait_for_merge_min = v.min(10);
         }
+        // 事故：只影响之后掷的骰子，已经躺在医院里的那单不动。
+        if let Some(v) = p.accident_enabled {
+            cfg.accident.enabled = v;
+        }
+        if let Some(v) = p.accident_rate_multiplier {
+            cfg.accident.rate_multiplier = v.clamp(0.0, 3.0);
+        }
+        // 情绪：关掉只是不再涨落，骑手当下的情绪值保留（下次日结回满）。
+        if let Some(v) = p.mood_enabled {
+            cfg.mood.enabled = v;
+        }
+        if let Some(v) = p.mood_lazy_threshold_max {
+            cfg.mood.lazy_threshold_max = v.clamp(1.0, 2.0);
+        }
         // 计价规则只影响之后新生成的订单，已在跑的单沿用当时的报价。
         if let Some(v) = p.base_fee_cents {
             cfg.fee.base_fee_cents = v.clamp(0, 2_000);
@@ -2732,9 +2746,12 @@ impl App {
         let now_min = self.world.elapsed_min;
         let mut fined = 0i64;
         if reply.fault.hits_rider() && reply.compensation_cents > 0 {
+            // 先克隆配置：`rider_mut` 要可变借用整个 world，没法再借它的 cfg。
+            let cfg = self.world.cfg.clone();
             if let Some(r) = self.world.rider_mut(rid) {
                 economy::issue_fine(
                     r,
+                    &cfg,
                     reply.compensation_cents,
                     "customer_compensation",
                     format!("顾客索赔：{}", reply.reply),

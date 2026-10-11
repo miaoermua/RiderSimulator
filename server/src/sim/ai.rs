@@ -302,7 +302,8 @@ pub fn accepts(world: &World, rider: &Rider, order: &Order) -> bool {
     let plan = plan_for(world, rider, order);
     let takehome = estimated_takehome_cents(world, rider, order);
     let hourly = takehome as f32 / plan.total_min().max(1) as f32 * 60.0;
-    let threshold = rider.effective_threshold_cents_hour(world.cfg.is_peak(world.sim_minute));
+    let threshold =
+        rider.effective_threshold_cents_hour(world.cfg.is_peak(world.sim_minute), &world.cfg);
     hourly >= threshold
 }
 

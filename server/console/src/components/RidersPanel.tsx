@@ -214,6 +214,13 @@ export function RidersPanel({ selected, onSelect }: Props) {
                   {r.hourly_wage_cents != null && <Metric>时薪 ¥{yuan(r.hourly_wage_cents)}</Metric>}
                   {r.takehome_cents != null && <Metric>到手 ¥{yuan(r.takehome_cents)}</Metric>}
                   {r.fatigue != null && <Metric>疲劳 {Math.round(r.fatigue * 100)}%</Metric>}
+                  {/* 情绪低的时候直接标「摆烂」：光给个百分比看不出后果，
+                      得让人一眼明白「他为什么磨蹭、为什么挑单」。 */}
+                  {r.mood != null && (
+                    <Metric>
+                      情绪 {Math.round(r.mood * 100)}%{r.slacking && "（摆烂）"}
+                    </Metric>
+                  )}
                 </MetricRow>
               }
             />

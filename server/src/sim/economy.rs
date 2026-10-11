@@ -163,9 +163,13 @@ pub fn reset_wallet(rider: &mut Rider) -> i64 {
     before
 }
 
-/// 开罚单：记钱 + 记明细（必须带原因）。
+/// 开罚单：记钱 + 记明细（必须带原因）+ 掉情绪。
+///
+/// **情绪挂在这里，不挂各个调用点**：罚款是骑手心情最大的杀手，而调用点散在
+/// `tick` / `scheduler` / `app` 六处，逐个手加迟早漏一个。
 pub fn issue_fine(
     rider: &mut Rider,
+    cfg: &SimConfig,
     amount_cents: i64,
     kind: &str,
     reason: impl Into<String>,
@@ -175,6 +179,7 @@ pub fn issue_fine(
     if amount_cents <= 0 {
         return;
     }
+    rider.shift_mood(cfg.mood.per_fine, cfg);
     rider.fines_cents += amount_cents;
     debit(rider, amount_cents);
     rider.push_ledger(LedgerEntry {
@@ -233,9 +238,12 @@ pub fn settle_delivery(
     rider.level = level_from_completed(cfg, rider.lifetime_completed);
     rider.fatigue = (rider.fatigue + cfg.fatigue.per_order).clamp(0.0, cfg.fatigue.max);
     if late {
+        rider.shift_mood(cfg.mood.per_late, cfg);
         rider.late_count += 1;
         adjust_rating(cfg, rider, cfg.rating_rules.late);
     } else {
+        // 准时送达是最主要的「回血」来源：罚款掉得凶，不给正反馈就只剩摆烂。
+        rider.shift_mood(cfg.mood.per_on_time, cfg);
         adjust_rating(cfg, rider, cfg.rating_rules.on_time);
     }
 
@@ -293,6 +301,9 @@ pub fn close_day(cfg: &SimConfig, rider: &mut Rider) -> (i64, i64, i64, i64) {
     rider.late_count = 0;
     rider.online_minutes = 0;
     rider.fatigue = 0.0;
+    // 睡一觉，情绪回到开局值。**日结必须给情绪兜底**：罚款和在线时长都在往下砸，
+    // 不给一个「新的一天」的回血点，跑几天就永久摆烂，玩家也再没有手段把它拉回来。
+    rider.mood = cfg.mood.initial;
     rider.last_ledger.clear();
     snapshot
 }
@@ -450,5 +461,38 @@ mod tests {
         r.rating = 4.4;
         r.completed = 0;
         assert!(commission_rate_for(&cfg, &r) < 0.10);
+    }
+
+    /// 罚款是情绪最大的杀手。**挂在 `issue_fine` 里而不是各调用点**，
+    /// 所以这里盯住这个入口：只要走它开单，情绪就必须掉。
+    #[test]
+    fn every_fine_sours_the_mood() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        let before = r.mood;
+        issue_fine(&mut r, &cfg, 500, "camera", "超速被拍", Some(1), 10);
+        assert!(
+            (r.mood - (before + cfg.mood.per_fine)).abs() < 1e-6,
+            "mood={}",
+            r.mood
+        );
+
+        // 金额为 0 不算一次罚款，也不该掉情绪
+        let current = r.mood;
+        issue_fine(&mut r, &cfg, 0, "camera", "空单", None, 11);
+        assert_eq!(r.mood, current, "零元罚单不该动情绪");
+    }
+
+    /// 日结把情绪拉回开局值。**必须给这个回血点**：罚款和在线时长都在往下砸，
+    /// 不给兜底的话跑几天就永久摆烂，而且玩家再没有手段把它拉回来。
+    #[test]
+    fn closing_the_day_puts_the_mood_back() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        r.mood = 0.05;
+        r.fatigue = 0.9;
+        close_day(&cfg, &mut r);
+        assert_eq!(r.mood, cfg.mood.initial);
+        assert_eq!(r.fatigue, 0.0, "日结同时清疲劳，两者一起回满");
     }
 }

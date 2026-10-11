@@ -361,6 +361,55 @@ export function SettingsPanel() {
         disabled={!isControl}
         onChange={(v) => store.send("set_config", { allow_unrestricted: v })}
       />
+
+      {/* 事故率：档位基准率（0.5% / 4% / 22%）是文档定死的，倍率只管手感。
+          默认 1.0 = 设计值，嫌吵就往左拉。 */}
+      <Heading>事故</Heading>
+      <SwitchRow
+        label="骑手会出事故"
+        hint="关掉就完全不掷事故（演示 / 排查用）"
+        value={c.accident_enabled}
+        disabled={!isControl}
+        onChange={(v) => store.send("set_config", { accident_enabled: v })}
+      />
+      <Row
+        label="事故率倍率"
+        hint="1.0 = 设计值（合规 0.5% / 超速 4% / 解除限速 22%）；往左更安全"
+      >
+        <Slider
+          style={{ width: 160 }}
+          min={0}
+          max={300}
+          step={10}
+          value={Math.round(c.accident_rate_multiplier * 100)}
+          disabled={!isControl || !c.accident_enabled}
+          onChangeComplete={(v) => store.send("set_config", { accident_rate_multiplier: v / 100 })}
+        />
+        <Typography.Text type="secondary">×{c.accident_rate_multiplier.toFixed(1)}</Typography.Text>
+      </Row>
+
+      {/* 情绪：低到 lazy_below 之下才开始懒——挑单（门槛上浮）+ 磨洋工（速度打折）。 */}
+      <Heading>情绪</Heading>
+      <SwitchRow
+        label="骑手有情绪"
+        hint="罚款、超时、在线久了都掉；收工和日结回血。情绪低就变懒"
+        value={c.mood_enabled}
+        disabled={!isControl}
+        onChange={(v) => store.send("set_config", { mood_enabled: v })}
+      />
+      <Row label="懒惰强度" hint="情绪见底时，接单时薪门槛最多上浮几倍（1.0 = 不影响接单）">
+        <Slider
+          style={{ width: 160 }}
+          min={100}
+          max={200}
+          step={5}
+          value={Math.round(c.mood_lazy_threshold_max * 100)}
+          disabled={!isControl || !c.mood_enabled}
+          onChangeComplete={(v) => store.send("set_config", { mood_lazy_threshold_max: v / 100 })}
+        />
+        <Typography.Text type="secondary">×{c.mood_lazy_threshold_max.toFixed(2)}</Typography.Text>
+      </Row>
+
       <SwitchRow
         label="允许背单"
         hint="顺路时可以同时揣多单"

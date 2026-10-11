@@ -458,6 +458,7 @@ fn step_one(
                 if let Some(r) = world.rider_mut(rid) {
                     economy::issue_fine(
                         r,
+                        &cfg,
                         cfg.fine.wait_timeout_cents,
                         "wait_timeout",
                         format!("商家出餐超时（承诺 {prep} 分钟，实际已等 {waited} 分钟）"),
@@ -726,13 +727,9 @@ fn roll_leg_risk(world: &mut World, rid: RiderId, oid: OrderId, events: &mut Vec
     let cfg = world.cfg.clone();
     let is_peak = cfg.is_peak(world.sim_minute);
 
-    let (mode, ratio, fatigue) = {
+    let (mode, fatigue) = {
         let Some(r) = world.rider(rid) else { return };
-        (
-            r.speed_mode,
-            risk::speed_ratio(r, &cfg, world.weather),
-            r.fatigue,
-        )
+        (r.speed_mode, r.fatigue)
     };
 
     // 1. 超速被拍
@@ -741,6 +738,7 @@ fn roll_leg_risk(world: &mut World, rid: RiderId, oid: OrderId, events: &mut Vec
         if let Some(r) = world.rider_mut(rid) {
             economy::issue_fine(
                 r,
+                &cfg,
                 cfg.fine.camera_cents,
                 "camera",
                 "超速被电子警察拍到",
@@ -759,7 +757,7 @@ fn roll_leg_risk(world: &mut World, rid: RiderId, oid: OrderId, events: &mut Vec
     }
 
     // 2. 事故
-    let Some(outcome) = risk::roll_accident(&mut world.rng, &cfg, ratio, world.weather, fatigue)
+    let Some(outcome) = risk::roll_accident(&mut world.rng, &cfg, mode, world.weather, fatigue)
     else {
         return;
     };
@@ -768,6 +766,7 @@ fn roll_leg_risk(world: &mut World, rid: RiderId, oid: OrderId, events: &mut Vec
     if let Some(r) = world.rider_mut(rid) {
         economy::issue_fine(
             r,
+            &cfg,
             outcome.medical_cents,
             "accident",
             format!(

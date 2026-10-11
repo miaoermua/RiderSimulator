@@ -370,6 +370,11 @@ impl Default for SimStrategy {
     }
 }
 
+/// 老存档缺 `mood` 时补的值。走 [`DEFAULT_MOOD`] 是为了和新骑手开局一致。
+fn default_mood() -> f32 {
+    super::config::DEFAULT_MOOD
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rider {
     pub id: RiderId,
@@ -395,6 +400,17 @@ pub struct Rider {
     pub late_count: u32,
     /// 隐藏属性 0~1，玩家看不到数字。
     pub fatigue: f32,
+    /// 情绪 0~1（玩法设计 §3.4）。低于 `mood.lazy_below` 就开始偷懒：
+    /// 接单门槛上浮、骑得更慢，见 [`Rider::laziness`]。
+    ///
+    /// 和 `fatigue` 的分工：疲劳是**体力**，涨了就骑得慢（速度直接打折）；
+    /// 情绪是**心情**，跌了才变懒（挑单 + 磨洋工），两者出口不同、来源也不同
+    /// ——罚款 / 超时砸的是情绪，跑单时长砸的是疲劳。
+    ///
+    /// 老存档没有这个字段，默认给 [`DEFAULT_MOOD`]；**不能默认 0**——
+    /// 那等于读一次档全员摆烂。
+    #[serde(default = "default_mood")]
+    pub mood: f32,
 
     pub online: bool,
     pub online_minutes: u32,
@@ -480,6 +496,7 @@ impl Rider {
             rejected: 0,
             late_count: 0,
             fatigue: 0.0,
+            mood: cfg.mood.initial,
             online: false,
             online_minutes: 0,
             lifetime_completed: 0,
@@ -618,11 +635,44 @@ impl Rider {
         self.held.iter_mut().find(|h| h.order_id == order_id)
     }
 
-    /// 当前速度 km/h：档位限速 × 天气 × 疲劳削减。
+    /// 当前速度 km/h：档位限速 × 天气 × 疲劳削减 × 情绪折扣。
     pub fn speed_kmh(&self, cfg: &SimConfig, weather: Weather) -> f32 {
         let limit = cfg.speed.complaint_speed_kmh[self.speed_mode.index()];
         let fatigue_penalty = 1.0 - self.fatigue.clamp(0.0, 1.0) * cfg.fatigue.speed_penalty_max;
-        (limit * weather.speed_factor() * fatigue_penalty).max(3.0)
+        let lazy_penalty = self.lazy_speed_factor(cfg);
+        (limit * weather.speed_factor() * fatigue_penalty * lazy_penalty).max(3.0)
+    }
+
+    /// 懒惰系数 0~1：情绪越低越大，`mood.lazy_below` 及以上恒为 0。
+    ///
+    /// **懒惰不等于罢工**：它是一个系数，从两个软出口渗出来——接单时薪门槛
+    /// 上浮（更挑单）、骑行速度打折（磨洋工）。情绪见底才拉满，
+    /// 情绪正常时系数为 0，整套机制对原有行为零影响。
+    pub fn laziness(&self, cfg: &SimConfig) -> f32 {
+        let m = &cfg.mood;
+        if !m.enabled || m.lazy_below <= 0.0 {
+            return 0.0;
+        }
+        ((m.lazy_below - self.mood) / m.lazy_below).clamp(0.0, 1.0)
+    }
+
+    /// 懒惰对速度的折扣（1.0 = 不打折）。
+    pub fn lazy_speed_factor(&self, cfg: &SimConfig) -> f32 {
+        let lazy = self.laziness(cfg);
+        1.0 - lazy * (1.0 - cfg.mood.lazy_speed_min.clamp(0.1, 1.0))
+    }
+
+    /// 情绪变动。**统一入口**：所有加减都走这里，才能保证钳在 0~1。
+    pub fn shift_mood(&mut self, delta: f32, cfg: &SimConfig) {
+        if !cfg.mood.enabled {
+            return;
+        }
+        self.mood = (self.mood + delta).clamp(0.0, 1.0);
+    }
+
+    /// 情绪是不是已经低到在偷懒了（控制端标状态用）。
+    pub fn is_slacking(&self, cfg: &SimConfig) -> bool {
+        self.laziness(cfg) > 0.0
     }
 
     /// 米/秒。真实骑行速度上限约 8.3 m/s（30km/h）。
@@ -636,16 +686,18 @@ impl Rider {
 
     /// 当前生效的接单时薪门槛（分/小时）。
     ///
-    /// 三层倍率叠加：`骑手基准 × 高峰系数 × LLM 单价档位倍率`。
-    /// 默认档位是 `Normal`（×1.0），所以 LLM 关闭时结果与不加协议完全一致。
-    pub fn effective_threshold_cents_hour(&self, is_peak: bool) -> f32 {
+    /// 四层倍率叠加：`骑手基准 × 高峰系数 × LLM 单价档位倍率 × 懒惰上浮`。
+    /// 默认档位是 `Normal`（×1.0）、情绪正常时懒惰系数为 0，
+    /// 所以 LLM 与情绪都关闭 / 无感时，结果与从前完全一致。
+    pub fn effective_threshold_cents_hour(&self, is_peak: bool, cfg: &SimConfig) -> f32 {
         let base = self.strategy.accept_threshold_cents_hour as f32;
         let peak = if is_peak {
             PEAK_THRESHOLD_MULTIPLIER
         } else {
             1.0
         };
-        base * peak * self.policy_override.price_tier.multiplier()
+        let lazy = 1.0 + self.laziness(cfg) * (cfg.mood.lazy_threshold_max.max(1.0) - 1.0);
+        base * peak * self.policy_override.price_tier.multiplier() * lazy
     }
 
     /// 当前生效的背单上限。**永远不能超过 `cfg.backorder.max_held`。**
@@ -767,5 +819,113 @@ mod tests {
 
         r.frozen_until_min = 10;
         assert!(!r.is_free(5, &cfg), "被冻结就不是没活");
+    }
+
+    /// 情绪正常时必须**完全无感**——这是这套机制敢默认开着的底线。
+    #[test]
+    fn a_normal_mood_rider_behaves_exactly_as_before() {
+        let cfg = SimConfig::default();
+        let r = rider(&cfg);
+        assert_eq!(r.mood, cfg.mood.initial);
+        assert_eq!(r.laziness(&cfg), 0.0);
+        assert_eq!(r.lazy_speed_factor(&cfg), 1.0);
+        assert!(!r.is_slacking(&cfg));
+
+        let base = r.strategy.accept_threshold_cents_hour as f32 * PEAK_THRESHOLD_MULTIPLIER;
+        assert_eq!(r.effective_threshold_cents_hour(true, &cfg), base);
+    }
+
+    /// 情绪跌到 `lazy_below` 之下才开始懒，而且是**线性**变懒：
+    /// 门槛上浮、速度打折，两个出口一起收紧。
+    #[test]
+    fn low_mood_makes_the_rider_pickier_and_slower() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        let fresh_thr = r.effective_threshold_cents_hour(false, &cfg);
+        let fresh_spd = r.speed_kmh(&cfg, Weather::Clear);
+
+        // 刚好卡在阈值上：还不懒
+        r.mood = cfg.mood.lazy_below;
+        assert_eq!(r.laziness(&cfg), 0.0);
+
+        // 中点：系数正好一半
+        r.mood = cfg.mood.lazy_below / 2.0;
+        assert!((r.laziness(&cfg) - 0.5).abs() < 1e-6);
+
+        // 见底：懒满
+        r.mood = 0.0;
+        assert_eq!(r.laziness(&cfg), 1.0);
+        assert!(r.is_slacking(&cfg));
+        let lazy_thr = r.effective_threshold_cents_hour(false, &cfg);
+        let lazy_spd = r.speed_kmh(&cfg, Weather::Clear);
+        assert!((lazy_thr / fresh_thr - cfg.mood.lazy_threshold_max).abs() < 1e-4);
+        assert!((lazy_spd / fresh_spd - cfg.mood.lazy_speed_min).abs() < 1e-4);
+        assert!(lazy_thr > fresh_thr, "懒了就挑单");
+        assert!(lazy_spd < fresh_spd, "懒了就磨洋工");
+    }
+
+    /// 关掉开关 = 整套机制消失，而不是「懒了一半」。
+    #[test]
+    fn switching_mood_off_restores_the_old_behaviour() {
+        let mut cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        r.mood = 0.0;
+        assert!(r.is_slacking(&cfg));
+        let lazy_spd = r.speed_kmh(&cfg, Weather::Clear);
+
+        cfg.mood.enabled = false;
+        assert_eq!(r.laziness(&cfg), 0.0);
+        assert_eq!(r.lazy_speed_factor(&cfg), 1.0);
+        assert!(!r.is_slacking(&cfg));
+        assert!(r.speed_kmh(&cfg, Weather::Clear) > lazy_spd);
+    }
+
+    /// 配错的折扣系数不该造出「越懒越快」或者「速度归零」这种怪东西。
+    #[test]
+    fn lazy_factors_are_clamped() {
+        let mut cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        r.mood = 0.0;
+
+        cfg.mood.lazy_speed_min = 3.0;
+        assert_eq!(r.lazy_speed_factor(&cfg), 1.0, "被夹回 1.0，不会变成加速");
+
+        cfg.mood.lazy_speed_min = -1.0;
+        assert!(
+            (r.lazy_speed_factor(&cfg) - 0.1).abs() < 1e-6,
+            "下限夹在 0.1，速度不会归零"
+        );
+    }
+
+    /// 情绪永远钳在 0~1。**不能让它变负**：懒惰系数是除法算出来的，
+    /// 负情绪会算出大于 1 的系数，门槛和速度都会翻车。
+    #[test]
+    fn shift_mood_never_leaves_the_unit_range() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        r.shift_mood(-99.0, &cfg);
+        assert_eq!(r.mood, 0.0);
+        assert_eq!(r.laziness(&cfg), 1.0);
+        r.shift_mood(99.0, &cfg);
+        assert_eq!(r.mood, 1.0);
+
+        // 开关关掉后连值都不该动
+        let mut off = SimConfig::default();
+        off.mood.enabled = false;
+        let before = r.mood;
+        r.shift_mood(-0.5, &off);
+        assert_eq!(r.mood, before);
+    }
+
+    /// 老存档没有 `mood` 字段，读进来必须补默认值而不是 0——
+    /// **默认 0 等于读一次档全员摆烂**。
+    #[test]
+    fn old_saves_without_mood_get_the_default() {
+        let cfg = SimConfig::default();
+        let r = rider(&cfg);
+        let mut v = serde_json::to_value(&r).unwrap();
+        v.as_object_mut().unwrap().remove("mood");
+        let back: Rider = serde_json::from_value(v).unwrap();
+        assert_eq!(back.mood, crate::sim::config::DEFAULT_MOOD);
     }
 }

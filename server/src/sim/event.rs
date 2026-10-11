@@ -76,6 +76,13 @@ pub struct RiderBrief {
     pub fines_cents: Option<i64>,
     /// 隐藏属性，只给控制端。
     pub fatigue: Option<f32>,
+    /// 情绪 0~1，只给控制端。见 [`Rider::laziness`]。
+    pub mood: Option<f32>,
+    /// 情绪是不是已经低到在偷懒了，只给控制端。
+    ///
+    /// 让服务端算而不是把 `lazy_below` 甩给前端：阈值在配置里，前端自己比
+    /// 就得再抄一份默认值，迟早对不上。
+    pub slacking: bool,
     pub expected_value_cents: Option<i64>,
 }
 
@@ -105,6 +112,8 @@ impl RiderBrief {
             cash_cents: None,
             fines_cents: None,
             fatigue: None,
+            mood: None,
+            slacking: false,
             expected_value_cents: None,
         }
     }
@@ -128,6 +137,8 @@ impl RiderBrief {
     pub fn control(r: &Rider, cfg: &SimConfig, now_min: u64) -> Self {
         let mut b = Self::own(r, cfg, now_min);
         b.fatigue = Some(r.fatigue);
+        b.mood = Some(r.mood);
+        b.slacking = r.is_slacking(cfg);
         if cfg.show_expected_value {
             b.expected_value_cents = Some(r.expected_value_cents(cfg));
         }

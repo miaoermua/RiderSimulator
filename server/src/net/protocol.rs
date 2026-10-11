@@ -364,6 +364,20 @@ pub struct ConfigPatch {
     #[serde(default)]
     pub merge_wait_min: Option<u32>,
 
+    // ---- 事故 / 情绪 ----
+    /// 事故总开关。
+    #[serde(default)]
+    pub accident_enabled: Option<bool>,
+    /// 事故率全局倍率，夹到 0~3（1.0 = 设计值）。
+    #[serde(default)]
+    pub accident_rate_multiplier: Option<f32>,
+    /// 情绪（懒惰）总开关。
+    #[serde(default)]
+    pub mood_enabled: Option<bool>,
+    /// 情绪见底时接单门槛倍率，夹到 1~2（1.0 = 情绪不影响接单）。
+    #[serde(default)]
+    pub mood_lazy_threshold_max: Option<f32>,
+
     // ---- 计价规则（「单价系统」）----
     /// 起步价（分），0~2000。
     #[serde(default)]

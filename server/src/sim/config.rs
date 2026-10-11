@@ -262,6 +262,90 @@ pub struct FatigueRules {
     pub accident_weight: f32,
 }
 
+/// 事故规则（玩法设计 §3.3）。
+///
+/// 真实掷骰只认这一组加 [`SpeedRules::accident_rate`]：
+/// `档位基准率 × 天气加成 × 全局倍率 + 疲劳惩罚`，再被 `max_probability` 夹一刀。
+///
+/// **为什么要有「全局倍率」**：档位基准率（0.5% / 4% / 22%）是文档定死的教学数字，
+/// 但那是「一单 22%」——跑一天几十单，体感就是一直在进医院。倍率是给控制端
+/// **调手感**用的，不去篡改设计值本身。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AccidentRules {
+    /// 总开关。关掉就完全不掷事故（演示 / 排查用）。
+    pub enabled: bool,
+    /// 全局倍率。`1.0` = 文档设计值。
+    pub rate_multiplier: f32,
+    /// 概率上限。
+    ///
+    /// **没有它，「解除限速 + 暴雨」会直接推到必出事**：22% × 6 = 132%，
+    /// 再叠疲劳惩罚。钳到 0.6 之后最坏也就是「六成概率」，仍是重罚但可玩。
+    pub max_probability: f32,
+}
+
+impl Default for AccidentRules {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rate_multiplier: 1.0,
+            max_probability: 0.6,
+        }
+    }
+}
+
+/// 新骑手的默认开局情绪。
+///
+/// 抽成常量是因为它有两个读法：真实新建走 `MoodRules::initial`，
+/// 老存档反序列化走 `Rider::mood` 的 `#[serde(default)]`——两者必须同值，
+/// 否则「读档进来的骑手」和「新加进来的骑手」开局情绪不一样。
+pub const DEFAULT_MOOD: f32 = 0.70;
+
+/// 情绪规则：**情绪低就变懒**——挑单、骑得慢。
+///
+/// 情绪取值 0~1，`lazy_below` 之上是「正常干活」，之下才开始偷懒，
+/// 懒惰系数 `(lazy_below − mood) / lazy_below` 线性放大到两个出口：
+/// 接单时薪门槛上浮、骑行速度打折。也就是说「累了烦了」不是硬停机，
+/// 而是**悄悄变难派、变慢**——这才像真人。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MoodRules {
+    pub enabled: bool,
+    /// 开局情绪（0~1）。
+    pub initial: f32,
+    /// 低于这个值才开始懒。高于它时懒惰系数恒为 0。
+    pub lazy_below: f32,
+    /// 情绪见底时，接单时薪门槛最多 ×几。`1.0` = 情绪不影响接单。
+    pub lazy_threshold_max: f32,
+    /// 情绪见底时，骑行速度最多打几折。`1.0` = 情绪不影响速度。
+    pub lazy_speed_min: f32,
+    /// 每笔罚款掉多少情绪。
+    pub per_fine: f32,
+    /// 每单超时掉多少情绪。
+    pub per_late: f32,
+    /// 每单准时送达涨多少情绪。
+    pub per_on_time: f32,
+    /// 在线每小时掉多少情绪（在线越久越烦）。
+    pub per_online_hour: f32,
+    /// 收工（下线）时一次性回多少情绪。
+    pub per_rest: f32,
+}
+
+impl Default for MoodRules {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            initial: DEFAULT_MOOD,
+            lazy_below: 0.50,
+            lazy_threshold_max: 1.35,
+            lazy_speed_min: 0.85,
+            per_fine: -0.06,
+            per_late: -0.04,
+            per_on_time: 0.008,
+            per_online_hour: -0.05,
+            per_rest: 0.12,
+        }
+    }
+}
+
 /// 单局可调参数（控制端能改的都在这）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimConfig {
@@ -276,6 +360,12 @@ pub struct SimConfig {
     pub rating_rules: RatingRules,
     pub level: LevelRules,
     pub fatigue: FatigueRules,
+    /// 事故规则（总开关 / 全局倍率 / 概率上限）。
+    #[serde(default)]
+    pub accident: AccidentRules,
+    /// 情绪规则（情绪低 → 变懒）。
+    #[serde(default)]
+    pub mood: MoodRules,
     /// 步行规则（商场单 / 高层送货的时间成本）。
     #[serde(default)]
     pub walk: WalkRules,
@@ -389,6 +479,8 @@ impl Default for SimConfig {
                 speed_penalty_max: 0.25,
                 accident_weight: 0.02,
             },
+            accident: AccidentRules::default(),
+            mood: MoodRules::default(),
             walk: WalkRules::default(),
             commission_rate: 0.0,
             commission_on_rain_bonus: false,

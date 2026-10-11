@@ -142,6 +142,14 @@ pub struct ConfigView {
     pub merge_merchant_cap: u32,
     /// 凑单窗口（分钟）：在店等餐的骑手愿意为同店新单多等多久。
     pub merge_wait_min: u32,
+    /// 事故总开关。
+    pub accident_enabled: bool,
+    /// 事故率全局倍率，`1.0` = 设计值（0.5% / 4% / 22%）。
+    pub accident_rate_multiplier: f32,
+    /// 情绪（懒惰）总开关。
+    pub mood_enabled: bool,
+    /// 情绪见底时接单门槛最多 ×几（懒惰的力度）。
+    pub mood_lazy_threshold_max: f32,
     /// 下发坐标的坐标系（方案 A：内部始终 GCJ-02，这里只决定出口转换）。
     pub coord_system: CoordSystem,
 }
@@ -955,10 +963,18 @@ impl World {
     pub fn accrue_online(&mut self) {
         let gain = self.cfg.fatigue.per_online_hour / 60.0;
         let max = self.cfg.fatigue.max;
+        // 情绪的主要下滑曲线是「在线时长」——罚款那种是突发的、偶发的，
+        // 真正让人烦的是上班本身。关掉情绪时增益为 0，等价于没有这段。
+        let mood_gain = if self.cfg.mood.enabled {
+            self.cfg.mood.per_online_hour / 60.0
+        } else {
+            0.0
+        };
         for r in &mut self.riders {
             if r.online {
                 r.online_minutes += 1;
                 r.fatigue = (r.fatigue + gain).min(max);
+                r.mood = (r.mood + mood_gain).clamp(0.0, 1.0);
             }
         }
     }
@@ -1009,6 +1025,10 @@ impl World {
             merge_max_per_rider: self.cfg.merge.algorithm_max_per_rider,
             merge_merchant_cap: self.cfg.merge.max_active_orders_per_merchant,
             merge_wait_min: self.cfg.merge.wait_for_merge_min,
+            accident_enabled: self.cfg.accident.enabled,
+            accident_rate_multiplier: self.cfg.accident.rate_multiplier,
+            mood_enabled: self.cfg.mood.enabled,
+            mood_lazy_threshold_max: self.cfg.mood.lazy_threshold_max,
             coord_system: self.cfg.coord_system,
         }
     }

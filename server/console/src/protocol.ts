@@ -88,6 +88,10 @@ export interface RiderBrief {
   fines_cents: number | null;
   /** 隐藏属性，只给控制端。 */
   fatigue: number | null;
+  /** 情绪 0~1，只给控制端。低于配置里的 `lazy_below` 就开始偷懒。 */
+  mood: number | null;
+  /** 情绪是不是已经低到在偷懒了（挑单 + 骑得慢），只给控制端。 */
+  slacking: boolean;
   expected_value_cents: number | null;
 }
 
@@ -211,6 +215,14 @@ export interface ConfigView {
   merge_merchant_cap: number;
   /** 凑单窗口（分钟）：在店等餐的骑手愿意为同店新单多等多久。 */
   merge_wait_min: number;
+  /** 事故总开关。 */
+  accident_enabled: boolean;
+  /** 事故率全局倍率，1.0 = 设计值（0.5% / 4% / 22%）。 */
+  accident_rate_multiplier: number;
+  /** 情绪（懒惰）总开关。 */
+  mood_enabled: boolean;
+  /** 情绪见底时接单门槛最多 ×几（懒惰的力度）。 */
+  mood_lazy_threshold_max: number;
   /** 坐标系：方案 A 里由控制端设置，服务端下发快照时据此转换。 */
   coord_system: CoordSystem;
 }

@@ -160,7 +160,7 @@ impl BrainRequest {
                 cash: r.cash_cents,
                 on: r.online_minutes,
                 cap: r.effective_max_held(cfg),
-                thr: r.effective_threshold_cents_hour(cfg.is_peak(world.sim_minute)) as i64,
+                thr: r.effective_threshold_cents_hour(cfg.is_peak(world.sim_minute), cfg) as i64,
                 skill: r.strategy.skill,
                 ride: r.speed_kmh(cfg, world.weather),
                 walk: cfg.walk.walk_speed_mps(),
