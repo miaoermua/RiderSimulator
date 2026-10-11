@@ -110,6 +110,27 @@ class GameState extends ChangeNotifier {
   bool get isRider => riderId != null;
 
   // ---------------------------------------------------------------------
+  // 地图底图
+  // ---------------------------------------------------------------------
+
+  /// 手动选的底图。`null` = 跟随服务端下发的坐标系（默认）。
+  ///
+  /// 只存在客户端，不上报——换底图是「换个角度看」，不改世界的坐标系。
+  CoordSystem? basemapOverride;
+
+  /// 当前该用的底图坐标系。
+  CoordSystem get basemap => basemapOverride ?? config.coordSystem;
+
+  /// 底图与下发坐标不一致：点位会整体偏移几百米。
+  bool get basemapMismatch => basemap != config.coordSystem;
+
+  void setBasemapOverride(CoordSystem? cs) {
+    if (basemapOverride == cs) return;
+    basemapOverride = cs;
+    notifyListeners();
+  }
+
+  // ---------------------------------------------------------------------
   // 指派单（控制端强制指派）
   // ---------------------------------------------------------------------
 

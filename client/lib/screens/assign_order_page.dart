@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../game_client.dart';
 import '../game_state.dart';
 import '../protocol.dart';
+import '../widgets/delivery_map.dart';
 import '../widgets/order_card.dart';
 
 /// 弹出指派单确认界面：上半地图、下半订单卡。
@@ -104,7 +105,7 @@ class _AssignOrderPageState extends State<AssignOrderPage> {
                   children: [
                     Expanded(
                       flex: 5,
-                      child: _AssignMap(order: order),
+                      child: _AssignMap(order: order, state: widget.state),
                     ),
                     Expanded(
                       flex: 4,
@@ -137,35 +138,34 @@ class _AssignOrderPageState extends State<AssignOrderPage> {
   }
 }
 
-/// 地图区。
+/// 地图区：真底图 +「取 → 送」连线，顶部压一条距离/时限。
 ///
-/// **目前是示意图占位**：真实底图要接高德原生 SDK（`amap_flutter_map`），
-/// 服务端已经把坐标按 `coord_system` 转好，接进来是直接可用的。
-/// 这里先把「上面地图、下面订单」的版式钉死，免得后面改布局。
+/// 底图跟着服务端下发的坐标系走（GCJ-02 → 高德，WGS-84 → OSM），
+/// 也能在图上的图层按钮里手动换；换得与坐标系不一致时会挂提示条。
 class _AssignMap extends StatelessWidget {
-  const _AssignMap({required this.order});
+  const _AssignMap({required this.order, required this.state});
 
   final OrderView order;
+  final GameState state;
 
   @override
   Widget build(BuildContext context) {
     return Stack(
       children: [
         Positioned.fill(
-          child: LayoutBuilder(
-            builder: (context, c) {
-              final from = Offset(c.maxWidth * 0.24, c.maxHeight * 0.68);
-              final to = Offset(c.maxWidth * 0.76, c.maxHeight * 0.30);
-              return CustomPaint(
-                painter: _MapPainter(from: from, to: to),
-                child: const SizedBox.expand(),
-              );
-            },
+          child: DeliveryMap(
+            state: state,
+            orders: [order],
+            // 指派单先回答「这一单从哪到哪、我现在在哪」，
+            // 三十多个商户点只会把画面糊住。
+            showMerchants: false,
+            showMe: true,
           ),
         ),
         Positioned(
           left: 12,
-          top: 12,
+          // 让开底图与坐标系不一致时的橙色提示条。
+          top: 38,
           child: _MapChip(
             icon: Icons.straighten,
             text: '全程 ${order.distanceLabel}',
@@ -173,18 +173,10 @@ class _AssignMap extends StatelessWidget {
         ),
         Positioned(
           right: 12,
-          top: 12,
+          top: 38,
           child: _MapChip(
             icon: Icons.schedule,
             text: '限 ${order.promisedMinutes} 分钟',
-          ),
-        ),
-        const Positioned(
-          left: 12,
-          bottom: 12,
-          child: _MapChip(
-            icon: Icons.map_outlined,
-            text: '地图占位 · 待接高德',
           ),
         ),
       ],
@@ -219,71 +211,4 @@ class _MapChip extends StatelessWidget {
       ),
     );
   }
-}
-
-/// 画底图网格 + 取送虚线 + 两端坐标点。
-class _MapPainter extends CustomPainter {
-  _MapPainter({required this.from, required this.to});
-
-  final Offset from;
-  final Offset to;
-
-  static const _grid = Color(0xFFD6E2D8);
-  static const _route = Color(0xFF1976D2);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final bg = Paint()..color = const Color(0xFFEAF1EA);
-    canvas.drawRect(Offset.zero & size, bg);
-
-    final grid = Paint()
-      ..color = _grid
-      ..strokeWidth = 1;
-    const step = 28.0;
-    for (double x = 0; x < size.width; x += step) {
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), grid);
-    }
-    for (double y = 0; y < size.height; y += step) {
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
-    }
-
-    final path = Path()
-      ..moveTo(from.dx, from.dy)
-      ..quadraticBezierTo(
-        (from.dx + to.dx) / 2,
-        from.dy - size.height * 0.35,
-        to.dx,
-        to.dy,
-      );
-    final route = Paint()
-      ..color = _route
-      ..strokeWidth = 4
-      ..strokeCap = StrokeCap.round
-      ..style = PaintingStyle.stroke;
-    canvas.drawPath(_dashed(path), route);
-
-    for (final p in [from, to]) {
-      canvas.drawCircle(p, 9, Paint()..color = Colors.white);
-      canvas.drawCircle(p, 6, Paint()..color = _route);
-    }
-  }
-
-  /// 把实线路径切成一段段虚线。
-  Path _dashed(Path source) {
-    const dash = 8.0;
-    const gap = 6.0;
-    final out = Path();
-    for (final metric in source.computeMetrics()) {
-      double d = 0;
-      while (d < metric.length) {
-        final end = (d + dash).clamp(0.0, metric.length);
-        out.addPath(metric.extractPath(d, end), Offset.zero);
-        d = end + gap;
-      }
-    }
-    return out;
-  }
-
-  @override
-  bool shouldRepaint(_MapPainter old) => old.from != from || old.to != to;
 }

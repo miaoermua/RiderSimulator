@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../game_client.dart';
 import '../game_state.dart';
+import '../map/basemaps.dart';
 import '../protocol.dart';
 
 /// 跑单设置。
@@ -86,6 +87,37 @@ class _RunningSettingsSheet extends StatelessWidget {
                   ),
                   const Divider(height: 26),
                 ],
+                const _Label('地图底图'),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    ChoiceChip(
+                      label: const Text('跟随坐标系'),
+                      selected: state.basemapOverride == null,
+                      onSelected: (_) => state.setBasemapOverride(null),
+                    ),
+                    for (final bm in basemaps.values)
+                      ChoiceChip(
+                        label: Text(bm.label),
+                        selected: state.basemapOverride == bm.id,
+                        onSelected: (_) => state.setBasemapOverride(bm.id),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  state.basemapMismatch
+                      ? '下发的是 ${cfg.coordSystem.label}，当前底图与它不一致，点位会偏几百米。'
+                      : '底图与下发坐标（${cfg.coordSystem.label}）是对齐的。',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: state.basemapMismatch
+                        ? Colors.orange.shade800
+                        : Colors.grey,
+                  ),
+                ),
+                const Divider(height: 26),
                 const _Label('当前派单规则（控制端设定）'),
                 const SizedBox(height: 6),
                 _Rule('抢单窗口', '${cfg.claimWindowSecs} 秒'),

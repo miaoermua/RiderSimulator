@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
@@ -111,6 +112,9 @@ class _RiderHomePageState extends State<RiderHomePage> {
                         state: state,
                         client: widget.client,
                         empty: '大厅暂时没单，下拉刷新试试。',
+                        // 一页几张照众包骑手端的全面屏版式来：
+                        // 待抢 3 张、待取 / 待送 2 张，一屏看全不用滑。
+                        perPage: 3,
                       ),
                       _OrderList(
                         orders: pickup,
@@ -118,6 +122,7 @@ class _RiderHomePageState extends State<RiderHomePage> {
                         state: state,
                         client: widget.client,
                         empty: '没有待取的单。去大厅抢一单吧。',
+                        perPage: 2,
                       ),
                       _OrderList(
                         orders: delivery,
@@ -125,6 +130,7 @@ class _RiderHomePageState extends State<RiderHomePage> {
                         state: state,
                         client: widget.client,
                         empty: '没有待送的单。',
+                        perPage: 2,
                       ),
                     ],
                   ),
@@ -293,14 +299,22 @@ class _Badge extends StatelessWidget {
       );
 }
 
-/// 一页订单列表。三个 tab 共用，只有 [mode] 不同。
-class _OrderList extends StatelessWidget {
+/// 一页订单列表。三个 tab 共用，只有 [mode] 与 [perPage] 不同。
+///
+/// **分页而不是长滚动**：全面屏上照众包骑手端的版式，一屏看全固定张数
+/// （待抢 3 张、待取 / 待送 2 张），比一列长列表更快做完「抢不抢」的判断。
+/// 竖向滑动翻页，另配上下页按钮，单手够得着。
+///
+/// 这里不挂 `RefreshIndicator`：下拉手势已经被翻页吃掉，
+/// 刷新走底部工具栏那颗按钮（见 `_BottomTools`）。
+class _OrderList extends StatefulWidget {
   const _OrderList({
     required this.orders,
     required this.mode,
     required this.state,
     required this.client,
     required this.empty,
+    required this.perPage,
   });
 
   final List<OrderView> orders;
@@ -309,57 +323,172 @@ class _OrderList extends StatelessWidget {
   final GameClient client;
   final String empty;
 
+  /// 一页放几张。
+  final int perPage;
+
+  @override
+  State<_OrderList> createState() => _OrderListState();
+}
+
+class _OrderListState extends State<_OrderList> {
+  final PageController _pager = PageController();
+  int _page = 0;
+
+  int get _pageCount => widget.orders.isEmpty
+      ? 0
+      : (widget.orders.length + widget.perPage - 1) ~/ widget.perPage;
+
+  @override
+  void dispose() {
+    _pager.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant _OrderList old) {
+    super.didUpdateWidget(old);
+    // 单被抢走 / 送完会让页数变少，把当前页拉回最后一页，
+    // 否则会停在一页空白上，看着像「单没了」。
+    final last = _pageCount - 1;
+    if (_page <= last) return;
+    final target = last < 0 ? 0 : last;
+    _page = target;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_pager.hasClients) return;
+      _pager.jumpToPage(target);
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
-    if (orders.isEmpty) {
-      return RefreshIndicator(
-        onRefresh: () async {
-          client.resync();
-        },
+    if (widget.orders.isEmpty) return _emptyView();
+    return Column(
+      children: [
+        Expanded(
+          child: PageView.builder(
+            controller: _pager,
+            scrollDirection: Axis.vertical,
+            itemCount: _pageCount,
+            onPageChanged: (i) => setState(() => _page = i),
+            itemBuilder: (context, i) => _pageBody(i),
+          ),
+        ),
+        if (_pageCount > 1) _pagerBar(),
+      ],
+    );
+  }
+
+  /// 第 [page] 页：固定 [perPage] 个槽位，等分高度。
+  ///
+  /// 卡片按自然高度画，放不下时整体等比缩小（`FittedBox.scaleDown`）——
+  /// 小屏塞三张卡时宁可字小一点，也不能 overflow 把底部按钮顶掉。
+  Widget _pageBody(int page) {
+    final start = page * widget.perPage;
+    final end = math.min(start + widget.perPage, widget.orders.length);
+    final slice = widget.orders.sublist(start, end);
+    return Column(
+      children: [
+        for (final o in slice)
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, c) => FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.topCenter,
+                child: SizedBox(width: c.maxWidth, child: _card(o)),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _card(OrderView o) => Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          OrderCard(
+            order: o,
+            state: widget.state,
+            client: widget.client,
+            mode: widget.mode,
+          ),
+          // 送单路上要能顺手回顾客消息，别藏到别的页面去。
+          if (widget.mode != OrderCardMode.hall && o.task != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: OutlinedButton.icon(
+                onPressed: () => showTaskSheet(
+                  context,
+                  order: o,
+                  state: widget.state,
+                  client: widget.client,
+                ),
+                icon: const Icon(Icons.chat_bubble_outline, size: 18),
+                label: Text('任务对话：${o.task!.name}'),
+              ),
+            ),
+        ],
+      );
+
+  Widget _emptyView() => RefreshIndicator(
+        onRefresh: () async => widget.client.resync(),
         child: ListView(
           physics: const AlwaysScrollableScrollPhysics(),
           children: [
             const SizedBox(height: 140),
             Center(
-              child: Text(empty, style: const TextStyle(color: Colors.grey)),
+              child: Text(
+                widget.empty,
+                style: const TextStyle(color: Colors.grey),
+              ),
             ),
           ],
         ),
       );
-    }
-    return RefreshIndicator(
-      onRefresh: () async {
-        client.resync();
-      },
-      child: ListView.builder(
-        physics: const AlwaysScrollableScrollPhysics(),
-        itemCount: orders.length,
-        itemBuilder: (context, i) {
-          final o = orders[i];
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              OrderCard(order: o, state: state, client: client, mode: mode),
-              if (mode != OrderCardMode.hall && o.task != null)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                  child: OutlinedButton.icon(
-                    onPressed: () => showTaskSheet(
-                      context,
-                      order: o,
-                      state: state,
-                      client: client,
+
+  /// 页脚：上一页 / 第几页 / 下一页。
+  Widget _pagerBar() => Row(
+        children: [
+          IconButton(
+            tooltip: '上一页',
+            onPressed: _page > 0
+                ? () => _pager.previousPage(
+                      duration: const Duration(milliseconds: 220),
+                      curve: Curves.easeOut,
+                    )
+                : null,
+            icon: const Icon(Icons.keyboard_arrow_up),
+          ),
+          Expanded(
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                for (var i = 0; i < _pageCount; i++)
+                  Container(
+                    width: i == _page ? 18 : 6,
+                    height: 6,
+                    margin: const EdgeInsets.symmetric(horizontal: 3),
+                    decoration: BoxDecoration(
+                      color: i == _page
+                          ? Theme.of(context).colorScheme.primary
+                          : Colors.black26,
+                      borderRadius: BorderRadius.circular(3),
                     ),
-                    icon: const Icon(Icons.chat_bubble_outline, size: 18),
-                    label: Text('任务对话：${o.task!.name}'),
                   ),
-                ),
-            ],
-          );
-        },
-      ),
-    );
-  }
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: '下一页',
+            onPressed: _page < _pageCount - 1
+                ? () => _pager.nextPage(
+                      duration: const Duration(milliseconds: 220),
+                      curve: Curves.easeOut,
+                    )
+                : null,
+            icon: const Icon(Icons.keyboard_arrow_down),
+          ),
+        ],
+      );
 }
 
 /// 底部工具栏：跑单设置 + 刷新。

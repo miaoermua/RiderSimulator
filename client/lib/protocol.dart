@@ -606,6 +606,28 @@ class MerchantView {
       );
 }
 
+/// 下发坐标的坐标系。
+///
+/// 服务端内部**始终**是 GCJ-02（高德 geocode / route 只吃这个），
+/// 只在下发快照与事件时按配置转换（见服务端 `sim::geo::to_coord_system`）。
+/// 所以客户端拿到哪套坐标，就得配哪套底图——混用会整体偏移几百米。
+enum CoordSystem {
+  gcj02,
+  wgs84;
+
+  static CoordSystem parse(String raw) => raw == 'wgs84' ? wgs84 : gcj02;
+
+  String get wire => switch (this) {
+        CoordSystem.gcj02 => 'gcj02',
+        CoordSystem.wgs84 => 'wgs84',
+      };
+
+  String get label => switch (this) {
+        CoordSystem.gcj02 => 'GCJ-02',
+        CoordSystem.wgs84 => 'WGS-84',
+      };
+}
+
 class ConfigView {
   const ConfigView({
     required this.speedMultiplier,
@@ -620,6 +642,7 @@ class ConfigView {
     required this.maxOrdersPerDay,
     required this.isPeak,
     required this.surgeMultiplier,
+    required this.coordSystem,
     required this.fee,
     required this.insurancePerDayCents,
   });
@@ -636,6 +659,8 @@ class ConfigView {
   final int maxOrdersPerDay;
   final bool isPeak;
   final double surgeMultiplier;
+  /// 下发坐标的坐标系。地图底图必须跟着它走，否则点位整体偏几百米。
+  final CoordSystem coordSystem;
   /// 计价规则（单价系统）。过去这里只有一个 `base_fee_cents`，
   /// 起步价以外的里程、等级、重投补贴都拿不到。
   final ConfigFeeRules fee;
@@ -654,6 +679,7 @@ class ConfigView {
         maxOrdersPerDay: reqInt(j['max_orders_per_day']),
         isPeak: reqBool(j['is_peak']),
         surgeMultiplier: reqDouble(j['surge_multiplier'], 1),
+        coordSystem: CoordSystem.parse(reqStr(j['coord_system'], 'gcj02')),
         fee: ConfigFeeRules.fromJson(asMap(j['fee'])),
         insurancePerDayCents: reqInt(j['insurance_per_day_cents']),
       );
