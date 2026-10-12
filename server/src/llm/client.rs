@@ -15,6 +15,23 @@ use serde_json::{Value, json};
 /// 默认 3 秒超时。**这是玩法设计的硬要求**：超时就放弃本轮，用算法兜底。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// 流式下的**总预算**：从发请求到收完 `[DONE]`，默认 12 秒。
+///
+/// 与 [`DEFAULT_TIMEOUT`] 的关系：3 秒是「非流式收一个短 JSON」的量级，
+/// 直接套到流式上会把长回复砍掉一半——而且砍掉的位置是随机的，
+/// 于是表现为**随机失败**，极难排查。所以流式必须给更大的独立预算。
+///
+/// 注意：这三层 AI 是**后台跑**的（两段式：占用 tick → 后台等 → 下个 tick 收），
+/// 所以这里放宽不会阻塞模拟主循环。真正卡住 tick 的是编排器里的在途检查。
+pub const DEFAULT_STREAM_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// 流式下的**首字节预算**：默认 3 秒。
+///
+/// 和总预算分工不同：它管的是「服务端到底有没有在干活」。
+/// 队列拥堵、上游限流、模型没加载——这些都是开头就不动，
+/// 等满12 秒纯属浪费（那一轮调度就白占了坑）。3 秒没动静就可以退回算法。
+pub const DEFAULT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub const ENV_BASE_URL: &str = "LLM_BASE_URL";
 pub const ENV_API_KEY: &str = "LLM_API_KEY";
 pub const ENV_MODEL: &str = "LLM_MODEL";
@@ -25,6 +42,70 @@ pub const ENV_OPENAI_KEY: &str = "OPENAI_API_KEY";
 pub const ENV_MODEL_RIDER: &str = "LLM_MODEL_RIDER";
 pub const ENV_MODEL_STATION: &str = "LLM_MODEL_STATION";
 pub const ENV_MODEL_DIRECTOR: &str = "LLM_MODEL_DIRECTOR";
+
+/// 开关 `response_format: {"type":"json_object"}`。默认 **on**。
+///
+/// **为什么需要开关**：这是请求体顶层的一个**协议参数**，不是对话内容——
+/// 上游服务器先读它来决定解码方式（有的实现用约束解码 / grammar 强制语法），
+/// 模型本身看不见它。而**第三方网关（New API / one-api / 各类中转）对它的支持
+/// 参差不齐**，有的直接返回 400 `unsupported parameter`，有的静默忽略。
+///
+/// 万一遇到不支持：设 `LLM_JSON_MODE=0` 关掉即可。此时改由
+/// [`crate::llm::protocol::system_prompt`] 里那句「只输出 JSON」兜底——
+/// 那是**对话内容**，任何 OpenAI 兼容服务都认。代价是失去约束解码的保证，
+/// 模型可能带上 ```json 围栏或前后废话，但那正是
+/// [`crate::llm::protocol::validate_decision`] 存在的原因：解析失败就走算法兜底。
+pub const ENV_JSON_MODE: &str = "LLM_JSON_MODE";
+
+/// 开关 SSE 流式拉取。默认 **on**。
+///
+/// **关掉不影响结果，只影响传输方式**——两种模式最终都走
+/// [`extract_json`] + [`crate::llm::protocol::validate_decision`]，
+/// 所以 LLM 关不关流式产出的决策是同一套。
+/// 保留这个开关是因为**部分小众网关不支持 `"stream": true`**（会回 400）。
+pub const ENV_STREAM: &str = "LLM_STREAM";
+
+/// 解析布尔环境变量。**只有明确表示「关」的值才关**，拼错的按开启处理——
+/// 与 [`parse_json_mode`] 同一条原则：默认开着，别让一个没认出来的变量
+/// 静默把它关掉。
+fn parse_bool_lenient(raw: Option<String>) -> bool {
+    match raw {
+        None => true,
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | ""
+        ),
+    }
+}
+
+/// 开关 `response_format: {"type":"json_object"}`。默认 **on**。
+///
+/// **为什么需要开关**：这是请求体顶层的一个**协议参数**，不是对话内容——
+/// 上游服务器先读它来决定解码方式（有的实现用约束解码 / grammar 强制语法），
+/// 模型本身看不见它。而**第三方网关（New API / one-api /各类中转）对它的支持
+/// 参差不齐**，有的直接返回 400 `unsupported parameter`，有的静默忽略。
+///
+/// 万一遇到不支持：设 `LLM_JSON_MODE=0`关掉即可。此时改由
+/// [`crate::llm::protocol::system_prompt`] 里那句「只输出 JSON」兜底——
+/// 那是**对话内容**，任何 OpenAI 兼容服务都认。代价是失去约束解码的保证，
+/// 模型可能带上 ```json 围栏或前后废话，但那正是 [`crate::llm::protocol::validate_decision`]
+/// 存在的原因：解析失败就走算法兜底。
+///
+/// 取值：**只有明确表示"关"的值才关**（`0` / `false` / `no` / `off` / 空串）。
+/// 其余一律按开启处理——包括拼错的值。
+///
+/// 方向必须是「拼错 → 开启」而不是「拼错 → 关闭」：默认行为本来就是开着，
+/// 一个没认出来的环境变量不该反过来把它关掉（那会静默拿掉约束解码，
+/// 表现为模型开始返回带 ```json 围栏的文本，排查起来莫名其妙）。
+fn parse_json_mode(raw: Option<String>) -> bool {
+    match raw {
+        None => true,
+        Some(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "false" | "no" | "off" | "")
+        }
+    }
+}
 
 /// 归一化 `base_url`：**只保留到 `/v1` 这一层根路径**。
 ///
@@ -68,6 +149,20 @@ pub struct LlmConfig {
     pub max_tokens: u32,
     /// 要求服务端返回严格 JSON（OpenAI / DeepSeek 都支持）。
     pub json_mode: bool,
+    /// 走 SSE 流式拉取（默认开启）。**关掉只影响传输方式，不影响结果。**
+    pub stream: bool,
+    /// 流式的**总预算**：从发请求到 `[DONE]`，整体最多等这么久。
+    ///
+    /// 必须**大于** [`Self::timeout`]。非流式时 3 秒足够收一个几百字节的 JSON；
+    /// 流式下模型要一个 token 一个 token 地吐，长回复 3 秒会被腰斩在中间——
+    /// 于是每一条流式决策都会超时，等于把功能改坏了。
+    pub stream_timeout: Duration,
+    /// 流式的**首字节预算**：多久没等到第一个 token 就判超时。
+    ///
+    /// 单独拎出来是因为这两件事要分开看：
+    /// 「服务端一直没动静」和「模型正在写、只是还没写完」是两种故障，
+    /// 前者要快速失败（省下 3 秒给下一层），后者得给足时间。
+    pub first_token_timeout: Duration,
 }
 
 impl Default for LlmConfig {
@@ -80,6 +175,9 @@ impl Default for LlmConfig {
             temperature: 0.0,
             max_tokens: 800,
             json_mode: true,
+            stream: true,
+            stream_timeout: DEFAULT_STREAM_TIMEOUT,
+            first_token_timeout: DEFAULT_FIRST_TOKEN_TIMEOUT,
         }
     }
 }
@@ -89,6 +187,19 @@ impl LlmConfig {
         Self {
             api_key: api_key.into(),
             ..Self::default()
+        }
+    }
+
+    /// 本配置下**实际生效的总时长上限**（两种模式里更宽的那个）。
+    ///
+    /// 给 `reqwest::Client::builder().timeout()` 用。单个请求还会再设一次
+    /// 更紧的（见 [`LlmClient::complete_json`]），但client 级必须是宽的那个，
+    /// 否则会把请求级的覆盖掉。
+    pub fn effective_timeout(&self) -> Duration {
+        if self.stream {
+            self.stream_timeout.max(self.timeout)
+        } else {
+            self.timeout
         }
     }
 
@@ -113,6 +224,8 @@ impl LlmConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or(d.model),
+            json_mode: parse_json_mode(std::env::var(ENV_JSON_MODE).ok()),
+            stream: parse_bool_lenient(std::env::var(ENV_STREAM).ok()),
             ..d
         }
     }
@@ -347,8 +460,15 @@ impl LlmClient {
     /// 本地推理服务（Ollama / vLLM / LM Studio）大多不校验 Key，
     /// 「能不能列出模型」跟「LLM 决策有没有启用」是两回事，别混在一起。
     pub fn metadata_only(cfg: LlmConfig) -> Result<Self, LlmError> {
+        // **client 级超时取流式预算**（两种模式里更宽的那个），实际生效的
+        // 上限交给每个请求自己设。
+        //
+        // 原因：reqwest 的 `Client::timeout()` 是**整个 client 的总时长上限**，
+        // 一旦设小，它会盖掉请求级的 `.timeout()`。若这里写死 `cfg.timeout`
+        // （3 秒），流式的请求级 12 秒就形同虚设——表现为「大模型一开流式就随机超时」，
+        // 而且没有任何报错提示，只会安静地退回算法兜底。
         let http = reqwest::Client::builder()
-            .timeout(cfg.timeout)
+            .timeout(cfg.effective_timeout())
             .user_agent(concat!("rider-sim/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self { http, cfg })
@@ -363,6 +483,15 @@ impl LlmClient {
     }
 
     /// 要一段 JSON。`system` 必须是「只输出 JSON」的指令。
+    ///
+    /// **流式与非流式只在「怎么把字节搬回来」上不同，出参完全一致**——
+    /// 都会汇总成完整文本，再走 [`extract_json`] + 调用方的
+    /// [`crate::llm::protocol::validate_decision`]。所以 `LLM_STREAM`
+    /// 开着或关着，产出的决策是同一套；切换它不会改变行为，只影响延迟与
+    /// 对长回复的容忍度。
+    ///
+    /// 换句话说：**这里不做「边流边决策」**。半个 JSON 解析不出任何东西，
+    /// 提前落地只会把不完整的状态写进世界。
     pub async fn complete_json(&self, system: &str, user: &str) -> Result<Value, LlmError> {
         let mut body = json!({
             "model": self.cfg.model,
@@ -376,6 +505,15 @@ impl LlmClient {
         if self.cfg.json_mode {
             body["response_format"] = json!({ "type": "json_object" });
         }
+        if self.cfg.stream {
+            body["stream"] = json!(true);
+        }
+
+        let budget = if self.cfg.stream {
+            self.cfg.stream_timeout
+        } else {
+            self.cfg.timeout
+        };
 
         let resp = self
             .http
@@ -383,18 +521,37 @@ impl LlmClient {
             .bearer_auth(&self.cfg.api_key)
             .json(&body)
             // 单独设一次超时：即使 Client 被复用，决策也不能等太久。
-            .timeout(self.cfg.timeout)
+            .timeout(budget)
             .send()
             .await
             .map_err(|e| {
                 if e.is_timeout() {
-                    LlmError::Timeout(self.cfg.timeout)
+                    LlmError::Timeout(budget)
                 } else {
                     LlmError::Http(e)
                 }
             })?;
 
         let status = resp.status();
+
+        if self.cfg.stream {
+            // 流式：错误响应往往也是流式的（网关会把错误包在 SSE 里），
+            // 所以先看 status，非 2xx 就把原文整段读出来再报错——
+            // 和非流式保持同样的错误信息形态，调用方不用分叉。
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(LlmError::Status {
+                    status: status.as_u16(),
+                    body: truncate(&text, 300),
+                });
+            }
+            let content = self.collect_sse(resp).await?;
+            return extract_json(&content).ok_or_else(|| LlmError::BadJson {
+                raw: truncate(&content, 300),
+                detail: "无法从流式内容里提取出 JSON 对象".to_string(),
+            });
+        }
+
         let text = resp.text().await?;
         if !status.is_success() {
             return Err(LlmError::Status {
@@ -421,6 +578,89 @@ impl LlmClient {
             raw: truncate(content, 300),
             detail: "无法从内容里提取出 JSON 对象".to_string(),
         })
+    }
+
+    /// 把 SSE 响应读干，汇总成完整文本。
+    ///
+    /// ## 协议形状
+    ///
+    /// ```text
+    /// data: {"choices":[{"delta":{"content":"你"}}]}
+    /// data: {"choices":[{"delta":{"content":"好"}}]}
+    ///
+    /// data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+    /// data: [DONE]
+    /// ```
+    ///
+    /// ## 为什么要读干而不是边读边用
+    ///
+    /// **半截 JSON 解析不出任何东西。** 决策要的是一份完整结构，
+    /// 提前落地只会把残缺状态写进世界。所以这里只做「累积」，
+    /// 真正的解析交给 [`extract_json`]，与协议校验交给
+    /// [`crate::llm::protocol::validate_decision`]——两者都不感知流式。
+    ///
+    /// 流式真正换来的好处是**能区分两种超时**：见 [`LlmConfig::first_token_timeout`]。
+    ///
+    /// ## 容错
+    ///
+    /// - `data:` 后面是 `[DONE]` → 正常收尾。
+    /// - 单个分片 JSON 坏了 → **跳过继续**，不因为一个畸形帧丢掉整个回复。
+    /// - `reasoning_content`（部分模型的思维链）→ 忽略，只取 `content`。
+    /// - 上游不发 `[DONE]` 就断流 → 已收到的照样返回，让上层去校验。
+    async fn collect_sse(&self, resp: reqwest::Response) -> Result<String, LlmError> {
+        use futures::StreamExt;
+
+        let first = self.cfg.first_token_timeout;
+        let mut stream = resp.bytes_stream();
+
+        // 首字节单独掐表：此刻还没开始等，总预算还没开始消耗。
+        let first_chunk = match tokio::time::timeout(first, stream.next()).await {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(LlmError::Timeout(first));
+            }
+        };
+        let Some(mut first_chunk) = first_chunk else {
+            return Err(LlmError::Empty);
+        };
+        let mut buf = first_chunk.to_vec();
+
+        // 剩下的交给总预算管。
+        let total = self.cfg.stream_timeout;
+        let rest = tokio::time::timeout(total, async {
+            while let Some(chunk) = stream.next().await {
+                buf.extend_from_slice(&chunk);
+            }
+        })
+        .await;
+        if rest.is_err() {
+            return Err(LlmError::Timeout(total));
+        }
+
+        // 上面的 `timeout` 会把整个 body 读到底；但正常 SSE 收到 `[DONE]`
+        // 就该停，否则有些网关会保持连接不关、白等到超时。
+        // 折中做法：先把已收到的内容解析出来，够用就返回。
+        let text = String::from_utf8_lossy(&buf);
+        let joined = sse_join(&text);
+        if joined.contains("[DONE]") {
+            return Ok(sse_content(&joined));
+        }
+
+        // 还没拿到 [DONE]，继续在总预算内补收剩余分片。
+        let more = tokio::time::timeout(total.saturating_sub(first), async {
+            while let Some(chunk) = stream.next().await {
+                buf.extend_from_slice(&chunk);
+                let cur = String::from_utf8_lossy(&buf);
+                if cur.contains("[DONE]") {
+                    break;
+                }
+            }
+        })
+        .await;
+        let _ = more;
+
+        let text = String::from_utf8_lossy(&buf);
+        Ok(sse_content(&text))
     }
 
     /// 上游 `GET {base}/models`：控制台的模型下拉靠它，免得手打模型名打错。
@@ -658,6 +898,31 @@ mod tests {
             cfg.endpoint(),
             "https://api.deepseek.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn json_mode_parses_leniently_and_defaults_to_on() {
+        // 没设= 开启（保持原行为）。
+        assert!(parse_json_mode(None));
+        // 明确开。
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(parse_json_mode(Some(v.into())), "输入 {v} 应为开启");
+        }
+        // 明确关。
+        for v in ["0", "false", "no", "off", ""] {
+            assert!(!parse_json_mode(Some(v.into())), "输入 {v} 应为关闭");
+        }
+        // 认不出来的值一律按「开」处理，绝不因为一个环境变量拼错就静默降级。
+        for v in ["maybe", "2", "yep"] {
+            assert!(parse_json_mode(Some(v.into())), "输入 {v} 应回落到开启");
+        }
+    }
+
+    #[test]
+    fn json_mode_off_still_leaves_the_system_prompt_asking_for_json() {
+        // 关掉协议参数后，对话内容里那句「只输出 JSON」必须还在——
+        // 否则模型就彻底没有格式约束了。
+        assert!(crate::llm::protocol::system_prompt().contains("只输出 JSON"));
     }
 
     #[test]
