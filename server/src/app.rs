@@ -1189,6 +1189,7 @@ impl App {
         match req {
             RpcRequest::State => Ok(self.rpc_state()),
             RpcRequest::Dispatch(items) => self.rpc_dispatch(items),
+            RpcRequest::Reassign(items) => self.rpc_reassign(items),
             RpcRequest::SetConfig(patch) => self.rpc_set_config(&patch),
             RpcRequest::SetRiderOnline { rider_id, online } => {
                 self.rpc_set_online(rider_id, online)
@@ -1431,6 +1432,83 @@ impl App {
                 ops: Vec::new(),
                 decision_id: 0,
                 note: "外部接口派单".to_string(),
+            });
+        }
+        if !events.is_empty() {
+            self.publish(&events);
+        }
+
+        let failed = results.len() as u32 - applied;
+        Ok(json!({ "applied": applied, "failed": failed, "results": results }))
+    }
+
+    /// 外部接口改派（`POST /api/reassign`）。
+    ///
+    /// 与派单分开：派单只能动大厅里无主的单，改派只能动**别人手上还没取餐**的单。
+    /// 两者的失败原因也不一样（`ALREADY_CLAIMED` vs `WRONG_PHASE`），
+    /// 合成一个接口会让调用方分不清自己错在哪。
+    fn rpc_reassign(&mut self, items: Vec<DispatchItem>) -> RpcReply {
+        let mut results = Vec::with_capacity(items.len());
+        let mut events = Vec::new();
+        let mut decisions = Vec::new();
+        let mut applied = 0u32;
+
+        for item in items {
+            let order_id = item.order_id;
+            let Some(rider_id) = item.rider() else {
+                results.push(json!({
+                    "order_id": order_id,
+                    "ok": false,
+                    "code": "RIDER_NOT_FOUND",
+                    "message": "rider_id 无法解析（用数字 3 或字符串 \"r3\"）",
+                }));
+                continue;
+            };
+
+            match scheduler::reassign(&mut self.world, order_id, rider_id) {
+                Ok(mut out) => {
+                    if let Some(reason) = item
+                        .reason
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|r| !r.is_empty())
+                    {
+                        out.assignment.reason = reason.to_string();
+                    }
+                    events.extend(self.reassign_events(&out));
+                    decisions.push(out.assignment.to_event());
+                    applied += 1;
+                    results.push(json!({
+                        "order_id": order_id,
+                        "rider_id": rider_id,
+                        "rider_key": crate::sim::rider_key(rider_id),
+                        "from_rider_id": out.from_rider,
+                        "from_rider_key": crate::sim::rider_key(out.from_rider),
+                        "from_phase": out.phase,
+                        "ok": true,
+                        "planned_minutes": out.assignment.plan.total_min(),
+                        "reason": out.assignment.reason,
+                    }));
+                }
+                Err(e) => results.push(json!({
+                    "order_id": order_id,
+                    "rider_id": rider_id,
+                    "rider_key": crate::sim::rider_key(rider_id),
+                    "ok": false,
+                    "code": e.code(),
+                    "message": e.message(),
+                })),
+            }
+        }
+
+        if !decisions.is_empty() {
+            events.push(SimEvent::AiDecision {
+                source: DecisionSource::Manual,
+                layer: "manual",
+                assignments: decisions,
+                ops: Vec::new(),
+                decision_id: 0,
+                note: "外部接口改派".to_string(),
             });
         }
         if !events.is_empty() {
@@ -1702,6 +1780,26 @@ impl App {
                         let events = app.claim_events(&assignment);
                         app.outbox.extend(events);
                         Some(json!({ "order_id": order_id, "rider_id": rider_id }))
+                    }
+                    Err(e) => {
+                        app.outbox_err = Some(e);
+                        None
+                    }
+                },
+            ),
+            M::Reassign { order_id, rider_id } => self.control(
+                conn_id,
+                role,
+                "reassign",
+                |app| match scheduler::reassign(&mut app.world, order_id, rider_id) {
+                    Ok(out) => {
+                        let events = app.reassign_events(&out);
+                        app.outbox.extend(events);
+                        Some(json!({
+                            "order_id": order_id,
+                            "from_rider_id": out.from_rider,
+                            "rider_id": rider_id,
+                        }))
                     }
                     Err(e) => {
                         app.outbox_err = Some(e);
@@ -2538,6 +2636,33 @@ impl App {
         events
     }
 
+    /// 改派的副作用事件：一条改派 + **两位**当事人的状态。
+    ///
+    /// 原骑手的状态事件不能漏：骑手卡片靠 `rider_state_changed` 刷新，
+    /// 漏了他手上会一直挂着那张已经不在的单，控制端就会继续以为这单有人管。
+    fn reassign_events(&self, out: &scheduler::ReassignOutcome) -> Vec<SimEvent> {
+        let to_rider = out.assignment.rider;
+        let to_rider_name = self
+            .world
+            .rider(to_rider)
+            .map(|r| r.name.clone())
+            .unwrap_or_default();
+        let mut events = vec![SimEvent::OrderReassigned {
+            order_id: out.assignment.order,
+            from_rider_id: out.from_rider,
+            from_rider_name: out.from_rider_name.clone(),
+            to_rider_id: to_rider,
+            to_rider_name,
+            phase: out.phase,
+        }];
+        for id in [out.from_rider, to_rider] {
+            if let Some(ev) = scheduler::state_event(&self.world, id) {
+                events.push(ev);
+            }
+        }
+        events
+    }
+
     // -----------------------------------------------------------------
     // 控制端
     // -----------------------------------------------------------------
@@ -3056,6 +3181,7 @@ fn client_action_name(msg: &ClientMessage) -> &'static str {
         M::SetWeather { .. } => "set_weather",
         M::SetCommissionRate { .. } => "set_commission_rate",
         M::ForceAssign { .. } => "force_assign",
+        M::Reassign { .. } => "reassign",
         M::SetLlmEnabled { .. } => "set_llm_enabled",
         M::SetConfig { .. } => "set_config",
         M::SetRiderOnline { .. } => "set_rider_online",

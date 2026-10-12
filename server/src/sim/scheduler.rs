@@ -38,6 +38,11 @@ pub enum ClaimError {
     FeatureDisabled,
     /// 今日拒单额度已用完——指派单拒不掉了，只能送。
     RejectLimitReached,
+    /// 改派的目标就是这单现在的持有人——那不是改派。
+    ///
+    /// 单独给一个码是为了文案：`ALREADY_CLAIMED`（"订单已被抢走"）用在改派上，
+    /// 会让操作者以为单被别人截了，而真相是他自己选错了人。
+    SameRider,
 }
 
 impl ClaimError {
@@ -63,6 +68,7 @@ impl ClaimError {
             ClaimError::NotAssignedToYou => "NOT_ASSIGNED_TO_YOU",
             ClaimError::FeatureDisabled => "FEATURE_DISABLED",
             ClaimError::RejectLimitReached => "REJECT_LIMIT_REACHED",
+            ClaimError::SameRider => "SAME_RIDER",
         }
     }
 
@@ -84,6 +90,7 @@ impl ClaimError {
             ClaimError::NotAssignedToYou => "这不是你的单",
             ClaimError::FeatureDisabled => "该功能未开启",
             ClaimError::RejectLimitReached => "你今天拒绝已超出上限",
+            ClaimError::SameRider => "这单已经在该骑手手上了",
         }
     }
 }
@@ -173,6 +180,151 @@ pub fn assign_forced(
         r.assign_pending = Some(order_id);
     }
     Ok(assignment)
+}
+
+/// 改派的回执。
+///
+/// 为什么要带「上一手是谁」：改派之后世界已经查不到这段关系了（单已经写在新骑手名下），
+/// 而事件要写原骑手的名字。让 `reassign` 把这段关系交出来，比让每个调用方在动手前
+/// 自己偷看一眼世界要稳——后者总有忘的那天（忘了就变成一条没有「从谁手上」的改派日志）。
+#[derive(Debug)]
+pub struct ReassignOutcome {
+    pub assignment: Assignment,
+    /// 原骑手。
+    pub from_rider: RiderId,
+    pub from_rider_name: String,
+    /// 改派那一刻原骑手卡在哪一段（`to_shop` / `waiting_food`）。
+    pub phase: Phase,
+}
+
+/// 改派（控制端动作）：把**还没取到餐**的单从原骑手手上转给另一个骑手。
+///
+/// # 为什么只允许「取餐中」
+///
+/// 判定落在骑手身上的那段腿（[`Phase::ToShop`] / [`Phase::WaitingFood`]），
+/// 与 `OrderStatus::Assigned` 等价：餐还在商家手里，站长才有得调。
+/// 一旦取到餐（`PickedUp`），保温、餐损、超时责任全在原骑手车上，
+/// 现实里没有人会把这袋饭从别人箱子里拎出来交给第三个人——所以这里直接拒掉。
+///
+/// # 与「重投回大厅」的区别
+///
+/// 重投是**原骑手不要了**（拒单 / 取消）：单带着加价回大厅重新广播，谁都能抢。
+/// 改派是**平台指定给谁**：不经过大厅、不看新骑手的接单意愿，但新骑手端照样弹确认
+/// （`assign_pending`），他拒了才吃拒单额度——和强制指派同一套规矩。
+///
+/// # 账怎么算
+///
+/// 不重掷出餐时长、不做大厅空转补偿、不加价：
+/// 出餐时长是商家的（原骑手等在店门口那几分钟不能白等），空转补偿是「平台让单干等」
+/// 的账，而这段路是原骑手跑掉的——补给新骑手等于把别人的延误变成他的外快，
+/// 还会让改派单永远判不了超时。
+pub fn reassign(
+    world: &mut World,
+    order_id: OrderId,
+    to_rider: RiderId,
+) -> Result<ReassignOutcome, ClaimError> {
+    let now = world.elapsed_min;
+
+    let from_rider = {
+        let order = world.order(order_id).ok_or(ClaimError::OrderNotFound)?;
+        if order.status != OrderStatus::Assigned {
+            // 已取货 / 已送达 / 还在大厅无主，都不是改派的场景。
+            return Err(ClaimError::WrongPhase);
+        }
+        order.assigned_to.ok_or(ClaimError::WrongPhase)?
+    };
+    if from_rider == to_rider {
+        return Err(ClaimError::SameRider);
+    }
+
+    // 阶段要问骑手身上的腿，不能只看订单状态：状态同为「已指派」，
+    // 人可能在去店路上，也可能已经在店里等餐，两者都在允许范围内——
+    // 但**已经取到餐**（ToCustomer / ArrivedCustomer）时状态会变成 PickedUp，
+    // 这里再兜一道，防止状态被谁写串了却放过去。
+    let from_phase = world
+        .rider(from_rider)
+        .and_then(|r| r.held_phase(order_id))
+        .ok_or(ClaimError::WrongPhase)?;
+    if !matches!(from_phase, Phase::ToShop | Phase::WaitingFood) {
+        return Err(ClaimError::WrongPhase);
+    }
+
+    {
+        let rider = world.rider(to_rider).ok_or(ClaimError::RiderNotFound)?;
+        if !rider.online {
+            return Err(ClaimError::RiderOffline);
+        }
+        if rider.is_injured(now) {
+            return Err(ClaimError::RiderInjured);
+        }
+        if rider.is_frozen(now) {
+            return Err(ClaimError::RiderFrozen);
+        }
+        if rider.is_holding(order_id) {
+            return Err(ClaimError::AlreadyClaimed);
+        }
+        if rider.held.len() as u32 >= rider.effective_max_held(&world.cfg) {
+            return Err(ClaimError::HeldLimitReached);
+        }
+    }
+
+    let from_name = world
+        .rider(from_rider)
+        .map(|r| r.name.clone())
+        .unwrap_or_default();
+    let to_name = world
+        .rider(to_rider)
+        .map(|r| r.name.clone())
+        .unwrap_or_default();
+
+    // 出餐钟跟着**商家**走，不跟着骑手走：原骑手已经在店门口等了一会儿、还剩 3 分钟出餐，
+    // 那新骑手到店时就只该再等 3 分钟，而不是从头再等一炉（等于商家白做一锅）。
+    // `prep_minutes` 正是「进等餐时倒计时多少分钟」（见 `tick::enter_waiting_food` 读它），
+    // 所以改写它就是改写这单的出餐进度。还在去店路上（ToShop）时商家还没开火，不用动。
+    if from_phase == Phase::WaitingFood {
+        let left = world
+            .rider(from_rider)
+            .and_then(|r| r.held.iter().find(|h| h.order_id == order_id))
+            .map(|h| h.remaining_min)
+            .unwrap_or(0);
+        if let Some(order) = world.order_mut(order_id) {
+            order.prep_minutes = Some(left.max(1));
+        }
+    }
+
+    // 摘单：`held` 与路线一起摘（`drop_order` 顺手 prune 空壳路线）。
+    // 同时取消「还没确认」的指派窗口——单已经不在他手上了，那个确认弹窗必须跟着消失，
+    // 否则他点「接受」会接受一张不属于他的单，点「拒绝」白白吃掉一次拒单额度。
+    if let Some(rider) = world.rider_mut(from_rider) {
+        rider.drop_order(order_id);
+        if rider.assign_pending == Some(order_id) {
+            rider.assign_pending = None;
+        }
+    }
+
+    let mut assignment = ai::evaluate(world, to_rider, order_id).ok_or(ClaimError::OrderNotFound)?;
+    assignment.source = DecisionSource::Manual;
+    assignment.reason = format!(
+        "控制端改派：{from_name}还没取到餐（{}），转给{to_name}",
+        from_phase.label()
+    );
+
+    if let Some(order) = world.order_mut(order_id) {
+        order.assigned_to = Some(to_rider);
+        // 和强制指派同理：新骑手端要弹确认，而不是「白捡一单」直接挂上。
+        order.forced = true;
+    }
+    mount_on_rider(world, &assignment);
+    if let Some(rider) = world.rider_mut(to_rider) {
+        rider.assign_pending = Some(order_id);
+    }
+    world.stats.reassigns += 1;
+    Ok(ReassignOutcome {
+        assignment,
+        from_rider,
+        from_rider_name: from_name,
+        phase: from_phase,
+    })
 }
 
 /// 骑手确认接受一张强制指派单。
@@ -353,11 +505,6 @@ pub fn claimed_event(world: &World, a: &Assignment) -> SimEvent {
 /// 真正把订单挂到骑手身上。这是「抢单」唯一改状态的地方。
 fn attach(world: &mut World, assignment: &Assignment) {
     let now = world.elapsed_min;
-    let plan = assignment.plan;
-    let back_order = world
-        .order(assignment.order)
-        .map(|o| o.back_order)
-        .unwrap_or(false);
 
     // 出餐耗时：商家均值 × 高峰系数 × 抖动 ±20%
     let prep = {
@@ -392,9 +539,25 @@ fn attach(world: &mut World, assignment: &Assignment) {
         order.credit_hall_idle(now);
     }
 
+    mount_on_rider(world, assignment);
+    world.stats.claims += 1;
+}
+
+/// 把单装配到骑手身上：`held` 记「手上有哪些单」，路线记「脚步往哪迈」。
+///
+/// **只动骑手，不动订单**——订单状态与出餐时长是 [`attach`]（从大厅首派）的事。
+/// 抽出来是因为改派（[`reassign`]）要同一段装配：单已经挂在某人身上，只是换个人驮。
+/// 两边各写一遍，迟早长歪（比如忘了给路线插腿，接手的人就会一直站在原地看着单不动）。
+fn mount_on_rider(world: &mut World, assignment: &Assignment) {
+    let now = world.elapsed_min;
+    let back_order = world
+        .order(assignment.order)
+        .map(|o| o.back_order)
+        .unwrap_or(false);
     let shop = world.order(assignment.order).map(|o| o.merchant_pos());
+
     if let Some(rider) = world.rider_mut(assignment.rider) {
-        let to_shop = plan.to_shop_min.max(1);
+        let to_shop = assignment.plan.to_shop_min.max(1);
         rider.held.push(HeldOrder::new(
             assignment.order,
             Phase::ToShop,
@@ -405,8 +568,7 @@ fn attach(world: &mut World, assignment: &Assignment) {
         // 路线：已有路线就把取餐腿插进去（自动排到第一个送达腿之前，
         // 保证餐先取齐），没有就起一条。
         //
-        // `held` 记「手上有哪些单」，路线记「脚步往哪迈」——合并单就是在这里发生的：
-        // 第二单不再自己找路，而是并入同一串腿。
+        // 合并单就是在这里发生的：第二单不再自己找路，而是并入同一串腿。
         if let Some(shop) = shop {
             let leg = RouteLeg::new(assignment.order, LegKind::Pickup, shop, to_shop);
             match rider.route.as_mut() {
@@ -415,7 +577,6 @@ fn attach(world: &mut World, assignment: &Assignment) {
             }
         }
     }
-    world.stats.claims += 1;
 }
 
 /// 骑手动作产生的副作用事件。
@@ -873,5 +1034,106 @@ mod tests {
             "钱包允许为负：罚单直接扣成负数"
         );
         assert_eq!(r.fines_cents, cancel_cents);
+    }
+
+    /// 造一个「两个骑手，`from` 手上有一张已接、还没取餐的单」的世界。
+    fn world_with_two_riders() -> (World, RiderId, RiderId, OrderId) {
+        let cfg = SimConfig {
+            sim_rider_count: 2,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 7);
+        let ids = w.sim_rider_ids();
+        let (from, to) = (ids[0], ids[1]);
+        let oid = w.generate_order_batch(1)[0];
+        assign_forced(&mut w, oid, from).expect("能强制指派");
+        accept_assign(&mut w, from, oid).expect("能接单");
+        (w, from, to, oid)
+    }
+
+    #[test]
+    fn reassign_moves_an_unpicked_order_between_riders() {
+        let (mut w, from, to, oid) = world_with_two_riders();
+        let promise_before = w.order(oid).expect("订单在").promised_minutes;
+        // 模拟「这单在大厅里空转了 20 分钟」：改派不该把这段时间补给新骑手。
+        w.elapsed_min += 20;
+        w.sim_minute += 20;
+
+        let out = reassign(&mut w, oid, to).expect("还没取餐，应能改派");
+        assert_eq!(out.from_rider, from);
+        assert_eq!(out.phase, Phase::ToShop, "原骑手在去店路上");
+
+        let f = w.rider(from).expect("原骑手在");
+        assert!(f.held.is_empty(), "单要从原骑手手上摘掉");
+        assert_eq!(f.assign_pending, None, "没确认的指派窗口必须一起取消");
+
+        let t = w.rider(to).expect("新骑手在");
+        assert_eq!(t.held.len(), 1);
+        assert_eq!(t.held[0].order_id, oid);
+        assert_eq!(t.held[0].phase, Phase::ToShop);
+        assert_eq!(t.assign_pending, Some(oid), "新骑手端要弹确认");
+        assert!(t.route.is_some(), "取餐腿得装进路线，否则他会站着不动");
+
+        let o = w.order(oid).expect("订单在");
+        assert_eq!(o.assigned_to, Some(to));
+        assert_eq!(o.status, OrderStatus::Assigned);
+        assert!(o.forced, "改派和强制指派同一套规矩：要确认，不是白捡");
+        assert_eq!(
+            o.promised_minutes, promise_before,
+            "大厅空转是平台的账，不许补给新骑手（补了这单就永远判不了超时）"
+        );
+        assert_eq!(w.stats.reassigns, 1);
+    }
+
+    /// 餐一旦离手，责任随人走——**失败必须是干净的失败**（人没换、单没动）。
+    #[test]
+    fn reassign_refuses_orders_already_in_hand() {
+        let (mut w, from, to, oid) = world_with_two_riders();
+        w.rider_mut(from).expect("骑手在").held[0].set_leg(Phase::ToCustomer, 8);
+        w.order_mut(oid).expect("订单在").status = OrderStatus::PickedUp;
+
+        let err = reassign(&mut w, oid, to).expect_err("取到餐之后不许改派");
+        assert_eq!(err, ClaimError::WrongPhase);
+        assert_eq!(w.order(oid).expect("订单在").assigned_to, Some(from));
+        assert_eq!(w.rider(to).expect("新骑手在").held.len(), 0);
+        assert_eq!(w.rider(from).expect("原骑手在").held.len(), 1, "原骑手不该丢单");
+        assert_eq!(w.stats.reassigns, 0);
+    }
+
+    #[test]
+    fn reassign_checks_the_receiving_rider() {
+        let (mut w, from, to, oid) = world_with_two_riders();
+        w.rider_mut(to).expect("骑手在").online = false;
+        assert_eq!(
+            reassign(&mut w, oid, to).expect_err("离线的不该收到单"),
+            ClaimError::RiderOffline
+        );
+
+        w.rider_mut(to).expect("骑手在").online = true;
+        assert_eq!(
+            reassign(&mut w, oid, from).expect_err("改派给自己不是改派"),
+            ClaimError::SameRider
+        );
+        assert_eq!(w.stats.reassigns, 0, "失败的改派不计数");
+    }
+
+    /// 商家那边的出餐钟跟着**商家**走：原骑手已经等掉 9 分钟、还剩 3 分钟出餐，
+    /// 新骑手到店时就只该再等 3 分钟，而不是从头再等一炉。
+    #[test]
+    fn reassign_carries_the_merchants_cook_clock_over() {
+        let (mut w, _from, to, oid) = world_with_two_riders();
+        {
+            let held = &mut w.rider_mut(_from).expect("骑手在").held[0];
+            held.set_leg(Phase::WaitingFood, 12);
+            held.remaining_min = 3;
+        }
+
+        let out = reassign(&mut w, oid, to).expect("等餐中也能改派");
+        assert_eq!(out.phase, Phase::WaitingFood);
+        assert_eq!(
+            w.order(oid).expect("订单在").prep_minutes,
+            Some(3),
+            "剩下的出餐时间要跟着单走，不能重置成整炉"
+        );
     }
 }

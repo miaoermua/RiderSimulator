@@ -262,6 +262,23 @@ pub enum SimEvent {
         quoted_fee_cents: i64,
         forced: bool,
     },
+    /// 改派：把**还没取到餐**的单从一个骑手手上转给另一个骑手（控制端动作）。
+    ///
+    /// 只在「餐还在商家手里」时发生（`OrderStatus::Assigned`，即骑手还在去店路上
+    /// 或在店里等餐）。餐一旦离手就在原骑手车上，保温与餐损都随人走，没有代送一说
+    /// （见 [`crate::sim::scheduler::reassign`]）。
+    ///
+    /// **两边骑手都要收到**：原骑手以为自己手上还有这张单，新骑手是突然多出来一张
+    /// （还得点确认）。所以可见性是「控制端 + 两位当事人」，不是全服广播。
+    OrderReassigned {
+        order_id: OrderId,
+        from_rider_id: RiderId,
+        from_rider_name: String,
+        to_rider_id: RiderId,
+        to_rider_name: String,
+        /// 改派那一刻原骑手卡在哪一段：`to_shop`（去店路上）/ `waiting_food`（店里等餐）。
+        phase: Phase,
+    },
     OrderExpired {
         order_id: OrderId,
     },

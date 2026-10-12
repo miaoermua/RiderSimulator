@@ -40,6 +40,12 @@ use crate::sim::{OrderId, RiderId};
 pub const STATE_PATH: &str = "/api/state";
 /// 派单：把订单指派给骑手。
 pub const DISPATCH_PATH: &str = "/api/dispatch";
+/// 改派：把**还没取到餐**的单从一个骑手手上转给另一个骑手。
+///
+/// 与 [`DISPATCH_PATH`] 分开而不是合成一个接口：派单只认大厅里**无主**的单，
+/// 改派只认**别人手上还没取餐**的单，前置条件正相反，失败原因也不一样
+/// （`ALREADY_CLAIMED` vs `WRONG_PHASE`）。合成一个，调用方就分不清自己错在哪。
+pub const REASSIGN_PATH: &str = "/api/reassign";
 /// 批量改控制端开关。
 pub const CONFIG_PATH: &str = "/api/config";
 /// 强制某个骑手上线 / 下线。
@@ -108,6 +114,8 @@ pub enum RpcRequest {
     State,
     /// 派单。整批按顺序执行，一条失败不挡后面的。
     Dispatch(Vec<DispatchItem>),
+    /// 改派。整批按顺序执行，一条失败不挡后面的。
+    Reassign(Vec<DispatchItem>),
     /// 改开关。
     SetConfig(ConfigPatch),
     /// 上 / 下线。
@@ -273,6 +281,7 @@ pub fn routes(state: ApiState) -> Router {
     Router::new()
         .route(STATE_PATH, get(state_route))
         .route(DISPATCH_PATH, post(dispatch_route))
+        .route(REASSIGN_PATH, post(reassign_route))
         .route(CONFIG_PATH, post(config_route))
         .route(RIDER_ONLINE_PATH, post(rider_online_route))
         .route(AI_PATH, get(ai_state_route).post(ai_config_route))
@@ -393,6 +402,27 @@ async fn dispatch_route(
         return ApiError::bad_request("assignments 不能为空").into_response();
     }
     api.call(&headers, RpcRequest::Dispatch(items)).await
+}
+
+async fn reassign_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let body: DispatchBody = match serde_json::from_value(body) {
+        Ok(b) => b,
+        Err(e) => {
+            return ApiError::bad_request(format!(
+                "请求体应为 {{\"assignments\":[...]}} / 单条对象 / 数组：{e}"
+            ))
+            .into_response();
+        }
+    };
+    let items = body.into_items();
+    if items.is_empty() {
+        return ApiError::bad_request("assignments 不能为空").into_response();
+    }
+    api.call(&headers, RpcRequest::Reassign(items)).await
 }
 
 async fn config_route(

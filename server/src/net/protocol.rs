@@ -154,6 +154,16 @@ pub enum ClientMessage {
         order_id: OrderId,
         rider_id: RiderId,
     },
+    /// 改派：把**还没取到餐**的单从原骑手手上转给另一个骑手。
+    ///
+    /// 与 [`ClientMessage::ForceAssign`] 分开而不是复用成一个动作：前者的语义是
+    /// 「从大厅里捞一张无主的单塞给某人」，后者是「从某人手上转给另一个人」，
+    /// 校验条件正相反（改派要求单**已经**在别人手上，且餐还没取到）。
+    /// 合成一个动作，就会出现「到底该查哪套前置条件」的分叉。
+    Reassign {
+        order_id: OrderId,
+        rider_id: RiderId,
+    },
     /// 开关 LLM 战术大脑。
     SetLlmEnabled { enabled: bool },
     /// 批量改控制端开关（玩法设计 §7.3）。缺省字段 = 不改。

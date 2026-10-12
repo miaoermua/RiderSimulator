@@ -423,6 +423,20 @@ export interface EventPayloads {
     forced: boolean;
   };
   order_expired: { order_id: number };
+  /**
+   * 改派：把**还没取到餐**的单从原骑手手上转给另一个骑手。
+   *
+   * 服务端只推给控制端和两位当事人——对第三人来说这单从头到尾都在别人手上。
+   */
+  order_reassigned: {
+    order_id: number;
+    from_rider_id: number;
+    from_rider_name: string;
+    to_rider_id: number;
+    to_rider_name: string;
+    /** 改派那一刻原骑手卡在哪一段：`to_shop`（去店路上）/ `waiting_food`（店里等餐）。 */
+    phase: Phase;
+  };
   /** 骑手拒掉了一张还没确认的指派单。只推给本人和控制端。 */
   assign_rejected: {
     rider_id: number;

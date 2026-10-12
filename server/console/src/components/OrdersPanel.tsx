@@ -1,7 +1,7 @@
 import { Badge, Empty, List, Select, Space, Typography } from "antd";
 import { STATUS_LABEL } from "../const";
 import { useIsControl, useStore } from "../hooks";
-import type { Order } from "../protocol";
+import type { Order, RiderBrief } from "../protocol";
 import { store, yuan } from "../store";
 import { CreateOrderButton } from "./CreateOrderModal";
 import { Metric, MetricRow } from "./Metric";
@@ -97,6 +97,7 @@ export function OrdersPanel() {
               }
               description={<ActiveMeta order={o} rider={nameOf(o.assigned_to)} />}
             />
+            {isControl && <ReassignSelect order={o} candidates={candidates} rider={nameOf(o.assigned_to)} />}
           </List.Item>
         )}
       />
@@ -134,6 +135,44 @@ function ActiveMeta({ order: o, rider }: { order: Order; rider: string }) {
       {o.back_order && <Metric>背单</Metric>}
       {o.urge_count ? <Metric>催 {o.urge_count}</Metric> : null}
     </MetricRow>
+  );
+}
+
+/**
+ * 改派下拉框。
+ *
+ * 只在「已指派、还没取货」时出现：`assigned` 覆盖「去店路上」和「店里等餐」两段，
+ * 这两段里餐还在商家手里，站长才有得调。一旦取到餐（`picked_up`），保温与餐损
+ * 都随原骑手走，服务端会回 `WRONG_PHASE`——所以这里干脆不画，
+ * 免得用户点出一个必然失败的动作。
+ *
+ * 候选里剔掉现任骑手：改派给自己不是改派（服务端回 `ALREADY_CLAIMED`）。
+ */
+function ReassignSelect({
+  order,
+  candidates,
+  rider,
+}: {
+  order: Order;
+  candidates: RiderBrief[];
+  rider: string;
+}) {
+  if (order.status !== "assigned" || order.assigned_to == null) return null;
+  const options = candidates.filter((r) => r.id !== order.assigned_to);
+  if (options.length === 0) return null;
+
+  return (
+    <Select
+      style={{ width: "100%", marginTop: 8 }}
+      showSearch
+      optionFilterProp="label"
+      placeholder={`改派给…（${rider} 还没取餐）`}
+      value={null}
+      options={options.map((r) => ({ value: r.id, label: `${r.name}（${r.held.length} 单）` }))}
+      // 这个下拉框永远显示占位符（`value={null}`），所以泛型被推成 `null`，
+      // 参数类型得自己写宽一点，否则 `null` 塞不进 `number`。
+      onChange={(v: number | null) => v != null && store.reassign(order.id, v)}
+    />
   );
 }
 

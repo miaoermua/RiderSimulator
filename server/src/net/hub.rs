@@ -271,6 +271,7 @@ pub fn event_name(ev: &SimEvent) -> &'static str {
         SimEvent::Tick { .. } => "tick",
         SimEvent::OrderBroadcast { .. } => "order_broadcast",
         SimEvent::OrderClaimed { .. } => "order_claimed",
+        SimEvent::OrderReassigned { .. } => "order_reassigned",
         SimEvent::OrderExpired { .. } => "order_expired",
         SimEvent::AssignRejected { .. } => "assign_rejected",
         SimEvent::OrderPickedUp { .. } => "order_picked_up",
@@ -386,6 +387,21 @@ fn render_filtered(world: &World, ev: &SimEvent, role: Role, now_min: u64) -> Op
             }
             payload_of(ev)
         }
+        SimEvent::OrderReassigned {
+            from_rider_id,
+            to_rider_id,
+            ..
+        } => {
+            // 两位当事人 + 控制端。原骑手要看到手上的单少了一张（否则他会一直
+            // 以为自己还得去这家店），新骑手要看到多了一张（还要点确认）。
+            // 对别人来说这单从头到尾都在别人手上，没有可看的信息——全服广播只会
+            // 把「谁的活被抢了」摆给全服看。
+            if is_control || me == Some(*from_rider_id) || me == Some(*to_rider_id) {
+                payload_of(ev)
+            } else {
+                None
+            }
+        }
         SimEvent::RiderStateChanged { rider_id, .. } => {
             // 关键：按角色重建 brief，而不是转发事件里那份公开版。
             let rider = world.rider(*rider_id)?;
@@ -492,7 +508,7 @@ mod tests {
         config::SimConfig,
         event::{DayLedger, DecisionSource, SimEvent},
         geo::LatLng,
-        rider::{RiderKind, SpeedMode},
+        rider::{Phase, RiderKind, SpeedMode},
         world::World,
     };
     use tokio::sync::mpsc::unbounded_channel;
@@ -622,6 +638,32 @@ mod tests {
         assert!(render(&w, &ev, Role::Spectator, w.elapsed_min).is_some());
         assert!(render(&w, &ev, Role::Rider(1), w.elapsed_min).is_some());
         assert!(render(&w, &ev, Role::Control, w.elapsed_min).is_some());
+    }
+
+    /// 改派只给两位当事人 + 控制端：对第三人来说这单从头到尾都挂在别人名下，
+    /// 广播出去只是把「谁的活被抢了」摆给全服看。
+    #[test]
+    fn order_reassigned_reaches_only_the_two_riders_involved() {
+        let w = world();
+        let ev = SimEvent::OrderReassigned {
+            order_id: 1,
+            from_rider_id: 2,
+            from_rider_name: "乙".into(),
+            to_rider_id: 3,
+            to_rider_name: "丙".into(),
+            phase: Phase::WaitingFood,
+        };
+        assert!(render(&w, &ev, Role::Control, w.elapsed_min).is_some());
+        assert!(
+            render(&w, &ev, Role::Rider(2), w.elapsed_min).is_some(),
+            "原骑手得知道手上少了一张"
+        );
+        assert!(
+            render(&w, &ev, Role::Rider(3), w.elapsed_min).is_some(),
+            "新骑手得知道多了一张（还要点确认）"
+        );
+        assert!(render(&w, &ev, Role::Rider(9), w.elapsed_min).is_none());
+        assert!(render(&w, &ev, Role::Spectator, w.elapsed_min).is_none());
     }
 
     #[test]

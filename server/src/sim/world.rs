@@ -43,6 +43,8 @@ pub struct SimStats {
     pub orders_delivered: u64,
     pub orders_late: u64,
     pub claims: u64,
+    /// 控制端改派次数（只数成功转手的，失败的重试不算）。
+    pub reassigns: u64,
     pub accidents: u32,
     pub camera_fines: u32,
     /// LLM 战术大脑调用次数（一天最多 24 次）。

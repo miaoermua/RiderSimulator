@@ -349,6 +349,17 @@ class ConsoleStore {
     this.send("reset_rider_wallet", { rider_id: riderId });
   }
 
+  /**
+   * 改派：把**还没取到餐**的单从原骑手手上转给另一个骑手。
+   *
+   * 服务端只认「已指派但未取货」的单，取到餐之后一律回 `WRONG_PHASE`。
+   * 所以按钮只在那一档出现（见 `OrdersPanel`），这里不做兜底判断——
+   * 前端和后端各判一次、判得还不一样，是更难查的那种 bug。
+   */
+  reassign(orderId: number, riderId: number) {
+    this.send("reassign", { order_id: orderId, rider_id: riderId });
+  }
+
   // ---------------- 骑手账号（HTTP） ----------------
 
   /**
@@ -481,6 +492,19 @@ class ConsoleStore {
       case "order_claimed": {
         const c = p as EventPayloads["order_claimed"];
         this.log(`#${c.order_id} 被 ${c.rider_name} ${c.forced ? "强制指派" : "抢到"}（${yuan(c.quoted_fee_cents)}）`);
+        break;
+      }
+      case "order_reassigned": {
+        const r = p as EventPayloads["order_reassigned"];
+        // 「取餐中」是两段：去店路上、店里等餐。站长关心的是人卡在哪一段，
+        // 所以分开念——只写「取餐中」，看日志的人还得自己去翻地图。
+        const where = r.phase === "waiting_food" ? "店里等餐" : "去店路上";
+        this.log(
+          `#${r.order_id} 改派：${r.from_rider_name}（${where}）→ ${r.to_rider_name}`,
+          "改派",
+          // Tag 的 color 走 Ant Design 预置调色板名，不引自定义色值。
+          "purple",
+        );
         break;
       }
       case "order_expired":
