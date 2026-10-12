@@ -177,7 +177,14 @@ body {
 /* 设置行：标签 + 控件两栏。扁平优先，不加分隔线，靠纵向节奏分组。 */
 .set-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  /* 控件列**必须封顶**（`auto` 不行）。
+     `auto` 轨道的上限是 max-content：控件里放一句长文案时它会拿走整行宽度，
+     把 `1fr` 的标签列挤成 0 宽——正文在最窄宽度下逐字断行，标签就被压成
+     「一字一行」的一长条（「里程阶梯」那行就是这么炸的）。
+     `fit-content(60%)` = min(60%, max-content)：控制项本身不宽时等于 `auto`
+     （绝大多数行一个字都不动），超宽的长文案才在 60% 处封顶、自己换行，
+     标签列始终留得住 40% 的可读宽度。 */
+  grid-template-columns: minmax(0, 1fr) fit-content(60%);
   align-items: center;
   gap: 16px;
   padding: 8px 0;
@@ -192,6 +199,10 @@ body {
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
+  /* 让控件可以被压到比内容窄（滑块收短、长文案自己换行），
+     而不是顶穿轨道把标签列吃掉。不写 `flex-wrap`：挤的时候收窄比换行好看，
+     换行会让整行高度突然翻倍。 */
+  min-width: 0;
 }
 
 .set-row.stack .set-ctl {

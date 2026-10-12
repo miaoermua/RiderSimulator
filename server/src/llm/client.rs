@@ -587,7 +587,6 @@ impl LlmClient {
     /// ```text
     /// data: {"choices":[{"delta":{"content":"你"}}]}
     /// data: {"choices":[{"delta":{"content":"好"}}]}
-    ///
     /// data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
     /// data: [DONE]
     /// ```
@@ -596,71 +595,68 @@ impl LlmClient {
     ///
     /// **半截 JSON 解析不出任何东西。** 决策要的是一份完整结构，
     /// 提前落地只会把残缺状态写进世界。所以这里只做「累积」，
-    /// 真正的解析交给 [`extract_json`]，与协议校验交给
+    /// 真正的解析交给 [`extract_json`]，协议校验交给
     /// [`crate::llm::protocol::validate_decision`]——两者都不感知流式。
     ///
-    /// 流式真正换来的好处是**能区分两种超时**：见 [`LlmConfig::first_token_timeout`]。
+    /// 流式真正换来的好处是**能区分两种超时**（见
+    /// [`LlmConfig::first_token_timeout`]）：「上游一直没动」和「模型还在写」
+    /// 是两种故障，前者该快速退回算法，后者得给足时间。
     ///
     /// ## 容错
     ///
-    /// - `data:` 后面是 `[DONE]` → 正常收尾。
-    /// - 单个分片 JSON 坏了 → **跳过继续**，不因为一个畸形帧丢掉整个回复。
+    /// - `data: [DONE]` → 立刻收尾，不再等连接关闭。
+    /// - 单个分片 JSON 坏了 → **跳过继续**，不因一个畸形帧丢掉整个回复。
     /// - `reasoning_content`（部分模型的思维链）→ 忽略，只取 `content`。
-    /// - 上游不发 `[DONE]` 就断流 → 已收到的照样返回，让上层去校验。
+    /// - 没收到 `[DONE]` 就断流 → 已收到的照样返回，让上层去校验。
     async fn collect_sse(&self, resp: reqwest::Response) -> Result<String, LlmError> {
         use futures::StreamExt;
 
-        let first = self.cfg.first_token_timeout;
         let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
 
-        // 首字节单独掐表：此刻还没开始等，总预算还没开始消耗。
-        let first_chunk = match tokio::time::timeout(first, stream.next()).await {
-            Ok(v) => v,
-            Err(_) => {
-                return Err(LlmError::Timeout(first));
-            }
-        };
-        let Some(mut first_chunk) = first_chunk else {
-            return Err(LlmError::Empty);
-        };
-        let mut buf = first_chunk.to_vec();
-
-        // 剩下的交给总预算管。
-        let total = self.cfg.stream_timeout;
-        let rest = tokio::time::timeout(total, async {
-            while let Some(chunk) = stream.next().await {
-                buf.extend_from_slice(&chunk);
-            }
-        })
-        .await;
-        if rest.is_err() {
-            return Err(LlmError::Timeout(total));
+        // ── 阶段一：等首字节 ──
+        // 单独掐表，因为「上游一直没动」和「模型正在写」是两种故障：
+        // 前者要快速退回算法（省下整个总预算给下一层），后者得给足时间。
+        let first_budget = self.cfg.first_token_timeout;
+        match tokio::time::timeout(first_budget, stream.next()).await {
+            Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
+            // 流正常结束却一个字节都没有：上游返回了空 body。
+            Ok(None) => return Err(LlmError::Empty),
+            // 连接中途断了：已经收到的部分可能仍然可用，但作为「首字节」阶段
+            // 它连一个字都没拿到，直接按 IO 错误报。
+            Ok(Some(Err(e))) => return Err(LlmError::Http(e)),
+            Err(_) => return Err(LlmError::Timeout(first_budget)),
         }
 
-        // 上面的 `timeout` 会把整个 body 读到底；但正常 SSE 收到 `[DONE]`
-        // 就该停，否则有些网关会保持连接不关、白等到超时。
-        // 折中做法：先把已收到的内容解析出来，够用就返回。
-        let text = String::from_utf8_lossy(&buf);
-        let joined = sse_join(&text);
-        if joined.contains("[DONE]") {
-            return Ok(sse_content(&joined));
-        }
-
-        // 还没拿到 [DONE]，继续在总预算内补收剩余分片。
-        let more = tokio::time::timeout(total.saturating_sub(first), async {
-            while let Some(chunk) = stream.next().await {
+        // ── 阶段二：收剩余分片 ──
+        // 首字节已经等到过了，给剩下的留足总预算。
+        let total_budget = self.cfg.stream_timeout;
+        let collect = async {
+            while let Some(item) = stream.next().await {
+                // 中途某个分片读失败（连接重置等）：**停止**，用已收到的继续。
+                // 丢弃整个回复反而更糟——可能已经收全了。
+                let Ok(chunk) = item else { break };
                 buf.extend_from_slice(&chunk);
-                let cur = String::from_utf8_lossy(&buf);
-                if cur.contains("[DONE]") {
+                // 收到 [DONE] 就收工：不少网关会保持连接不关，
+                // 死等 body 结束只会白白耗到超时。
+                if has_done_marker(&buf) {
                     break;
                 }
             }
-        })
-        .await;
-        let _ = more;
+        };
+        if tokio::time::timeout(total_budget, collect).await.is_err() {
+            // 已经收了一部分，但没等到 [DONE]：**照样返回**。
+            // 让上层去校验/丢弃，比直接报超时更有用——有时回复其实已经完整了，
+            // 只是上游忘了发终止帧。
+            tracing::debug!("SSE 未收到 [DONE]，用已收到的部分继续");
+        }
 
         let text = String::from_utf8_lossy(&buf);
-        Ok(sse_content(&text))
+        let content = sse_content(&text);
+        if content.trim().is_empty() {
+            return Err(LlmError::Empty);
+        }
+        Ok(content)
     }
 
     /// 上游 `GET {base}/models`：控制台的模型下拉靠它，免得手打模型名打错。
@@ -749,6 +745,76 @@ pub fn parse_models(envelope: &Value) -> Vec<ModelInfo> {
 
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out.dedup_by(|a, b| a.id == b.id);
+    out
+}
+
+/// SSE 缓冲里是否已经出现 `[DONE]` 终止标记。
+///
+/// 逐字节扫而不是 `String::from_utf8_lossy` 全文转换再`contains`：
+/// 后者会在每个分片上分配一次完整字符串，长回复下浪费明显；
+/// `[DONE]` 永远在 ASCII 区间，按字节找不会误判多字节字符。
+fn has_done_marker(buf: &[u8]) -> bool {
+    const MARKER: &[u8] = b"data: [DONE]";
+    buf.windows(MARKER.len()).any(|w| w == MARKER)
+}
+
+/// 从 SSE 原始文本里抽出模型输出的正文。
+///
+/// ## SSE 分片形状
+///
+/// ```text
+/// data: {"choices":[{"delta":{"content":"你好"}}]}
+/// data: {"choices":[{"delta":{"content":",世界"}}]}
+/// data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+/// data: [DONE]
+/// ```
+///
+/// 累加的是 `choices[0].delta.content`。几个必须处理的细节：
+///
+/// 1. **分片边界会切断 UTF-8 字符**。用 `String::from_utf8_lossy` 逐片转换会
+///    把跨界的多字节字符变成 `��`。所以**先把整个缓冲区一次性转**，
+///    再按行切——顺序反了就会出乱码。
+/// 2. **忽略 `reasoning_content`**：部分模型（DeepSeek-R1 等）会先吐思维链，
+///    那个字段不是最终答案，取了会污染 JSON。
+/// 3. **跳过解析失败的分片**：一个畸形帧不该让整个回复作废。
+/// 4. **兼容非流式的 `message.content`**：有的网关即使回了 SSE 也用
+///    `message` 而不是 `delta`，顺手支持一下。
+fn sse_content(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() / 2);
+    for line in raw.lines() {
+        let line = line.trim();
+        // SSE 允许 `data:` 后有可选空格；也可能有 `event:` / `id:` 等字段，一律跳过。
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        let Some(choice) = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+        else {
+            continue;
+        };
+        // 先试流式的 delta，再试非流式的 message —— 两种网关都覆盖。
+        let piece = choice
+            .get("delta")
+            .and_then(|d| d.get("content"))
+            .or_else(|| {
+                choice
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+            })
+            .and_then(|c| c.as_str());
+        if let Some(s) = piece {
+            out.push_str(s);
+        }
+    }
     out
 }
 
@@ -1082,6 +1148,191 @@ mod tests {
         .expect("带 Key 的配置必须建得出来")
     }
 
+    /// 同上，但**强制关掉流式**。
+    ///
+    /// 这两个必须分开：`stub_upstream` 返回的是一个**完整的 JSON 响应体**，
+    /// 不是 SSE。而 `LlmConfig::default()` 现在 `stream = true`，
+    /// 于是 `complete_json` 会走流式分支去找 `data:` 行——找不到，
+    /// 报 `Empty`。看起来像"加了流式把原有功能改坏了"，其实只是桩没换形态。
+    fn client_plain(base_url: String) -> LlmClient {
+        LlmClient::new(LlmConfig {
+            base_url,
+            api_key: "test-key".into(),
+            timeout: Duration::from_secs(5),
+            stream: false,
+            ..Default::default()
+        })
+        .expect("带 Key 的配置必须建得出来")
+    }
+
+    /// 起一个**真的 SSE 上游**：按分片吐出，最后发 `[DONE]`。
+    ///
+    /// 纯函数测过 `sse_content`，但「流式链路能不能把 JSON 完整拿回来」
+    /// 还得跑一次真网络——`bytes_stream()` 的分片边界、axum 的 chunked 编码、
+    /// `[DONE]` 之后是否真的关连接，这些模拟不出来。
+    async fn stub_sse(frames: Vec<&'static str>, send_done: bool) -> String {
+        use axum::{Router, http::header, routing::any};
+
+        let app = Router::new().route(
+            "/v1/{*rest}",
+            any(move || {
+                let frames = frames.clone();
+                async move {
+                    // 先把要发的分片攒成Vec，再一次性变成Stream。
+                    // （不能直接对 `std::iter::Map` 调 `.chain()`——那不是 Stream。）
+                    let mut chunks: Vec<Result<String, std::io::Error>> = frames
+                        .into_iter()
+                        .map(|f| Ok(format!("data: {f}\n\n")))
+                        .collect();
+                    if send_done {
+                        chunks.push(Ok("data: [DONE]\n\n".to_string()));
+                    }
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        axum::body::Body::from_stream(futures::stream::iter(chunks)),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/v1")
+    }
+
+    /// 端到端：默认（流式开）能从 SSE 里拿到完整 JSON。
+    #[tokio::test]
+    async fn complete_json_reads_a_real_sse_stream() {
+        let base = stub_sse(
+            vec![
+                r#"{"choices":[{"delta":{"content":"{\"assignments\":"}}]}"#,
+                r#"{"choices":[{"delta":{"content":"[{\"rider_id\":1,\"score\":0.7}]}"}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            ],
+            true,
+        )
+        .await;
+
+        // 注意：用默认配置（stream = true），确保走的是真流式分支。
+        let client = client_for_stmt(base);
+        let v = client
+            .complete_json("只输出 JSON", "派单")
+            .await
+            .expect("SSE 应当被读成完整 JSON");
+        assert_eq!(v["assignments"][0]["rider_id"], json!(1));
+    }
+
+    /// 上游忘了发 `[DONE]`（就断了）：**照样返回已收到的内容**，
+    /// 交给上层校验，而不是直接报超时把整个回复丢掉。
+    #[tokio::test]
+    async fn complete_json_survives_a_stream_that_never_says_done() {
+        let base = stub_sse(
+            vec![r#"{"choices":[{"delta":{"content":"{\"ok\":1}"}}]}"#],
+            false,
+        )
+        .await;
+        let v = client_for_stmt(base)
+            .complete_json("s", "u")
+            .await
+            .expect("缺 [DONE] 也该把已收到的交出去");
+        assert_eq!(v["ok"], json!(1));
+    }
+
+    // ---------------- SSE 分片解析（纯函数，最容易出错的地方） ----------------
+
+    #[test]
+    fn sse_joins_deltas_into_one_string() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"acts\\\":\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"[{\\\"r\\\":\\\"r1\\\"}]}\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(sse_content(raw), "{\"acts\":[{\"r\":\"r1\"}]}");
+    }
+
+    #[test]
+    fn sse_survives_a_split_multibyte_character() {
+        // 「你」是 3 字节 UTF-8。真实流式里它**很可能被切在两个分片之间**。
+        // 关键防线是：先整个缓冲区一次性转字符串，再按行切——
+        // 顺序反了（逐片 from_utf8_lossy）就会在这里变成 U+FFFD。
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n",
+        );
+        assert_eq!(sse_content(raw), "你");
+        assert!(!sse_content(raw).contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn sse_skips_malformed_frames_instead_of_giving_up() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"前\"}}]}\n\n",
+            "data: {这不是合法 JSON\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"缀\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(sse_content(raw), "前缀");
+    }
+
+    #[test]
+    fn sse_ignores_reasoning_content() {
+        // DeepSeek-R1 一类模型会先吐思维链在 reasoning_content 里，
+        // 那是**思考过程不是答案**，取它会污染 JSON。
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"让我想想\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"ok\\\":1}\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(sse_content(raw), "{\"ok\":1}");
+    }
+
+    #[test]
+    fn sse_also_accepts_non_streaming_message_shape() {
+        // 有些网关即使回了 SSE，内容仍用 message 而非 delta。
+        let raw = "data: {\"choices\":[{\"message\":{\"content\":\"{\\\"ok\\\":2}\"}}]}\n\ndata: [DONE]\n\n";
+        assert_eq!(sse_content(raw), "{\"ok\":2}");
+    }
+
+    #[test]
+    fn done_marker_is_detected_in_a_partial_buffer() {
+        // [DONE] 可能被切在两个 chunk 之间，必须跨边界能认出来。
+        assert!(has_done_marker(b"data: {\"a\":1}\n\ndata: [DONE]\n\n"));
+        assert!(has_done_marker(b"xxxdata: [DONE]"));
+        assert!(!has_done_marker(b"data: {\"a\":1}"));
+        assert!(!has_done_marker(b"data: [DON]"));
+    }
+
+    #[test]
+    fn stream_budget_must_exceed_the_plain_timeout() {
+        // 这是「一开流式就随机超时」那个坑的守卫：
+        // client 级超时取 effective_timeout，若它比流式预算还短，
+        // 请求级的 12 秒会被 client 级的覆盖掉。
+        let cfg = LlmConfig::default();
+        assert!(cfg.stream_timeout > cfg.timeout);
+        assert_eq!(cfg.effective_timeout(), cfg.stream_timeout);
+
+        let mut off = cfg.clone();
+        off.stream = false;
+        assert_eq!(off.effective_timeout(), cfg.timeout);
+    }
+
+    #[test]
+    fn stream_toggle_is_lenient_and_defaults_on() {
+        assert!(parse_bool_lenient(None));
+        for v in ["1", "true", "yes", "on"] {
+            assert!(parse_bool_lenient(Some(v.into())), "{v} 应为开");
+        }
+        for v in ["0", "false", "no", "off", ""] {
+            assert!(!parse_bool_lenient(Some(v.into())), "{v} 应为关");
+        }
+        // 拼错的值按开启处理——绝不能因为一个没认出来的变量静默关掉流式。
+        for v in ["maybe", "2", "流式"] {
+            assert!(parse_bool_lenient(Some(v.into())), "{v} 应回落到开启");
+        }
+    }
+
     #[test]
     fn parses_the_common_models_shapes() {
         // OpenAI / DeepSeek / vLLM：data 数组 + 对象
@@ -1174,7 +1425,7 @@ mod tests {
             r#"{"choices":[{"message":{"content":"{\"assignments\":[]}"}}]}"#,
         )
         .await;
-        let client = client_for_stmt(base);
+        let client = client_plain(base);
         let v = client
             .complete_json("只输出 JSON", "派单")
             .await
@@ -1198,7 +1449,7 @@ mod tests {
             r#"{"choices":[{"message":{"content":"```json\n{\"v\":1}\n```"}}]}"#,
         )
         .await;
-        let v = client_for_stmt(base)
+        let v = client_plain(base)
             .complete_json("s", "u")
             .await
             .expect("该成功");

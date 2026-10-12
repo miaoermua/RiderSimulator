@@ -274,7 +274,9 @@ export function SettingsPanel() {
           onChange={(v) => store.send("set_config", { base_fee_cents: toCents(v) })}
         />
       </Row>
-      <Row label="里程阶梯" hint="整段总价，不是每段累加；区间左闭右开">
+      {/* 这一行右边不是控件而是一整句话（阶梯全貌有好几档），
+          所以走 `stack` 给整行宽度——挤在两栏的右半边里只会换行成一片。 */}
+      <Row label="里程阶梯" hint="整段总价，不是每段累加；区间左闭右开" stack>
         <Typography.Text type="secondary">
           {tierRanges(c.fee.distance_tiers, c.fee.per_km_over_cents)}
         </Typography.Text>
