@@ -6,6 +6,8 @@ import '../protocol.dart';
 import '../screens/ledger_page.dart';
 import '../screens/notifications_page.dart';
 import '../screens/running_settings_sheet.dart';
+import '../screens/settings_page.dart';
+import '../screens/wallet_page.dart';
 
 /// 折叠菜单：骑手信息、钱包金额、已完成单数，以及各页入口。
 class RiderDrawer extends StatelessWidget {
@@ -26,7 +28,17 @@ class RiderDrawer extends StatelessWidget {
             children: [
               _Header(state: state),
               if (me != null) ...[
-                _Wallet(me: me),
+                _Wallet(
+                  me: me,
+                  onTap: () {
+                    Navigator.of(context).pop();
+                    Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => WalletPage(state: state),
+                      ),
+                    );
+                  },
+                ),
                 _Counters(me: me),
               ],
               const Divider(height: 1),
@@ -66,23 +78,21 @@ class RiderDrawer extends StatelessWidget {
                   showRunningSettings(context, state: state, client: client);
                 },
               ),
+              ListTile(
+                leading: const Icon(Icons.settings_outlined),
+                title: const Text('设置'),
+                subtitle: const Text('连接 · 骑行模式 · 派单规则'),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).push<void>(
+                    MaterialPageRoute<void>(
+                      builder: (_) =>
+                          SettingsPage(state: state, client: client),
+                    ),
+                  );
+                },
+              ),
               const Divider(height: 1),
-              ListTile(
-                leading: const Icon(Icons.sync),
-                title: const Text('重新同步'),
-                onTap: () {
-                  Navigator.pop(context);
-                  client.resync();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.wifi_protected_setup),
-                title: const Text('重连'),
-                onTap: () {
-                  Navigator.pop(context);
-                  client.reconnect();
-                },
-              ),
               const SizedBox(height: 12),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -170,40 +180,55 @@ class _Header extends StatelessWidget {
 }
 
 class _Wallet extends StatelessWidget {
-  const _Wallet({required this.me});
+  const _Wallet({required this.me, required this.onTap});
 
   final RiderView me;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
       child: Card(
-        child: Padding(
-          padding: const EdgeInsets.all(14),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                '钱包余额',
-                style: Theme.of(context).textTheme.labelSmall,
-              ),
-              Text(
-                '¥${yuan(me.cashCents ?? 0)}',
-                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.bold,
-                      color: Colors.green.shade700,
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '钱包余额',
+                        style: Theme.of(context).textTheme.labelSmall,
+                      ),
                     ),
-              ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  _Money(label: '今日到手', cents: me.takehomeCents),
-                  _Money(label: '时薪', cents: me.hourlyWageCents),
-                  _Money(label: '罚款', cents: me.finesCents),
-                ],
-              ),
-            ],
+                    const Text(
+                      '明细 ›',
+                      style: TextStyle(fontSize: 11, color: Colors.grey),
+                    ),
+                  ],
+                ),
+                Text(
+                  '¥${yuan(me.cashCents ?? 0)}',
+                  style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        color: Colors.green.shade700,
+                      ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    _Money(label: '今日到手', cents: me.takehomeCents),
+                    _Money(label: '时薪', cents: me.hourlyWageCents),
+                    _Money(label: '罚款', cents: me.finesCents),
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
       ),

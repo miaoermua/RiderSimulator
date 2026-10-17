@@ -7,6 +7,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 fn world() -> World {
     let cfg = crate::sim::config::SimConfig {
         sim_rider_count: 3,
+        // 真人只在实时档能上线（模拟档是给 AI 演练的），测试里默认按实时档起。
+        realtime: true,
         ..Default::default()
     };
     World::new_for_test(cfg, 42)
@@ -406,6 +408,7 @@ fn control_can_create_a_custom_order_that_lands_in_the_hall() {
             customer_lat: 30.55,
             customer_lng: 114.45,
             fee_cents: Some(2222),
+            prep_seconds: None,
         },
     );
     let v = drain(&mut ctrl);
@@ -446,6 +449,7 @@ fn create_order_rejects_an_impossible_coordinate() {
             customer_lat: 30.5,
             customer_lng: 114.4,
             fee_cents: None,
+            prep_seconds: None,
         },
     );
     let v = drain(&mut ctrl);

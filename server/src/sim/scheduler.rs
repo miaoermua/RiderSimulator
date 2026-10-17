@@ -12,6 +12,7 @@ use super::{
     config::{PEAK_PREP_FACTOR, STORM_PREP_FACTOR, SimConfig},
     economy,
     event::{DecisionSource, SimEvent},
+    geo::{LatLng, haversine_m},
     order::{AssignMode, OrderStatus, OrderTier},
     rider::{HeldOrder, Phase, Rider, RiderKind, SpeedMode},
     route::{LegKind, RouteLeg, RouteTask},
@@ -44,6 +45,9 @@ pub enum ClaimError {
     AssignForced,
     /// 今天已经被强制下线（拒单额度用尽），不能再自己上线。
     ForcedOffline,
+    /// 世界不在实时档。真人骑手的时间必须和现实对齐（秒级出餐、真实距离），
+    /// 模拟加速档只跑 AI——真人此时不能接入。
+    RealtimeOnly,
     /// 改派的目标就是这单现在的持有人——那不是改派。
     ///
     /// 单独给一个码是为了文案：`ALREADY_CLAIMED`（"订单已被抢走"）用在改派上，
@@ -77,6 +81,7 @@ impl ClaimError {
             ClaimError::RejectLimitReached => "REJECT_LIMIT_REACHED",
             ClaimError::AssignForced => "ASSIGN_FORCED",
             ClaimError::ForcedOffline => "FORCED_OFFLINE",
+            ClaimError::RealtimeOnly => "REALTIME_ONLY",
             ClaimError::SameRider => "SAME_RIDER",
         }
     }
@@ -102,6 +107,7 @@ impl ClaimError {
             ClaimError::RejectLimitReached => "你今天拒绝已超出上限",
             ClaimError::AssignForced => "强制派单不能拒绝",
             ClaimError::ForcedOffline => "今天已被强制下线，明天再来",
+            ClaimError::RealtimeOnly => "当前是模拟档，真人骑手只能在实时档上线",
             ClaimError::SameRider => "这单已经在该骑手手上了",
         }
     }
@@ -668,6 +674,11 @@ pub fn set_online(
     if online && rider.forced_offline {
         return Err(ClaimError::ForcedOffline);
     }
+    // 真人只在实时档跑：模拟档的世界被倍速了，秒级出餐与真实距离都失真，
+    // 让真人接进来会得到一套「明明 30 米却说没到」的怪异体验。
+    if online && rider.kind == RiderKind::Human && !cfg.realtime {
+        return Err(ClaimError::RealtimeOnly);
+    }
     if !online && !rider.held.is_empty() {
         // 手上还有单不能下线
         return Err(ClaimError::WrongPhase);
@@ -705,6 +716,14 @@ pub fn set_speed_mode(
 /// 卡死在 100% 会让人觉得「明明到了却点不了」。AI 不走这条闸门。
 const OFFSITE_TOLERANCE: f32 = 0.85;
 
+/// 人是不是已经站在目的地的圈里。`radius_m == 0` 表示这条放行理由关闭。
+///
+/// 这是**独立的第三条放行理由**：违规开关（人没到也能点）、时间进度走满、
+/// 真实坐标进圈。三者任一成立就放行，互不影响。
+fn in_arrive_radius(radius_m: u32, from: LatLng, to: LatLng) -> bool {
+    radius_m > 0 && haversine_m(from, to) <= radius_m as f64
+}
+
 /// 到达商家（确认）。真人骑手必须点，倒计时归零后由 sim 兜底推进。
 ///
 /// 控制端没开「允许真人违规操作」时，路没走完就点这里会被拒（`OFFSITE_OP`）。
@@ -715,9 +734,15 @@ pub fn arrive_shop(
 ) -> Result<Vec<SimEvent>, ClaimError> {
     let now = world.elapsed_min;
     let allow_violation = world.cfg.allow_rider_violation;
+    let radius_m = world.cfg.arrive_radius_m;
     let human = world
         .rider(rider_id)
         .is_some_and(|r| r.kind == RiderKind::Human);
+    // 借 `rider_mut` 之前先把「人在哪、店在哪」抄出来——同一条 world 上不能再借。
+    let rider_pos = world.rider(rider_id).map(|r| r.pos());
+    let shop_pos = world.order(order_id).map(|o| o.merchant_pos());
+    // 等餐的秒级起点必须记真实墙钟，否则 `pump_waiting` 不知道从什么时候算。
+    let wall = world.wall_ms;
     let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
     let held = rider
         .held_mut(order_id)
@@ -726,12 +751,19 @@ pub fn arrive_shop(
         return Err(ClaimError::WrongPhase);
     }
     if human && !allow_violation && held.leg_progress() < OFFSITE_TOLERANCE {
-        return Err(ClaimError::OffsiteOp);
+        // 「进度没走满」不等于「人没到」：GPS 已经在 100 米内就认。
+        let arrived = rider_pos
+            .zip(shop_pos)
+            .is_some_and(|(p, t)| in_arrive_radius(radius_m, p, t));
+        if !arrived {
+            return Err(ClaimError::OffsiteOp);
+        }
     }
     held.set_leg(Phase::WaitingFood, 1);
     held.awaiting_ack = false;
     held.remaining_min = 0;
     held.wait_started_min = now;
+    held.wait_started_wall_ms = wall;
     held.wait_fined = false;
     // 到店 = 取餐腿跑完。同店多单一起出队，别让第二单再排一次到店。
     rider.complete_pickup_legs_at_current();
@@ -745,9 +777,12 @@ pub fn arrive_customer(
     order_id: OrderId,
 ) -> Result<Vec<SimEvent>, ClaimError> {
     let allow_violation = world.cfg.allow_rider_violation;
+    let radius_m = world.cfg.arrive_radius_m;
     let human = world
         .rider(rider_id)
         .is_some_and(|r| r.kind == RiderKind::Human);
+    let rider_pos = world.rider(rider_id).map(|r| r.pos());
+    let target = world.order(order_id).map(|o| o.customer_pos());
     let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
     let held = rider
         .held_mut(order_id)
@@ -756,7 +791,12 @@ pub fn arrive_customer(
         return Err(ClaimError::WrongPhase);
     }
     if human && !allow_violation && held.leg_progress() < OFFSITE_TOLERANCE {
-        return Err(ClaimError::OffsiteOp);
+        let arrived = rider_pos
+            .zip(target)
+            .is_some_and(|(p, t)| in_arrive_radius(radius_m, p, t));
+        if !arrived {
+            return Err(ClaimError::OffsiteOp);
+        }
     }
     held.set_leg(Phase::ArrivedCustomer, 1);
     held.awaiting_ack = false;
@@ -771,7 +811,9 @@ pub fn deliver(
     order_id: OrderId,
 ) -> Result<Vec<SimEvent>, ClaimError> {
     let allow_violation = world.cfg.allow_rider_violation;
-    let (phase, human, progress) = {
+    let radius_m = world.cfg.arrive_radius_m;
+    let customer_pos = world.order(order_id).map(|o| o.customer_pos());
+    let (phase, human, progress, rider_pos) = {
         let rider = world.rider(rider_id).ok_or(ClaimError::RiderNotFound)?;
         let held = rider
             .held
@@ -782,6 +824,7 @@ pub fn deliver(
             held.phase,
             rider.kind == RiderKind::Human,
             held.leg_progress(),
+            rider.pos(),
         )
     };
     if phase != Phase::ArrivedCustomer {
@@ -792,7 +835,10 @@ pub fn deliver(
             return Err(ClaimError::WrongPhase);
         }
         if progress < OFFSITE_TOLERANCE && !allow_violation {
-            return Err(ClaimError::OffsiteOp);
+            let arrived = customer_pos.is_some_and(|t| in_arrive_radius(radius_m, rider_pos, t));
+            if !arrived {
+                return Err(ClaimError::OffsiteOp);
+            }
         }
     }
     let now = world.elapsed_min;
@@ -1382,6 +1428,91 @@ mod tests {
             h.remaining_min = 1;
         }
         arrive_shop(&mut w, rid, oid).expect("剩最后一小段不算违规");
+    }
+
+    /// 真实坐标已经落进取送半径，时间进度没走满也认「到了」。
+    #[test]
+    fn being_inside_the_arrive_radius_counts_as_arrived() {
+        let (mut w, rid, oid) = world_with_pending_assign(6);
+        let shop = w.order(oid).expect("单在").merchant_pos();
+        {
+            let r = w.rider_mut(rid).expect("骑手在");
+            r.kind = RiderKind::Human;
+            r.set_pos(shop);
+        }
+        arrive_shop(&mut w, rid, oid).expect("人已经站在店门口了");
+    }
+
+    /// 圈外照旧拒绝：半径不是给「人在别处」开后门。
+    #[test]
+    fn being_outside_the_arrive_radius_is_still_rejected() {
+        let (mut w, rid, oid) = world_with_pending_assign(6);
+        let shop = w.order(oid).expect("单在").merchant_pos();
+        {
+            let r = w.rider_mut(rid).expect("骑手在");
+            r.kind = RiderKind::Human;
+            // 往北挪 0.01 度 ≈ 1.1 公里，远在 100 米之外。
+            r.set_pos(LatLng::new(shop.lat + 0.01, shop.lng));
+        }
+        assert_eq!(
+            arrive_shop(&mut w, rid, oid).unwrap_err(),
+            ClaimError::OffsiteOp
+        );
+    }
+
+    /// 控制台填了出餐秒数的单，按**真实墙钟**出餐，不按模拟分钟。
+    #[test]
+    fn a_real_time_prep_order_finishes_on_the_wall_clock() {
+        let (mut w, rid, oid) = world_with_pending_assign(6);
+        let shop = w.order(oid).expect("单在").merchant_pos();
+        {
+            let r = w.rider_mut(rid).expect("骑手在");
+            r.kind = RiderKind::Human;
+            r.set_pos(shop);
+        }
+        if let Some(o) = w.order_mut(oid) {
+            o.prep_seconds = Some(30);
+        }
+        w.wall_ms = 1_000;
+        arrive_shop(&mut w, rid, oid).expect("人已经到店");
+
+        // 第 29 秒：还在等。
+        let mut evs = Vec::new();
+        crate::sim::tick::pump_waiting(&mut w, 30_000, &mut evs);
+        assert!(evs.is_empty(), "29 秒时不该出餐");
+        assert_eq!(
+            w.rider(rid).and_then(|r| r.held.first()).map(|h| h.phase),
+            Some(Phase::WaitingFood)
+        );
+
+        // 第 30 秒：出餐上路。
+        crate::sim::tick::pump_waiting(&mut w, 31_000, &mut evs);
+        assert_eq!(
+            w.rider(rid).and_then(|r| r.held.first()).map(|h| h.phase),
+            Some(Phase::ToCustomer),
+            "30 秒到了就该上路送货"
+        );
+        assert!(
+            matches!(evs.first(), Some(SimEvent::OrderPickedUp { .. })),
+            "要发一条取餐事件：{evs:?}"
+        );
+    }
+
+    /// 半径配 0 = 关闭这条放行理由，回到只看时间进度。
+    #[test]
+    fn a_zero_radius_disables_the_distance_rule() {
+        let (mut w, rid, oid) = world_with_pending_assign(6);
+        let shop = w.order(oid).expect("单在").merchant_pos();
+        w.cfg.arrive_radius_m = 0;
+        {
+            let r = w.rider_mut(rid).expect("骑手在");
+            r.kind = RiderKind::Human;
+            r.set_pos(shop);
+        }
+        assert_eq!(
+            arrive_shop(&mut w, rid, oid).unwrap_err(),
+            ClaimError::OffsiteOp
+        );
     }
 
     /// AI 骑手不受这条约束：它们本来就按 tick 自己走到位。

@@ -119,6 +119,8 @@ abstract final class ErrCode {
   static const assignForced = 'ASSIGN_FORCED';
   /// 今天已被强制下线（拒单额度用尽），不能再自己上线。
   static const forcedOffline = 'FORCED_OFFLINE';
+  /// 世界不在实时档：真人骑手必须和现实时间对齐，模拟加速档只跑 AI。
+  static const realtimeOnly = 'REALTIME_ONLY';
 
   /// 给用户看的短提示。未知码原样返回，方便发现契约漂移。
   static String humanize(String? code) => switch (code) {
@@ -136,6 +138,7 @@ abstract final class ErrCode {
         rejectLimitReached => '你今天拒绝已超出上限',
         assignForced => '强制派单不能拒绝',
         forcedOffline => '今天已被强制下线，明天再来',
+        realtimeOnly => '当前是模拟档，真人只能在实时档上线',
         noTask => '这一单没有附加任务',
         taskFinished => '任务已经做完了',
         notARider => '观战者不能跑单',
@@ -783,6 +786,7 @@ class ConfigView {
     required this.coordSystem,
     required this.fee,
     required this.insurancePerDayCents,
+    required this.arriveRadiusM,
   });
 
   final int speedMultiplier;
@@ -805,6 +809,8 @@ class ConfigView {
   /// 起步价以外的里程、等级、重投补贴都拿不到。
   final ConfigFeeRules fee;
   final int insurancePerDayCents;
+  /// 取送半径（米）：真实坐标进圈就能点到店 / 送达，0 = 关闭。
+  final int arriveRadiusM;
 
   factory ConfigView.fromJson(Map<String, dynamic> j) => ConfigView(
         speedMultiplier: reqInt(j['speed_multiplier'], 1),
@@ -823,6 +829,7 @@ class ConfigView {
         coordSystem: CoordSystem.parse(reqStr(j['coord_system'], 'gcj02')),
         fee: ConfigFeeRules.fromJson(asMap(j['fee'])),
         insurancePerDayCents: reqInt(j['insurance_per_day_cents']),
+        arriveRadiusM: reqInt(j['arrive_radius_m'], 100),
       );
 }
 

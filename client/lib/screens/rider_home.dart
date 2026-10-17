@@ -44,6 +44,9 @@ class _RiderHomePageState extends State<RiderHomePage> {
   /// 已经提示过的定位失败原因。
   String? _seenLocationError;
 
+  /// 上一次看到的在线状态：用来在上下线时弹一句。
+  bool? _onlineBefore;
+
   @override
   void initState() {
     super.initState();
@@ -76,6 +79,20 @@ class _RiderHomePageState extends State<RiderHomePage> {
       if (!mounted) return;
       showAppToast(err, bad: true);
     });
+  }
+
+  /// 上下线各弹一句。上线提醒是平台合规要求的那条；下线只说清楚状态。
+  ///
+  /// 首帧不弹（`_onlineBefore == null`）——进页面时本来就在线，没必要补一句。
+  void _watchOnline() {
+    final online = widget.state.me?.online;
+    if (online != null && _onlineBefore != null && online != _onlineBefore) {
+      showAppToast(
+        online ? '交警部门提醒：带好安全盔骑行不吃亏' : '已下线，注意休息',
+        bad: false,
+      );
+    }
+    _onlineBefore = online;
   }
 
   /// 定位出问题（没权限 / 系统定位没开）时当场说一声。
@@ -137,6 +154,7 @@ class _RiderHomePageState extends State<RiderHomePage> {
   /// 收到系统派单就弹确认界面。导航不能放在 build 里，推到下一帧。
   void _onState() {
     _complainOnce();
+    _watchOnline();
     _showRejectNotice();
 
     final id = widget.state.assignOrderId;

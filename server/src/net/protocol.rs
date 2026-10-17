@@ -248,6 +248,10 @@ pub enum ClientMessage {
         /// 上界在服务端夹取，免得手滑输个天文数字把流水玩坏。
         #[serde(default)]
         fee_cents: Option<i64>,
+        /// 出餐时间（秒）。缺省 30 秒，服务端夹到 5..3600。
+        /// 给了之后这单不再走「模拟分钟」出餐，而是按真实墙钟秒出餐。
+        #[serde(default)]
+        prep_seconds: Option<u32>,
     },
 
     /// 把某个骑手的钱包清零（余额、当日流水、罚款、保险、欠款、账单）。
@@ -363,6 +367,9 @@ pub struct ConfigPatch {
     /// 允许真人骑手做违规操作（未到位置就点到店 / 送达）。
     #[serde(default)]
     pub allow_rider_violation: Option<bool>,
+    /// 取送半径（米），0 = 关闭；夹到 0~2000。
+    #[serde(default)]
+    pub arrive_radius_m: Option<u32>,
     #[serde(default)]
     pub backorder_enabled: Option<bool>,
     /// 背单上限，1~5。

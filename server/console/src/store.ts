@@ -338,6 +338,8 @@ class ConsoleStore {
     customer_lat: number;
     customer_lng: number;
     fee_cents?: number;
+    /** 出餐时间（秒）。缺省由服务端补 30 秒，按真实墙钟出餐。 */
+    prep_seconds?: number;
   }) {
     this.send("create_order", fields);
   }

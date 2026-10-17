@@ -388,6 +388,13 @@ pub struct SimConfig {
     /// AI 骑手不受这条约束——它们按 tick 自己走，本来就没有抢先点的机会。
     #[serde(default)]
     pub allow_rider_violation: bool,
+    /// 取送半径（米）：真人骑手只要真实坐标已经落在这个圈里，就算
+    /// 「到了」——不必等这一段的时间进度走满。0 = 关闭半径判定。
+    ///
+    /// 与 [`Self::allow_rider_violation`] 是**并列**的两条放行理由，不是替代：
+    /// 关着违规开关时，站到门口照样能点；开着时无论在哪都能点。
+    #[serde(default = "default_arrive_radius_m")]
+    pub arrive_radius_m: u32,
     pub backorder_enabled: bool,
     pub max_orders_per_day: u32,
     /// 每天能拒掉多少张**系统指派**的单，0 = 不限。
@@ -414,6 +421,11 @@ pub struct SimConfig {
     /// 下发坐标的坐标系。内部世界状态永远是 GCJ-02，这里只决定出口转换。
     #[serde(default)]
     pub coord_system: CoordSystem,
+}
+
+/// 取送半径的默认值：100 米。老存档缺这个字段时也按它算。
+fn default_arrive_radius_m() -> u32 {
+    100
 }
 
 impl Default for SimConfig {
@@ -498,6 +510,8 @@ impl Default for SimConfig {
             allow_unrestricted: false,
             // 默认禁止：不到位置就点「到店 / 送达」是违规操作，得由控制端显式放行。
             allow_rider_violation: false,
+            // 100 米内算「到了」，覆盖 GPS 漂移与「车停马路对面」的现实误差。
+            arrive_radius_m: default_arrive_radius_m(),
             backorder_enabled: true,
             max_orders_per_day: 0,
             max_rejects_per_day: 6,
@@ -508,7 +522,9 @@ impl Default for SimConfig {
             sim_rider_count: 3,
             order_spawn_interval_min: 3,
             speed_multiplier: 1,
-            realtime: false,
+            // 真人骑手只能跑在实时档，而手机端是主玩法——默认就给实时。
+            // 想快进看 AI 演练，在烽火台切倍率档即可（会请真人下线）。
+            realtime: true,
             coord_system: CoordSystem::Gcj02,
         }
     }
@@ -599,6 +615,8 @@ mod tests {
     #[test]
     fn tick_interval_scales() {
         let mut c = SimConfig::default();
+        // 这条测的是倍率档的换算，先退出实时档。
+        c.realtime = false;
         assert_eq!(c.tick_interval_ms(), 1000);
         assert_eq!(c.claim_window_ticks(), 3);
         c.speed_multiplier = 60;
@@ -613,7 +631,8 @@ mod tests {
     #[test]
     fn realtime_mode_runs_one_sim_minute_per_real_minute() {
         let mut c = SimConfig::default();
-        assert!(!c.realtime, "默认真实时间是关的");
+        assert!(c.realtime, "默认真实时间是开的：真人骑手要贴着现实时间跑");
+        assert_eq!(c.tick_interval_ms(), REALTIME_TICK_MS);
 
         c.realtime = true;
         assert_eq!(c.tick_interval_ms(), REALTIME_TICK_MS);

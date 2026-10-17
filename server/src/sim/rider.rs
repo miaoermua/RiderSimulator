@@ -138,6 +138,11 @@ pub struct HeldOrder {
     pub back_order: bool,
     /// 等餐已经开始，记一下用于罚款判定。
     pub wait_started_min: u64,
+    /// 等餐开始的**真实墙钟毫秒**。实时出餐单（`Order::prep_seconds`）按它算秒。
+    ///
+    /// 0 = 还没记过（老存档 / 单测构造），这种单退回按模拟分钟推进。
+    #[serde(default)]
+    pub wait_started_wall_ms: u64,
     /// 等餐超时罚单是否已经开过（每单只罚一次）。
     pub wait_fined: bool,
     /// 到达顾客的时刻（`elapsed_min`）。`None` = 还没到门口。
@@ -173,6 +178,7 @@ impl HeldOrder {
             awaiting_ack: false,
             back_order,
             wait_started_min: now_min,
+            wait_started_wall_ms: 0,
             wait_fined: false,
             arrive_at_min: None,
             deliver_window_min: 0,

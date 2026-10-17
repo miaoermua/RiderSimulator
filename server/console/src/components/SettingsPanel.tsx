@@ -370,6 +370,19 @@ export function SettingsPanel() {
         disabled={!isControl}
         onChange={(v) => store.send("set_config", { allow_rider_violation: v })}
       />
+      <Row
+        label="取送半径（米）"
+        hint="真人坐标进圈就能点到店 / 送达；0 = 关闭。与上面的违规开关互不影响"
+      >
+        <InputNumber
+          min={0}
+          max={2000}
+          step={10}
+          disabled={!isControl}
+          value={c.arrive_radius_m}
+          onChange={(v) => v != null && store.send("set_config", { arrive_radius_m: v })}
+        />
+      </Row>
 
       {/* 事故率：档位基准率（0.5% / 4% / 22%）是文档定死的，倍率只管手感。
           默认 1.0 = 设计值，嫌吵就往左拉。 */}

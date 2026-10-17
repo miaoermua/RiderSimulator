@@ -59,6 +59,11 @@ use crate::sim::{
 };
 use crate::store::{ChatRecord, Store};
 
+/// 实时档的秒级节拍：主循环每 1 秒醒一次。
+const REALTIME_BEAT_MS: u64 = 1000;
+/// 一个模拟分钟有多少真实毫秒。
+const SIM_MINUTE_MS: u64 = 60_000;
+
 /// 服务端运行时选项。**与 `SimConfig` 分开**：这些是「服务器怎么跑」，
 /// 不是「模拟世界怎么算」。
 #[derive(Debug, Clone)]
@@ -375,7 +380,21 @@ impl App {
 
     /// 当前一个 tick 的现实时长。
     pub fn period(&self) -> Duration {
+        // 实时档：世界仍然一分钟一拍，但主循环改成 1 秒醒一次——
+        // 只有累计满 60 秒才推进世界，中间那些拍子用来按真实秒
+        // 推进「实时出餐」，30 秒的单不会等到下一个整分钟。
+        if self.world.cfg.realtime {
+            return Duration::from_millis(REALTIME_BEAT_MS);
+        }
         Duration::from_millis(self.world.cfg.tick_interval_ms().max(1))
+    }
+
+    /// 当前真实墙钟毫秒。只用于「实时出餐」这类必须贴着现实时间的判定。
+    fn wall_ms_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
     }
 
     /// 绑定端口 + 跑主循环。Ctrl-C 或监听失败时退出。
@@ -436,11 +455,27 @@ impl App {
 
         self.maybe_start_plan();
         let mut next = Instant::now() + self.period();
+        // 实时档下每 1 秒醒一次，攒够 60 秒才真正走一个世界 tick。
+        let mut realtime_acc_ms: u64 = 0;
 
         loop {
             tokio::select! {
                 _ = sleep_until(next) => {
-                    self.on_tick();
+                    if self.world.cfg.realtime {
+                        // 每秒一次：先把真人等餐按真实墙钟推进（不碰模拟时钟）。
+                        let mut events = Vec::new();
+                        tick::pump_waiting(&mut self.world, Self::wall_ms_now(), &mut events);
+                        if !events.is_empty() {
+                            self.publish(&events);
+                        }
+                        realtime_acc_ms += REALTIME_BEAT_MS;
+                        if realtime_acc_ms >= SIM_MINUTE_MS {
+                            realtime_acc_ms -= SIM_MINUTE_MS;
+                            self.on_tick();
+                        }
+                    } else {
+                        self.on_tick();
+                    }
                     next = Instant::now() + self.period();
                 }
                 Some(msg) = inbound.recv() => {
@@ -449,6 +484,7 @@ impl App {
                     // 处理完立刻重排下一次 tick，别让世界等旧的节拍。
                     if self.beat_reset {
                         self.beat_reset = false;
+                        realtime_acc_ms = 0;
                         next = Instant::now() + self.period();
                     }
                 }
@@ -471,6 +507,23 @@ impl App {
     // -----------------------------------------------------------------
     // tick
     // -----------------------------------------------------------------
+
+    /// 切回模拟档时把真人请下线：加速世界里「秒级出餐」与「真实 100 米」
+    /// 都失真。手上的单不动——人下线，单照常送完（与强制下线同一口径）。
+    fn kick_humans_offline(&mut self) {
+        let mut ids = Vec::new();
+        for r in &mut self.world.riders {
+            if r.kind == RiderKind::Human && r.online {
+                r.online = false;
+                ids.push(r.id);
+            }
+        }
+        for rid in ids {
+            if let Some(ev) = scheduler::state_event(&self.world, rid) {
+                self.outbox.push(ev);
+            }
+        }
+    }
 
     fn on_tick(&mut self) {
         // 暂停：倍率 0 时世界完全冻住，但网络照常收发（否则客户端会以为掉线）。
@@ -1974,6 +2027,7 @@ impl App {
                         // 选倍率档 = 退出实时档：两个模式互斥。
                         app.world.cfg.realtime = false;
                         app.paused_multiplier = m;
+                        app.kick_humans_offline();
                     }
                     app.beat_reset = true;
                     Some(json!({
@@ -2086,6 +2140,10 @@ impl App {
                 wall_minute,
             } => self.control(conn_id, role, "set_realtime", |app| {
                 app.world.cfg.realtime = enabled;
+                if !enabled {
+                    // 退回模拟档：真人不能留在加速世界里。
+                    app.kick_humans_offline();
+                }
                 let mut aligned = None;
                 if enabled {
                     // 对齐真实钟表：分钟数由控制端浏览器给（服务端不引时区库），
@@ -2199,6 +2257,7 @@ impl App {
                 customer_lat,
                 customer_lng,
                 fee_cents,
+                prep_seconds,
             } => {
                 if !valid_latlng(merchant_lat, merchant_lng)
                     || !valid_latlng(customer_lat, customer_lng)
@@ -2225,6 +2284,8 @@ impl App {
                             customer_lat: c.lat,
                             customer_lng: c.lng,
                             fee_cents,
+                            // 控制台没填就是 30 秒：真人骑手的默认出餐节奏。
+                            prep_seconds: Some(prep_seconds.unwrap_or(30)),
                         });
                         // 不等下一拍 tick：控制台点完「创建」就该在大厅看见它。
                         if let Some(order) = app.world.order(id) {
@@ -2416,6 +2477,10 @@ impl App {
         // 只影响真人当下的操作能不能生效，不需要回滚任何骑手状态。
         if let Some(v) = p.allow_rider_violation {
             cfg.allow_rider_violation = v;
+        }
+        // 半径同理：只影响之后的点到店 / 送达判定。
+        if let Some(v) = p.arrive_radius_m {
+            cfg.arrive_radius_m = v.min(2000);
         }
         if let Some(v) = p.backorder_enabled {
             cfg.backorder_enabled = v;

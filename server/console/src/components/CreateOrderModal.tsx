@@ -23,6 +23,11 @@ const FALLBACK_CENTER: [number, number] = [30.5077, 114.4154];
 const MIN_FEE_YUAN = 1;
 const MAX_FEE_YUAN = 2000;
 
+/** 出餐秒数的可填区间，与服务端 `clamp(5, 3600)` 一致。 */
+const DEFAULT_PREP_SEC = 30;
+const MIN_PREP_SEC = 5;
+const MAX_PREP_SEC = 3600;
+
 type End = "merchant" | "customer";
 
 /**
@@ -44,6 +49,7 @@ export function CreateOrderButton() {
   const [customerAddr, setCustomerAddr] = useState("");
   const [customer, setCustomer] = useState<[number, number]>(FALLBACK_CENTER);
   const [feeYuan, setFeeYuan] = useState<number | null>(null);
+  const [prepSec, setPrepSec] = useState<number | null>(DEFAULT_PREP_SEC);
   const [active, setActive] = useState<End>("merchant");
 
   const coord: CoordSystem = snap?.config.coord_system ?? "gcj02";
@@ -58,6 +64,7 @@ export function CreateOrderButton() {
     setCustomerName("");
     setCustomerAddr("");
     setFeeYuan(null);
+    setPrepSec(DEFAULT_PREP_SEC);
     setActive("merchant");
     setOpen(true);
   };
@@ -76,6 +83,10 @@ export function CreateOrderButton() {
       message.error(`金额要在 ${MIN_FEE_YUAN}~${MAX_FEE_YUAN} 元之间`);
       return;
     }
+    if (prepSec != null && (prepSec < MIN_PREP_SEC || prepSec > MAX_PREP_SEC)) {
+      message.error(`出餐时间要在 ${MIN_PREP_SEC}~${MAX_PREP_SEC} 秒之间`);
+      return;
+    }
     store.createOrder({
       merchant_name: name,
       merchant_lat: merchant[0],
@@ -85,6 +96,7 @@ export function CreateOrderButton() {
       customer_lat: customer[0],
       customer_lng: customer[1],
       ...(feeYuan != null ? { fee_cents: Math.round(feeYuan * 100) } : {}),
+      ...(prepSec != null ? { prep_seconds: Math.round(prepSec) } : {}),
     });
     setOpen(false);
   };
@@ -147,6 +159,19 @@ export function CreateOrderButton() {
           </Field>
           <Field label="顾客坐标">
             <CoordInputs value={customer} onChange={setCustomer} />
+          </Field>
+          <Field
+            label="出餐时间（秒）"
+            hint={`默认 ${DEFAULT_PREP_SEC}；真人到店后按真实秒出餐，${MIN_PREP_SEC}~${MAX_PREP_SEC}`}
+          >
+            <InputNumber
+              min={MIN_PREP_SEC}
+              max={MAX_PREP_SEC}
+              step={10}
+              precision={0}
+              value={prepSec}
+              onChange={(v) => setPrepSec(v ?? DEFAULT_PREP_SEC)}
+            />
           </Field>
           <Field label="金额（元）" hint={`${MIN_FEE_YUAN}~${MAX_FEE_YUAN}；留空 = 按计价规则`}>
             <InputNumber

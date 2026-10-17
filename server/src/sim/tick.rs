@@ -358,7 +358,7 @@ fn step_one(
     let weather = world.weather;
     let cfg = world.cfg.clone();
 
-    let (phase, remaining, awaiting, prep, needs_click, speed_mps, target) = {
+    let (phase, remaining, awaiting, prep, needs_click, _speed_mps, target) = {
         let Some(rider) = world.rider(rid) else {
             return;
         };
@@ -449,6 +449,17 @@ fn step_one(
             }
         }
         Phase::WaitingFood => {
+            // 实时出餐单（控制台可填秒，默认 30s）：秒级判定交给 `pump_waiting`，
+            // 这里不再按模拟分钟一格一格推进，否则 30 秒的单会被 tick 抢跑成 1 分钟。
+            let real_time_prep = world.order(oid).and_then(|o| o.prep_seconds).is_some()
+                && world
+                    .rider(rid)
+                    .and_then(|r| r.held.iter().find(|h| h.order_id == oid))
+                    // 没记到墙钟起点（老存档）就还是按分钟走，别把单卡死。
+                    .is_some_and(|h| h.wait_started_wall_ms > 0);
+            if world.rider(rid).is_some_and(|r| r.kind == RiderKind::Human) && real_time_prep {
+                return;
+            }
             // 等餐超时：超过出餐时间 10 分钟仍是罚单（设计：等餐超时 -2.00 元）
             let (waited, fined) = world
                 .rider(rid)
@@ -482,35 +493,7 @@ fn step_one(
                 return;
             }
             // 出餐完成 → 上路送货（骑行 + 顾客端步行往返，与 plan_for 同源）
-            let travel = world
-                .rider(rid)
-                .and_then(|r| world.order(oid).map(|o| ai::customer_leg_min(world, r, o)))
-                .unwrap_or_else(|| {
-                    // `distance_m` 已是路网距离，别再乘 ROAD_FACTOR（与 ai::customer_leg_min 同源）。
-                    let road_m = world.order(oid).map(|o| o.distance_m).unwrap_or(0) as f32;
-                    ((road_m / speed_mps.max(1.0) / 60.0).ceil() as u32).max(1)
-                });
-            if let Some(rider) = world.rider_mut(rid)
-                && let Some(h) = rider.held_mut(oid)
-            {
-                h.set_leg(Phase::ToCustomer, travel);
-                h.awaiting_ack = false;
-                h.wait_started_min = now;
-            }
-            // 出餐 = 生成送达腿。多单同店时第二条腿追加进同一串路线，
-            // 再按「就近优先」重排——这就是「一起送」的排序落点。
-            push_dropoff_leg(world, rid, oid, travel);
-            if let Some(order) = world.order_mut(oid) {
-                order.status = OrderStatus::PickedUp;
-                order.picked_up_at_min = Some(now);
-            }
-            events.push(SimEvent::OrderPickedUp {
-                order_id: oid,
-                rider_id: rid,
-                prep_minutes: prep,
-            });
-            // 上路这一刻掷风险
-            roll_leg_risk(world, rid, oid, events);
+            finish_waiting(world, rid, oid, prep, now, events);
         }
         Phase::ToCustomer => {
             if remaining > 1 {
@@ -656,16 +639,103 @@ fn enter_waiting_food(
     now: u64,
     events: &mut Vec<SimEvent>,
 ) {
+    // 先抄墙钟：下面要可变借 rider，不能再读 world。
+    let wall = world.wall_ms;
     if let Some(rider) = world.rider_mut(rid)
         && let Some(h) = rider.held_mut(oid)
     {
         h.set_leg(Phase::WaitingFood, prep.max(1));
         h.awaiting_ack = false;
         h.wait_started_min = now;
+        h.wait_started_wall_ms = wall;
         h.wait_fined = false;
     }
     if let Some(ev) = scheduler::state_event(world, rid) {
         events.push(ev);
+    }
+}
+
+/// 出餐完成 → 上路送货。分钟级 [`tick`] 与秒级 [`pump_waiting`] 共用。
+fn finish_waiting(
+    world: &mut World,
+    rid: RiderId,
+    oid: OrderId,
+    prep: u32,
+    now: u64,
+    events: &mut Vec<SimEvent>,
+) {
+    let travel = world
+        .rider(rid)
+        .and_then(|r| world.order(oid).map(|o| ai::customer_leg_min(world, r, o)))
+        .unwrap_or_else(|| {
+            // `distance_m` 已是路网距离，别再乘 ROAD_FACTOR（与 ai::customer_leg_min 同源）。
+            let road_m = world.order(oid).map(|o| o.distance_m).unwrap_or(0) as f32;
+            let speed_mps = world
+                .rider(rid)
+                .map(|r| r.speed_mps(&world.cfg, world.weather))
+                .unwrap_or(1.0);
+            ((road_m / speed_mps.max(1.0) / 60.0).ceil() as u32).max(1)
+        });
+    if let Some(rider) = world.rider_mut(rid)
+        && let Some(h) = rider.held_mut(oid)
+    {
+        h.set_leg(Phase::ToCustomer, travel);
+        h.awaiting_ack = false;
+        h.wait_started_min = now;
+    }
+    // 出餐 = 生成送达腿。多单同店时第二条腿追加进同一串路线，
+    // 再按「就近优先」重排——这就是「一起送」的排序落点。
+    push_dropoff_leg(world, rid, oid, travel);
+    if let Some(order) = world.order_mut(oid) {
+        order.status = OrderStatus::PickedUp;
+        order.picked_up_at_min = Some(now);
+    }
+    events.push(SimEvent::OrderPickedUp {
+        order_id: oid,
+        rider_id: rid,
+        prep_minutes: prep,
+    });
+    // 上路这一刻掷风险
+    roll_leg_risk(world, rid, oid, events);
+}
+
+/// 秒级出餐推进：只处理真人、且带 `prep_seconds` 的等餐单。
+///
+/// 世界时钟仍由 [`tick`] 推进；这里用**真实墙钟**判断「出餐时间到没到」，
+/// 不推进任何分钟级状态——所以 30 秒的单真的 30 秒出餐，不会被
+/// 「一 tick = 一模拟分钟」四舍五入成 1 分钟。
+///
+/// 暂停或速度归零时不动：世界冻住，真实秒也不该偷跑。
+pub fn pump_waiting(world: &mut World, wall_ms: u64, events: &mut Vec<SimEvent>) {
+    world.wall_ms = wall_ms;
+    if world.cfg.speed_multiplier == 0 {
+        return;
+    }
+    let now = world.elapsed_min;
+    // 先收集再改：判定只需要只读借用，动手时才拿可变借用。
+    let mut waiting: Vec<(RiderId, OrderId, u64)> = Vec::new();
+    for r in &world.riders {
+        if r.kind != RiderKind::Human {
+            continue;
+        }
+        for h in &r.held {
+            if h.phase == Phase::WaitingFood && h.wait_started_wall_ms > 0 {
+                waiting.push((r.id, h.order_id, h.wait_started_wall_ms));
+            }
+        }
+    }
+    let due: Vec<(RiderId, OrderId, u32)> = waiting
+        .into_iter()
+        .filter_map(|(rid, oid, started)| {
+            let secs = world.order(oid).and_then(|o| o.prep_seconds)?;
+            let waited_ms = wall_ms.saturating_sub(started);
+            (waited_ms >= secs as u64 * 1000).then_some((rid, oid, secs))
+        })
+        .collect();
+    for (rid, oid, secs) in due {
+        // 事件里的 `prep_minutes` 是分钟口径，秒级单向上取整到分钟。
+        let prep = secs.div_ceil(60).max(1);
+        finish_waiting(world, rid, oid, prep, now, events);
     }
 }
 
@@ -1255,6 +1325,7 @@ mod tests {
             customer_lat: shop.lat + 0.01,
             customer_lng: shop.lng,
             fee_cents: Some(20_000),
+            prep_seconds: None,
         });
 
         tick(&mut w, TickInput::default());

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../game_state.dart';
 import '../protocol.dart';
+import 'wallet_page.dart';
 
 /// 账单与战报：今日收入 + 昨日结算。
 class LedgerPage extends StatelessWidget {
@@ -12,7 +13,20 @@ class LedgerPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('账单与战报')),
+      appBar: AppBar(
+        title: const Text('账单与战报'),
+        actions: [
+          IconButton(
+            tooltip: '我的钱包',
+            icon: const Icon(Icons.account_balance_wallet_outlined),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => WalletPage(state: state),
+              ),
+            ),
+          ),
+        ],
+      ),
       body: AnimatedBuilder(
         animation: state,
         builder: (context, _) {

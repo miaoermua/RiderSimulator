@@ -17,6 +17,25 @@ class LogLine {
 
 enum LogKind { info, good, bad, money, chat }
 
+/// 钱包里的一条收支。金额单位是分，负数是支出（罚款 / 抽水）。
+class WalletEntry {
+  WalletEntry({
+    required this.at,
+    required this.title,
+    required this.cents,
+    required this.kind,
+  });
+
+  final DateTime at;
+  final String title;
+  final int cents;
+
+  /// `order` / `fine` / `activity` 之类的来源，只用来挑图标与颜色。
+  final String kind;
+
+  bool get income => cents >= 0;
+}
+
 /// 客户端世界状态。
 ///
 /// **这是 UI 的唯一数据源**：网络层只负责把帧喂给 [applyFrame]，
@@ -48,6 +67,10 @@ class GameState extends ChangeNotifier {
   List<OrderView> hall = [];
   List<OrderView> activeOrders = [];
   List<DayLedgerView> ledgers = const [];
+
+  /// 钱包流水（本地累积）。服务端只给日结汇总，没有逐笔明细接口，
+  /// 所以这里把每一笔 `rider_finance` 记下来；重连 / 重进 app 不清空。
+  final List<WalletEntry> walletEntries = [];
 
   /// 平台活动（含已下架的）。进行中的见 [runningActivities]。
   List<ActivityView> activities = const [];
@@ -422,7 +445,12 @@ class GameState extends ChangeNotifier {
       note(label, kind: LogKind.good);
       return;
     }
-    note(ErrCode.humanize(a.code), kind: LogKind.bad);
+    // 失败也要走「当场提示」通道：只写进通知列表，骑手按完按钮没反应会更懵。
+    // 到店 / 送达被拒、取送失败都在这里，首页靠 `errorSeq` 去重弹 toast。
+    final msg = ErrCode.humanize(a.code);
+    lastError = msg;
+    errorSeq++;
+    note(msg, kind: LogKind.bad);
   }
 
   /// 时钟类事件：把插值基准往前推。
@@ -566,8 +594,19 @@ class GameState extends ChangeNotifier {
   void _applyFinance(Map<String, dynamic> p) {
     final delta = reqInt(p['delta_cents']);
     if (optInt(p['rider_id']) != riderId) return;
+    final reason = reqStr(p['reason'], reqStr(p['kind']));
+    walletEntries.insert(
+      0,
+      WalletEntry(
+        at: DateTime.now(),
+        title: reason,
+        cents: delta,
+        kind: reqStr(p['kind'], 'other'),
+      ),
+    );
+    if (walletEntries.length > 300) walletEntries.removeLast();
     note(
-      '${delta >= 0 ? '+' : ''}${yuan(delta)} 元：${reqStr(p['reason'], reqStr(p['kind']))}',
+      '${delta >= 0 ? '+' : ''}${yuan(delta)} 元：$reason',
       kind: LogKind.money,
     );
     // 财务字段会随后续的 rider_state_changed 修正；本地先乐观累加。

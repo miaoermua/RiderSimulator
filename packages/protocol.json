@@ -110,6 +110,8 @@
         "claim_window_secs": "u32 (1..10)",
         "allow_speeding": "bool",
         "allow_unrestricted": "bool",
+        "allow_rider_violation": "bool 允许真人未到位置就点到店/送达",
+        "arrive_radius_m": "u32 (0..2000) 取送半径，真实坐标进圈即可点到店/送达；0=关闭",
         "backorder_enabled": "bool",
         "backorder_max": "u32 (1..5)",
         "discriminative_commission": "bool",

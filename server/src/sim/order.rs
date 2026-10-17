@@ -162,6 +162,10 @@ pub struct Order {
     pub urge_count: u32,
     /// 商家实际出餐耗时（分钟），到店后确定。
     pub prep_minutes: Option<u32>,
+    /// 实时出餐秒数。`Some` = 这单按**真实墙钟**出餐（控制台临时单用），
+    /// 真人骑手的等餐倒计时走秒，不再按模拟分钟一格一格跳。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prep_seconds: Option<u32>,
 }
 
 impl Order {
@@ -270,6 +274,7 @@ mod tests {
             task: None,
             urge_count: 0,
             prep_minutes: None,
+            prep_seconds: None,
         }
     }
 

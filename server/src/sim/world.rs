@@ -79,6 +79,9 @@ pub struct CustomOrderSpec {
     pub customer_lng: f64,
     /// 这张单的报价（分）。`Some` 时**直接**当最终报价，`None` 才按计价规则算。
     pub fee_cents: Option<i64>,
+    /// 出餐时间（秒）。`Some` = 到店后按真实墙钟等这么多秒出餐，
+    /// `None` 才走自然单的模拟分钟逻辑。
+    pub prep_seconds: Option<u32>,
 }
 
 /// 临时单报价的下界（1 元）：手滑输 0 会算出一张白跑的单。
@@ -124,6 +127,8 @@ pub struct ConfigView {
     pub allow_unrestricted: bool,
     /// 允许真人骑手未到位置就点到店 / 送达。
     pub allow_rider_violation: bool,
+    /// 取送半径（米）：真实坐标进圈即可点到店 / 送达，`0` = 关闭。
+    pub arrive_radius_m: u32,
     pub backorder_enabled: bool,
     pub backorder_max: u32,
     pub max_orders_per_day: u32,
@@ -209,6 +214,9 @@ pub struct World {
     pub sim_minute: u32,
     /// 自开局起算的单调分钟。**所有截止时间都用这个**（跨日不会回绕）。
     pub elapsed_min: u64,
+    /// 真实墙钟毫秒（由 app 层的秒级节拍写入）。只给「实时出餐」与
+    /// 「100 米半径」这类**真实时间 / 真实位置**判定用，不参与模拟时钟。
+    pub wall_ms: u64,
     pub riders: Vec<Rider>,
     pub orders: Vec<Order>,
     pub merchants: Vec<Merchant>,
@@ -245,6 +253,7 @@ impl World {
             day: 1,
             sim_minute: 6 * 60,
             elapsed_min: 0,
+            wall_ms: 0,
             riders: Vec::new(),
             orders: Vec::new(),
             merchants,
@@ -736,6 +745,7 @@ impl World {
             task,
             urge_count: 0,
             prep_minutes: None,
+            prep_seconds: None,
         });
         self.stats.orders_created += 1;
         Some(id)
@@ -847,6 +857,7 @@ impl World {
             task: None,
             urge_count: 0,
             prep_minutes: None,
+            prep_seconds: spec.prep_seconds.map(|s| s.clamp(5, 3600)),
         });
         self.stats.orders_created += 1;
         id
@@ -1027,6 +1038,7 @@ impl World {
             allow_speeding: self.cfg.allow_speeding,
             allow_unrestricted: self.cfg.allow_unrestricted,
             allow_rider_violation: self.cfg.allow_rider_violation,
+            arrive_radius_m: self.cfg.arrive_radius_m,
             backorder_enabled: self.cfg.backorder_enabled,
             backorder_max: self.cfg.backorder.max_held,
             max_orders_per_day: self.cfg.max_orders_per_day,
@@ -1329,6 +1341,7 @@ mod tests {
             customer_lat: 30.51,
             customer_lng: 114.41,
             fee_cents: None,
+            prep_seconds: None,
         });
         let o = w.order(id).expect("订单在");
         assert_eq!(o.merchant_name, known);
@@ -1362,6 +1375,7 @@ mod tests {
             customer_lat: 30.6,
             customer_lng: 114.5,
             fee_cents: fee,
+            prep_seconds: None,
         };
 
         let id = w.create_custom_order(spec(Some(1234)));

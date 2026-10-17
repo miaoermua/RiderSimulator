@@ -1,7 +1,7 @@
 name: rider_client
 description: 骑手模拟器 · 骑手端（Flutter）
 publish_to: "none"
-version: 0.2.1+3
+version: 0.2.3+4
 
 environment:
   sdk: ">=3.4.0 <4.0.0"

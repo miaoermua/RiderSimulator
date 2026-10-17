@@ -715,6 +715,7 @@ mod tests {
             customer_lat: shop.lat + 0.01,
             customer_lng: shop.lng,
             fee_cents: Some(20_000),
+            prep_seconds: None,
         });
         let res = batch_decide(&w, &[same], &[]);
         assert_eq!(res.len(), 1, "在店等餐的骑手该能顺手接同店单");
@@ -730,6 +731,7 @@ mod tests {
             customer_lat: shop.lat + 0.06,
             customer_lng: shop.lng,
             fee_cents: Some(20_000),
+            prep_seconds: None,
         });
         let res = batch_decide(&w, &[other], &[]);
         assert!(res.is_empty(), "不同商家的单不该塞给在店等餐的骑手");

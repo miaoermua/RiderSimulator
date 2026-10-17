@@ -210,6 +210,8 @@ export interface ConfigView {
   allow_unrestricted: boolean;
   /** 允许真人骑手做违规操作（没过到位置就点「到店 / 送达」）。 */
   allow_rider_violation: boolean;
+  /** 取送半径（米）：真实坐标进圈即可点到店 / 送达。0 = 关闭。 */
+  arrive_radius_m: number;
   backorder_enabled: boolean;
   backorder_max: number;
   max_orders_per_day: number;
