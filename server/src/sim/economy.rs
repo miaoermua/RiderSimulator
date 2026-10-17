@@ -295,6 +295,8 @@ pub fn close_day(cfg: &SimConfig, rider: &mut Rider) -> (i64, i64, i64, i64) {
     rider.insurance_cents = 0;
     rider.completed = 0;
     rider.rejected = 0;
+    // 新的一天，拒单额度重算，「强制下线」也跟着解除。
+    rider.forced_offline = false;
     // 跨天了，昨天那张还没确认的指派单不该继续挂着——不然今天的第一次
     // 拒单会被算成「拒绝一张昨天塞过来的单」，额度和提示都会对不上。
     rider.assign_pending = None;

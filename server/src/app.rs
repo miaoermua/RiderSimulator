@@ -1565,7 +1565,7 @@ impl App {
                 continue;
             };
 
-            match scheduler::assign_forced(&mut self.world, order_id, rider_id) {
+            match scheduler::assign_forced(&mut self.world, order_id, rider_id, item.mode) {
                 Ok(mut assignment) => {
                     if let Some(reason) = item
                         .reason
@@ -1639,7 +1639,7 @@ impl App {
                 continue;
             };
 
-            match scheduler::reassign(&mut self.world, order_id, rider_id) {
+            match scheduler::reassign(&mut self.world, order_id, rider_id, item.mode) {
                 Ok(mut out) => {
                     if let Some(reason) = item
                         .reason
@@ -2001,24 +2001,40 @@ impl App {
                     Some(json!({ "commission_rate": r }))
                 })
             }
-            M::ForceAssign { order_id, rider_id } => self.control(
-                conn_id,
-                role,
-                "force_assign",
-                |app| match scheduler::assign_forced(&mut app.world, order_id, rider_id) {
+            M::ForceAssign {
+                order_id,
+                rider_id,
+                mode,
+            } => self.control(conn_id, role, "force_assign", |app| {
+                match scheduler::assign_forced(&mut app.world, order_id, rider_id, mode) {
                     Ok(assignment) => {
                         let events = app.claim_events(&assignment);
                         app.outbox.extend(events);
-                        Some(json!({ "order_id": order_id, "rider_id": rider_id }))
+                        // 实际生效的方式可能被服务端纠正过（被强制下线的人只能收强制单），
+                        // 回执如实说，别让控制台以为指派成功的是「可拒」的那种。
+                        let actual = app
+                            .world
+                            .order(order_id)
+                            .and_then(|o| o.assign_mode)
+                            .unwrap_or(mode);
+                        Some(json!({
+                            "order_id": order_id,
+                            "rider_id": rider_id,
+                            "assign_mode": actual,
+                        }))
                     }
                     Err(e) => {
                         app.outbox_err = Some(e);
                         None
                     }
-                },
-            ),
-            M::Reassign { order_id, rider_id } => self.control(conn_id, role, "reassign", |app| {
-                match scheduler::reassign(&mut app.world, order_id, rider_id) {
+                }
+            }),
+            M::Reassign {
+                order_id,
+                rider_id,
+                mode,
+            } => self.control(conn_id, role, "reassign", |app| {
+                match scheduler::reassign(&mut app.world, order_id, rider_id, mode) {
                     Ok(out) => {
                         let events = app.reassign_events(&out);
                         app.outbox.extend(events);
@@ -2026,6 +2042,7 @@ impl App {
                             "order_id": order_id,
                             "from_rider_id": out.from_rider,
                             "rider_id": rider_id,
+                            "assign_mode": mode,
                         }))
                     }
                     Err(e) => {
@@ -2849,17 +2866,18 @@ impl App {
             .rider(assignment.rider)
             .map(|r| r.name.clone())
             .unwrap_or_default();
-        let (quoted, forced) = self
+        let (quoted, forced, assign_mode) = self
             .world
             .order(assignment.order)
-            .map(|o| (o.quoted_fee_cents(), o.forced))
-            .unwrap_or((0, false));
+            .map(|o| (o.quoted_fee_cents(), o.forced, o.assign_mode))
+            .unwrap_or((0, false, None));
         events.push(SimEvent::OrderClaimed {
             order_id: assignment.order,
             rider_id: assignment.rider,
             rider_name,
             quoted_fee_cents: quoted,
             forced,
+            assign_mode,
         });
         if let Some(ev) = scheduler::state_event(&self.world, assignment.rider) {
             events.push(ev);

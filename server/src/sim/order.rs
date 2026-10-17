@@ -43,6 +43,22 @@ impl OrderStatus {
     }
 }
 
+/// 平台派单的两种口径（控制端派单弹窗二选一）。
+///
+/// - [`AssignMode::Offer`]：指派单——骑手端弹确认页，可以拒绝，拒一次吃一格
+///   `max_rejects_per_day` 额度；
+/// - [`AssignMode::Forced`]：强制派单——只能点同意，服务端会挡回任何 `reject`。
+///
+/// 额度用尽被强制下线的骑手，之后收到的平台单**一律按 `Forced`** 处理
+/// （见 `scheduler::assign_forced`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignMode {
+    #[default]
+    Offer,
+    Forced,
+}
+
 /// 评分门槛分层（玩法设计 §8.3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -128,8 +144,15 @@ pub struct Order {
     pub surcharge_cents: i64,
     pub status: OrderStatus,
     pub assigned_to: Option<RiderId>,
-    /// 强制指派单（控制端指派，骑手端弹确认框）。
+    /// 平台派过来的单（控制端指派 / 改派），骑手端要弹确认框。
+    ///
+    /// 只表示「不是自己抢的」；能不能拒由 [`Order::assign_mode`] 决定。
     pub forced: bool,
+    /// 待确认期间是哪种派单：`offer` 可拒 / `forced` 只能同意。
+    ///
+    /// `None` = 不是平台派过来的（大厅抢的 / AI 派的 / 系统救单）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assign_mode: Option<AssignMode>,
     /// 背单（绕路顺带）。
     pub back_order: bool,
     pub back_order_bonus_cents: i64,
@@ -241,6 +264,7 @@ mod tests {
             status: OrderStatus::Pending,
             assigned_to: None,
             forced: false,
+            assign_mode: None,
             back_order: false,
             back_order_bonus_cents: 0,
             task: None,

@@ -730,6 +730,7 @@ impl World {
             status: OrderStatus::Pending,
             assigned_to: None,
             forced: false,
+            assign_mode: None,
             back_order: false,
             back_order_bonus_cents: 0,
             task,
@@ -840,6 +841,7 @@ impl World {
             status: OrderStatus::Pending,
             assigned_to: None,
             forced: false,
+            assign_mode: None,
             back_order: false,
             back_order_bonus_cents: 0,
             task: None,
@@ -866,6 +868,10 @@ impl World {
         // 次数封顶后不再增长：`count == MAX` 就是「该救单了」的稳定判据。
         o.redispatch_count = (o.redispatch_count + 1).min(MAX_REDISPATCH_ATTEMPTS);
         o.assigned_to = None;
+        // 回到大厅就是一张普通待抢单：派单方式的「待选择」状态不能跟着走，
+        // 否则下一次被抢走时客户端会以为还需要确认。
+        o.forced = false;
+        o.assign_mode = None;
         o.back_order = false;
         o.back_order_bonus_cents = 0;
 
@@ -897,6 +903,8 @@ impl World {
         };
         o.status = OrderStatus::Pending;
         o.assigned_to = None;
+        o.forced = false;
+        o.assign_mode = None;
         o.picked_up_at_min = None;
         o.claim_deadline_min = now + window;
         // 事故退单同理：骑手倒下不是下一任的错（见 `Order::renew_promise`）。

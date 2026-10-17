@@ -436,6 +436,12 @@ pub struct Rider {
     /// 订单就已经挂进 `held` 了，光看 `held` 分不出这两种情况。
     #[serde(default)]
     pub assign_pending: Option<OrderId>,
+    /// 今天因拒单额度用尽被强制下线。
+    ///
+    /// 与普通的 `online == false` 的区别：本人不能自己上线（`set_online` 会挡），
+    /// 平台要派单只能派强制单；日结清零。手上没送完的单不受影响。
+    #[serde(default)]
+    pub forced_offline: bool,
     /// 被拍冻结到（自开局起算的模拟分钟）。
     pub frozen_until_min: u64,
     /// 事故停工到。
@@ -495,6 +501,7 @@ impl Rider {
             insurance_cents: 0,
             debt_cents: 0,
             assign_pending: None,
+            forced_offline: false,
             rating: cfg.rating_rules.initial,
             level: 1,
             completed: 0,

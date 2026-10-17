@@ -271,6 +271,7 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
                 .map(|o| o.takehome_cents())
                 .unwrap_or(0),
             forced: false,
+            assign_mode: None,
         });
         if let Some(ev) = scheduler::state_event(world, a.rider) {
             events.push(ev);
@@ -1000,7 +1001,9 @@ mod tests {
             if same_shop {
                 continue;
             }
-            if scheduler::assign_forced(&mut w, oid, rid).is_ok() {
+            if scheduler::assign_forced(&mut w, oid, rid, crate::sim::order::AssignMode::Offer)
+                .is_ok()
+            {
                 picked.push(oid);
             }
         }
@@ -1221,7 +1224,8 @@ mod tests {
 
         w.generate_order_batch(1);
         let first = w.pending_orders()[0];
-        scheduler::assign_forced(&mut w, first, rid).expect("先塞一单给他");
+        scheduler::assign_forced(&mut w, first, rid, crate::sim::order::AssignMode::Offer)
+            .expect("先塞一单给他");
         // 到店倒计时压到 1 分钟，下一 tick 就到店进等餐。
         w.rider_mut(rid)
             .unwrap()

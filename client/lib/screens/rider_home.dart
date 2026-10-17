@@ -38,6 +38,9 @@ class _RiderHomePageState extends State<RiderHomePage> {
   /// 已经提示过第几条错误，避免同一条提示连着弹。
   int _seenErrorSeq = 0;
 
+  /// 已经弹过第几次「拒单结果」，重放事件时不重复弹。
+  int _seenRejectSeq = 0;
+
   /// 已经提示过的定位失败原因。
   String? _seenLocationError;
 
@@ -85,9 +88,56 @@ class _RiderHomePageState extends State<RiderHomePage> {
     showAppToast(err, bad: true);
   }
 
-  /// 收到系统指派就弹确认界面。导航不能放在 build 里，推到下一帧。
+  /// 每拒掉一单都明说「现在拒了几次」——额度只有这里看得见，
+  /// 藏在通知列表里等于没有。用序号驱动，重放旧事件不会重复弹。
+  void _showRejectNotice() {
+    final state = widget.state;
+    if (state.rejectNoticeSeq <= _seenRejectSeq) return;
+    _seenRejectSeq = state.rejectNoticeSeq;
+
+    final used = state.rejectNoticeUsed;
+    final limit = state.rejectNoticeLimit;
+    final left = state.rejectNoticeLeft;
+    final forcedOffline = state.rejectNoticeForcedOffline;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(forcedOffline ? '已被强制下线' : '已拒绝一单'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                limit > 0
+                    ? '今日已拒 $used/$limit 次，还剩 $left 次'
+                    : '今日已拒 $used 次（不限次数）',
+              ),
+              if (forcedOffline) ...[
+                const SizedBox(height: 10),
+                const Text(
+                  '拒单额度已用尽，今天不能再自己上线；手上的单照常送完，平台派的单一律按强制派单处理。',
+                  style: TextStyle(color: Colors.redAccent),
+                ),
+              ],
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('知道了'),
+            ),
+          ],
+        ),
+      );
+    });
+  }
+
+  /// 收到系统派单就弹确认界面。导航不能放在 build 里，推到下一帧。
   void _onState() {
     _complainOnce();
+    _showRejectNotice();
 
     final id = widget.state.assignOrderId;
     if (id == null) {
@@ -200,6 +250,11 @@ class _Title extends StatelessWidget {
   Widget build(BuildContext context) {
     final me = state.me;
     final online = me?.online ?? false;
+    // 被强制下线的人不能自己上线：顶栏直接说清楚，别让他反复点「上线」撞错误。
+    final forcedOffline = me?.forcedOffline ?? false;
+    final tone = forcedOffline
+        ? Colors.redAccent
+        : (online ? Colors.green : Colors.grey);
     final conn = switch (state.status) {
       ConnStatus.online => Colors.greenAccent,
       ConnStatus.connecting || ConnStatus.retrying => Colors.orangeAccent,
@@ -213,7 +268,7 @@ class _Title extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
           decoration: BoxDecoration(
-            color: (online ? Colors.green : Colors.grey).withValues(alpha: 0.12),
+            color: tone.withValues(alpha: 0.12),
             borderRadius: BorderRadius.circular(16),
           ),
           child: Row(
@@ -229,15 +284,17 @@ class _Title extends StatelessWidget {
               Icon(
                 online ? Icons.wifi_tethering : Icons.wifi_tethering_off,
                 size: 16,
-                color: online ? Colors.green : Colors.grey,
+                color: tone,
               ),
               const SizedBox(width: 4),
               Text(
-                me == null ? '观战' : (online ? '上线' : '下线'),
+                me == null
+                    ? '观战'
+                    : (forcedOffline ? '强制下线' : (online ? '上线' : '下线')),
                 style: TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
-                  color: online ? Colors.green : Colors.grey,
+                  color: tone,
                 ),
               ),
               if (me != null) const Icon(Icons.arrow_drop_down, size: 18),
@@ -259,13 +316,19 @@ class _Title extends StatelessWidget {
           children: [
             ListTile(
               title: const Text('出勤状态'),
-              subtitle: Text(me.online ? '现在在线，大厅的单可以抢' : '现在离线，接不到新单'),
+              subtitle: Text(me.forcedOffline
+                  ? '拒单额度已用尽，今天被强制下线'
+                  : (me.online ? '现在在线，大厅的单可以抢' : '现在离线，接不到新单')),
             ),
             const Divider(height: 1),
             ListTile(
-              leading: const Icon(Icons.wifi_tethering, color: Colors.green),
+              enabled: !me.forcedOffline,
+              leading: Icon(
+                Icons.wifi_tethering,
+                color: me.forcedOffline ? Colors.grey : Colors.green,
+              ),
               title: const Text('上线'),
-              subtitle: const Text('开始接单'),
+              subtitle: Text(me.forcedOffline ? '今天不能再上线，明天再来' : '开始接单'),
               trailing: me.online ? const Icon(Icons.check) : null,
               onTap: () {
                 Navigator.of(sheet).pop();

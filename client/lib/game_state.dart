@@ -164,7 +164,15 @@ class GameState extends ChangeNotifier {
 
   /// 待确认的指派单 id。非空时骑手端要弹出确认界面。
   int? assignOrderId;
+
+  /// 这一单的派单方式：`offer` = 指派单（可拒），`forced` = 强制派单（只能同意）。
+  ///
+  /// 单独存一份是因为推送比订单快照先到——[assignOrder] 可能还是旧的那份。
+  String? _assignMode;
   DateTime? _assignAt;
+
+  /// 当前待确认的是不是强制派单。
+  bool get assignForced => (_assignMode ?? assignOrder?.assignMode) == 'forced';
 
   /// 确认窗口。玩法设计 §4.3：30 秒内不确认则自动拒绝。
   ///
@@ -188,8 +196,9 @@ class GameState extends ChangeNotifier {
 
   /// 关闭指派单确认界面（接受或拒绝之后都要调）。
   void resolveAssign() {
-    if (assignOrderId == null && _assignAt == null) return;
+    if (assignOrderId == null && _assignAt == null && _assignMode == null) return;
     assignOrderId = null;
+    _assignMode = null;
     _assignAt = null;
     notifyListeners();
   }
@@ -204,6 +213,25 @@ class GameState extends ChangeNotifier {
 
   /// 拒单额度已用尽：系统塞来的指派单**拒不掉**，只能接下。
   bool get rejectQuotaExhausted => rejectQuotaLeft == 0;
+
+  // ---------------------------------------------------------------------
+  // 拒单结果弹窗
+  // ---------------------------------------------------------------------
+
+  /// 每拒掉一单 +1，首页靠它判断「是不是新的一次」，避免重复弹。
+  int rejectNoticeSeq = 0;
+  /// 这次拒单之后的已用次数 / 当日上限（0 = 不限）。
+  int rejectNoticeUsed = 0;
+  int rejectNoticeLimit = 0;
+  /// 这次拒单是否把额度用尽、当场被强制下线。
+  bool rejectNoticeForcedOffline = false;
+
+  /// 今日还剩几次额度（`null` = 不限），弹窗文案用。
+  int? get rejectNoticeLeft {
+    if (rejectNoticeLimit <= 0) return null;
+    final left = rejectNoticeLimit - rejectNoticeUsed;
+    return left < 0 ? 0 : left;
+  }
 
   // ---------------------------------------------------------------------
   // 通知
@@ -430,22 +458,27 @@ class GameState extends ChangeNotifier {
     final by = optInt(p['rider_id']);
     final mine = by != null && by == riderId;
     final forced = reqBool(p['forced']);
+    // 旧服务端没有这个字段：那时平台塞过来的单都是可拒的，按指派单处理。
+    final mode = p['assign_mode'] is String ? p['assign_mode'] as String : null;
     final idx = hall.indexWhere((o) => o.id == id);
     if (idx >= 0) {
       final old = hall.removeAt(idx);
       activeOrders.add(_copyOrder(old, status: OrderStatus.assigned, assignedTo: by));
     }
-    // 系统塞的单要骑手当面确认，先弹界面再算数。
-    //
-    // 额度已用尽时也照弹——那正是要让骑手看见「你今天拒绝已超出上限」小窗的
-    // 时刻；只是确认界面里「拒绝」会被禁掉，只剩接受（见 AssignOrderPage）。
-    if (mine && forced) {
+    // 平台派来的单要骑手当面确认，先弹界面再算数：
+    // 指派单可以拒（吃额度），强制派单只能同意。
+    if (mine && (mode != null || forced)) {
       assignOrderId = id;
+      _assignMode = mode ?? 'offer';
       _assignAt = DateTime.now();
     }
     note(
       mine
-          ? (forced ? '平台指派：${reqStr(p['rider_name'], '你')} 塞来一单' : '抢到了：${reqStr(p['rider_name'], '你')} → ${yuan(reqInt(p['quoted_fee_cents']))} 元')
+          ? switch (mode) {
+              'forced' => '强制派单：${reqStr(p['rider_name'], '你')} 塞来一单，只能同意',
+              'offer' => '指派单：${reqStr(p['rider_name'], '你')} 给你派了一单',
+              _ => '抢到了：${reqStr(p['rider_name'], '你')} → ${yuan(reqInt(p['quoted_fee_cents']))} 元',
+            }
           : '单 ${reqStr(p['rider_name'], '他人')} 抢走了',
       kind: mine ? LogKind.good : LogKind.info,
     );
@@ -456,11 +489,21 @@ class GameState extends ChangeNotifier {
     final id = reqInt(p['order_id']);
     final used = reqInt(p['used']);
     final limit = reqInt(p['limit']);
+    final forcedOffline = reqBool(p['forced_offline']);
     if (assignOrderId == id) resolveAssign();
     note(
       limit > 0 ? '拒单已记入额度：今日 $used/$limit' : '拒单已记入额度：今日 $used（不限）',
       kind: LogKind.info,
     );
+    // 每一次拒单都要让骑手看见「现在拒了几次」——这是额度的唯一反馈，
+    // 藏在通知列表里等于没有。用序号驱动首页弹窗，重放旧事件不会重复弹。
+    rejectNoticeUsed = used;
+    rejectNoticeLimit = limit;
+    rejectNoticeForcedOffline = forcedOffline;
+    rejectNoticeSeq++;
+    if (forcedOffline) {
+      note('拒单额度用尽，你已被强制下线', kind: LogKind.bad);
+    }
   }
 
   void _applyOrderPickedUp(Map<String, dynamic> p) {
@@ -655,6 +698,7 @@ class GameState extends ChangeNotifier {
         status: status ?? o.status,
         assignedTo: assignedTo ?? o.assignedTo,
         forced: o.forced,
+        assignMode: o.assignMode,
         backOrder: o.backOrder,
         urgeCount: o.urgeCount,
         prepMinutes: o.prepMinutes,
@@ -681,6 +725,7 @@ class GameState extends ChangeNotifier {
         rating: r.rating,
         completed: r.completed,
         rejectsToday: r.rejectsToday,
+        forcedOffline: r.forcedOffline,
         held: r.held,
         phase: r.phase,
         lat: lat ?? r.lat,

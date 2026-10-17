@@ -115,6 +115,10 @@ abstract final class ErrCode {
   static const offsiteOp = 'OFFSITE_OP';
   /// 今日拒单额度已用尽，这张指派单拒不掉了。
   static const rejectLimitReached = 'REJECT_LIMIT_REACHED';
+  /// 这是一张强制派单，本来就没有拒绝这个动作。
+  static const assignForced = 'ASSIGN_FORCED';
+  /// 今天已被强制下线（拒单额度用尽），不能再自己上线。
+  static const forcedOffline = 'FORCED_OFFLINE';
 
   /// 给用户看的短提示。未知码原样返回，方便发现契约漂移。
   static String humanize(String? code) => switch (code) {
@@ -130,6 +134,8 @@ abstract final class ErrCode {
         notAssignedToYou => '这不是你的订单',
         offsiteOp => '还没到位置，等骑到再点',
         rejectLimitReached => '你今天拒绝已超出上限',
+        assignForced => '强制派单不能拒绝',
+        forcedOffline => '今天已被强制下线，明天再来',
         noTask => '这一单没有附加任务',
         taskFinished => '任务已经做完了',
         notARider => '观战者不能跑单',
@@ -446,6 +452,7 @@ class OrderView {
     required this.status,
     required this.assignedTo,
     required this.forced,
+    required this.assignMode,
     required this.backOrder,
     required this.urgeCount,
     required this.prepMinutes,
@@ -476,6 +483,9 @@ class OrderView {
   final OrderStatus status;
   final int? assignedTo;
   final bool forced;
+  /// 平台派单方式：`offer` = 指派单（可拒），`forced` = 强制派单（只能同意）。
+  /// null = 不是平台派过来的（大厅抢的 / AI 派的）。
+  final String? assignMode;
   final bool backOrder;
   final int urgeCount;
   final int? prepMinutes;
@@ -521,6 +531,7 @@ class OrderView {
       status: OrderStatus.parse(reqStr(j['status'])),
       assignedTo: optInt(j['assigned_to']),
       forced: reqBool(j['forced']),
+      assignMode: j['assign_mode'] is String ? j['assign_mode'] as String : null,
       backOrder: reqBool(j['back_order']),
       urgeCount: reqInt(j['urge_count']),
       prepMinutes: optInt(j['prep_minutes']),
@@ -621,6 +632,7 @@ class RiderView {
     required this.rating,
     required this.completed,
     required this.rejectsToday,
+    required this.forcedOffline,
     required this.held,
     required this.phase,
     required this.lat,
@@ -645,6 +657,8 @@ class RiderView {
   final int completed;
   /// 今日已用掉的拒单次数（配合 [ConfigView.maxRejectsPerDay] 显示额度）。
   final int rejectsToday;
+  /// 今天因拒单额度用尽被强制下线：不能自己再上线，日结才解封。
+  final bool forcedOffline;
   final List<int> held;
   final RiderPhase? phase;
   final double lat;
@@ -681,6 +695,7 @@ class RiderView {
         rating: reqDouble(j['rating']),
         completed: reqInt(j['completed']),
         rejectsToday: reqInt(j['rejects_today']),
+        forcedOffline: reqBool(j['forced_offline']),
         held: j['held'] is List
             ? (j['held'] as List).whereType<num>().map((e) => e.toInt()).toList()
             : const [],

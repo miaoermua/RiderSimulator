@@ -108,8 +108,10 @@ class _OrderCardState extends State<OrderCard> {
                             ),
                             if (mode == OrderCardMode.assign ||
                                 order.forced) ...[
-                              const _Chip(
-                                  text: '平台指派', color: Colors.redAccent),
+                              _Chip(
+                                text: state.assignForced ? '强制派单' : '平台派单',
+                                color: Colors.redAccent,
+                              ),
                               const SizedBox(width: 6),
                             ],
                             _TierChip(tier: order.tier),
@@ -474,20 +476,21 @@ class _Actions extends StatelessWidget {
         );
 
       case OrderCardMode.assign:
-        // 额度用尽时这一单本来就不许拒。按钮挂着「拒不掉」而不是置灰：
-        // 点下去会弹中心通知把原因说清楚（见 AssignOrderPage._reject），
-        // 置灰的按钮只能让人猜。
+        // 强制派单没有「拒绝」这个动作：藏掉按钮，别给一个必然失败的操作。
+        // 指派单额度用尽时按钮挂着「拒不掉」而不是置灰：点下去会弹中心通知
+        // 把原因说清楚（见 AssignOrderPage._reject），置灰只能让人猜。
         final noQuota = state.rejectQuotaExhausted;
         return Wrap(
           spacing: 8,
           children: [
-            OutlinedButton(
-              onPressed: onReject,
-              child: Text(noQuota ? '拒不掉' : '拒绝'),
-            ),
+            if (!state.assignForced)
+              OutlinedButton(
+                onPressed: onReject,
+                child: Text(noQuota ? '拒不掉' : '拒绝'),
+              ),
             FilledButton(
               onPressed: onAccept,
-              child: const Text('接受'),
+              child: Text(state.assignForced ? '同意' : '接受'),
             ),
           ],
         );

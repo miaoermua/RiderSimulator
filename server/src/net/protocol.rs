@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sim::{OrderId, RiderId, geo::CoordSystem, rider::SpeedMode};
+use crate::sim::{OrderId, RiderId, geo::CoordSystem, order::AssignMode, rider::SpeedMode};
 
 /// 协议版本。客户端版本不一致时服务端拒绝并返回 `PROTOCOL_MISMATCH`。
 pub use crate::PROTOCOL_VERSION;
@@ -158,10 +158,19 @@ pub enum ClientMessage {
     },
     /// 调整平台抽水比例。
     SetCommissionRate { rate: f32 },
-    /// 强制指派。
+    /// 派单：把大厅里一张无主的单塞给某个骑手。
+    ///
+    /// `mode` 决定骑手端能不能拒：
+    /// - `offer`（默认，兼容旧控制台）：指派单，弹确认页，可拒，吃当日拒单额度；
+    /// - `forced`：强制派单，只能点同意，`reject` 会被服务端挡回。
+    ///
+    /// 被强制下线（拒单额度用尽）的骑手只能收 `forced`；即使这里传了 `offer`，
+    /// 服务端也会纠正成 `forced`，回执里的 `assign_mode` 是实际生效值。
     ForceAssign {
         order_id: OrderId,
         rider_id: RiderId,
+        #[serde(default)]
+        mode: AssignMode,
     },
     /// 改派：把**还没取到餐**的单从原骑手手上转给另一个骑手。
     ///
@@ -172,6 +181,9 @@ pub enum ClientMessage {
     Reassign {
         order_id: OrderId,
         rider_id: RiderId,
+        /// 与 [`ClientMessage::ForceAssign`] 同义：`offer` 可拒 / `forced` 只能同意。
+        #[serde(default)]
+        mode: AssignMode,
     },
     /// 开关 LLM 战术大脑。
     SetLlmEnabled { enabled: bool },

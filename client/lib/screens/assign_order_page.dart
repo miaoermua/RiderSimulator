@@ -9,9 +9,12 @@ import '../widgets/app_toast.dart';
 import '../widgets/delivery_map.dart';
 import '../widgets/order_card.dart';
 
-/// 弹出指派单确认界面：上半地图、下半订单卡。
+/// 弹出派单确认界面：上半地图、下半订单卡。
 ///
-/// 玩法设计 §4.3：控制端强制指派 → 骑手端弹确认框 → 30 秒内不确认自动拒绝。
+/// 玩法设计 §4.3：控制端派单 → 骑手端弹确认框 → 30 秒内不处理自动收尾。
+/// 两种口径共用这一页：
+/// - 指派单（`offer`）：可以拒绝，拒一次吃一格当日额度，30 秒不处理自动拒；
+/// - 强制派单（`forced`）：只能同意，30 秒不处理自动接下。
 Future<void> showAssignOrderPage(
   BuildContext context, {
   required GameState state,
@@ -65,9 +68,10 @@ class _AssignOrderPageState extends State<AssignOrderPage> {
       return;
     }
     if (state.assignRemainingMs <= 0) {
-      // 30 秒到点。额度用尽时「自动拒绝」根本发不出去，只能自动收下——
+      // 30 秒到点。强制派单没有拒绝这个动作，只能是「自动接下」；
+      // 指派单额度用尽时「自动拒绝」也发不出去，同样只能收下——
       // 不然骑手会卡在一张既拒不掉、又没确认的单上。
-      if (state.rejectQuotaExhausted) {
+      if (state.assignForced || state.rejectQuotaExhausted) {
         _accept(auto: true);
       } else {
         _reject(auto: true);
@@ -89,13 +93,24 @@ class _AssignOrderPageState extends State<AssignOrderPage> {
     final state = widget.state;
     final id = state.assignOrder?.id ?? state.assignOrderId;
     if (id != null) widget.client.acceptAssign(id);
-    if (auto) state.note('30 秒未确认，这单已自动接下', kind: LogKind.info);
+    if (auto) {
+      state.note(
+        state.assignForced ? '30 秒未确认，强制派单已自动接下' : '30 秒未确认，这单已自动接下',
+        kind: LogKind.info,
+      );
+    }
     state.resolveAssign();
     Navigator.of(context).maybePop();
   }
 
   void _reject({bool auto = false}) {
     final state = widget.state;
+    if (state.assignForced) {
+      // 按钮已经藏了，这里兜住误触 / 旧状态：说清楚为什么拒不了。
+      state.note('强制派单不能拒绝', kind: LogKind.bad);
+      showAppToast('强制派单不能拒绝', bad: true);
+      return;
+    }
     if (state.rejectQuotaExhausted) {
       // 服务端一定会挡回来，就地提示比让骑手以为拒成功了强。
       state.note('你今天拒绝已超出上限', kind: LogKind.bad);
@@ -117,7 +132,7 @@ class _AssignOrderPageState extends State<AssignOrderPage> {
         final order = widget.state.assignOrder;
         return Scaffold(
           appBar: AppBar(
-            title: const Text('平台指派单'),
+            title: Text(widget.state.assignForced ? '强制派单' : '指派单'),
             leading: IconButton(
               tooltip: '稍后处理',
               onPressed: () => Navigator.of(context).maybePop(),
@@ -137,14 +152,19 @@ class _AssignOrderPageState extends State<AssignOrderPage> {
                       child: ListView(
                         padding: const EdgeInsets.only(top: 4, bottom: 12),
                         children: [
-                          const Padding(
-                            padding: EdgeInsets.fromLTRB(14, 10, 14, 0),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(14, 10, 14, 0),
                             child: Text(
-                              '系统把这一单指派给你，确认后即刻生效。',
-                              style: TextStyle(fontSize: 12, color: Colors.grey),
+                              widget.state.assignForced
+                                  ? '这是强制派单，只能同意；30 秒不处理会自动接下。'
+                                  : '这是指派单，可以拒绝（消耗一次当日额度）；30 秒不处理会自动拒单。',
+                              style: const TextStyle(
+                                  fontSize: 12, color: Colors.grey),
                             ),
                           ),
-                          _QuotaBanner(state: widget.state),
+                          // 强制派单没有拒绝权，额度条对他没有意义。
+                          if (!widget.state.assignForced)
+                            _QuotaBanner(state: widget.state),
                           OrderCard(
                             order: order,
                             state: widget.state,

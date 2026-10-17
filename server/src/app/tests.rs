@@ -515,6 +515,7 @@ fn rider_accept_assign_clears_the_pending_flag() {
         ClientMessage::ForceAssign {
             order_id: oid,
             rider_id: rid,
+            mode: crate::sim::order::AssignMode::Offer,
         },
     );
     drain(&mut ctrl);
@@ -532,6 +533,91 @@ fn rider_accept_assign_clears_the_pending_flag() {
     send(&mut app, 2, ClientMessage::AcceptAssign { order_id: oid });
     let v = drain(&mut rider_rx);
     assert_eq!(ack(&v)["payload"]["ok"].as_bool(), Some(true));
+}
+
+/// 强制派单没有「拒绝」这个动作：服务端挡回，状态原样保留；
+/// 指派单则照常能拒（吃一次额度）。
+#[test]
+fn forced_assign_cannot_be_rejected_but_offer_can() {
+    let mut app = control_app();
+    let (mut ctrl, _) = hello(&mut app, 1, None);
+    drain(&mut ctrl);
+    let rid = app.world.sim_rider_ids()[0];
+    let (mut rider_rx, _) = hello(&mut app, 2, Some(&rider_token(rid)));
+    drain(&mut rider_rx);
+
+    let forced_oid = app.world.generate_order_batch(1)[0];
+    send(
+        &mut app,
+        1,
+        ClientMessage::ForceAssign {
+            order_id: forced_oid,
+            rider_id: rid,
+            mode: crate::sim::order::AssignMode::Forced,
+        },
+    );
+    let ctrls = drain(&mut ctrl);
+    assert_eq!(
+        event(&ctrls, "order_claimed").expect("要看到抢单")["payload"]["assign_mode"].as_str(),
+        Some("forced"),
+        "控制台要能分清这是强制派单"
+    );
+
+    send(
+        &mut app,
+        2,
+        ClientMessage::Reject {
+            order_id: forced_oid,
+        },
+    );
+    let v = drain(&mut rider_rx);
+    let a = ack(&v);
+    assert_eq!(a["payload"]["ok"].as_bool(), Some(false));
+    assert_eq!(a["payload"]["code"].as_str(), Some("ASSIGN_FORCED"));
+    assert_eq!(a["payload"]["message"].as_str(), Some("强制派单不能拒绝"));
+    let r = app.world.rider(rid).expect("骑手在");
+    assert_eq!(r.assign_pending, Some(forced_oid), "拒绝失败不能摘掉待确认");
+    assert_eq!(r.rejected, 0, "被挡回的拒绝不计额度");
+    assert_eq!(
+        app.world.order(forced_oid).expect("订单在").status,
+        OrderStatus::Assigned,
+        "拒不掉就等于接下了"
+    );
+
+    // 同一骑手的下一张派成指派单，就能正常拒。
+    let offer_oid = app.world.generate_order_batch(1)[0];
+    send(
+        &mut app,
+        1,
+        ClientMessage::ForceAssign {
+            order_id: offer_oid,
+            rider_id: rid,
+            mode: crate::sim::order::AssignMode::Offer,
+        },
+    );
+    drain(&mut ctrl);
+    send(
+        &mut app,
+        2,
+        ClientMessage::Reject {
+            order_id: offer_oid,
+        },
+    );
+    let v = drain(&mut rider_rx);
+    assert_eq!(ack(&v)["payload"]["ok"].as_bool(), Some(true));
+    let ev = event(&v, "assign_rejected").expect("拒单要进事件流");
+    assert_eq!(ev["payload"]["used"].as_u64(), Some(1));
+    assert_eq!(ev["payload"]["forced_offline"].as_bool(), Some(false));
+    assert_eq!(
+        app.world.rider(rid).expect("骑手在").rejected,
+        1,
+        "指派单拒掉要吃额度"
+    );
+    assert_eq!(
+        app.world.order(offer_oid).expect("订单在").status,
+        OrderStatus::Pending,
+        "拒掉要回大厅"
+    );
 }
 
 #[test]
@@ -569,6 +655,7 @@ fn reject_limit_round_trips_through_config_and_the_wire() {
             ClientMessage::ForceAssign {
                 order_id: oid,
                 rider_id: rid,
+                mode: crate::sim::order::AssignMode::Offer,
             },
         );
         drain(&mut ctrl);
@@ -592,6 +679,7 @@ fn reject_limit_round_trips_through_config_and_the_wire() {
         ClientMessage::ForceAssign {
             order_id: oid,
             rider_id: rid,
+            mode: crate::sim::order::AssignMode::Offer,
         },
     );
     drain(&mut ctrl);
@@ -599,17 +687,23 @@ fn reject_limit_round_trips_through_config_and_the_wire() {
     let v = drain(&mut rider_rx);
     let a = ack(&v);
     assert_eq!(a["payload"]["ok"].as_bool(), Some(false));
-    assert_eq!(a["payload"]["code"].as_str(), Some("REJECT_LIMIT_REACHED"));
-    assert_eq!(
-        a["payload"]["message"].as_str(),
-        Some("你今天拒绝已超出上限")
-    );
-    // 拒不掉就等于接下了：单还在骑手身上，待确认标记被摘掉，
-    // 但额度不许再涨（这是「失败」的一面）。
+    // 额度满的那一刻人已经被强制下线了，后续平台单只能是强制派单：
+    // 不是「额度挡住拒绝」，而是「强制单根本没有拒绝这个动作」。
+    assert_eq!(a["payload"]["code"].as_str(), Some("ASSIGN_FORCED"));
+    assert_eq!(a["payload"]["message"].as_str(), Some("强制派单不能拒绝"));
     let r = app.world.rider(rid).expect("骑手在");
     assert!(r.is_holding(oid), "拒不掉 = 归他，单不能跑");
-    assert_eq!(r.assign_pending, None, "要摘掉待确认，别让他卡死");
+    // 这单是**强制派单**，待确认标记得留着——他还要点「同意」（或等 30 秒自动接下）。
+    assert_eq!(r.assign_pending, Some(oid), "强制单的确认框不能自己消失");
     assert_eq!(r.rejected, 3, "被挡下的尝试不计入额度");
+    assert!(r.forced_offline, "拒满额度要强制下线");
+    assert!(!r.online, "被强制下线的人不该在线");
+
+    // 今天不许自己上线：错误码要能让手机端说清原因。
+    send(&mut app, 2, ClientMessage::SetOnline { online: true });
+    let v = drain(&mut rider_rx);
+    let a = ack(&v);
+    assert_eq!(a["payload"]["code"].as_str(), Some("FORCED_OFFLINE"));
 }
 
 #[test]

@@ -4,6 +4,7 @@ import {
   isLlmSource,
   type AccountJoin,
   type AccountList,
+  type AssignMode,
   type ActivityView,
   type AiOpBrief,
   type AiState,
@@ -358,8 +359,8 @@ class ConsoleStore {
    * 所以按钮只在那一档出现（见 `OrdersPanel`），这里不做兜底判断——
    * 前端和后端各判一次、判得还不一样，是更难查的那种 bug。
    */
-  reassign(orderId: number, riderId: number) {
-    this.send("reassign", { order_id: orderId, rider_id: riderId });
+  reassign(orderId: number, riderId: number, mode: AssignMode = "offer") {
+    this.send("reassign", { order_id: orderId, rider_id: riderId, mode });
   }
 
   // ---------------- 骑手账号（HTTP） ----------------
@@ -548,7 +549,16 @@ class ConsoleStore {
       }
       case "order_claimed": {
         const c = p as EventPayloads["order_claimed"];
-        this.log(`#${c.order_id} 被 ${c.rider_name} ${c.forced ? "强制指派" : "抢到"}（${yuan(c.quoted_fee_cents)}）`);
+        // 三种来源要分开念：抢的、站长派的指派单、站长派的强制单。
+        const how =
+          c.assign_mode === "forced"
+            ? "强制派单接下"
+            : c.assign_mode === "offer"
+              ? "接受指派单"
+              : c.forced
+                ? "平台派单接下"
+                : "抢到";
+        this.log(`#${c.order_id} 被 ${c.rider_name} ${how}（${yuan(c.quoted_fee_cents)}）`);
         break;
       }
       case "order_reassigned": {
@@ -571,7 +581,12 @@ class ConsoleStore {
         const r = p as EventPayloads["assign_rejected"];
         // 上限 0 = 不限，别把它念成「0/0」。
         const quota = r.limit === 0 ? "不限" : `${r.used}/${r.limit}`;
-        this.log(`骑手 #${r.rider_id} 拒掉指派单 #${r.order_id}（今日 ${quota}）`);
+        this.log(
+          `骑手 #${r.rider_id} 拒掉指派单 #${r.order_id}（今日 ${quota}）` +
+            (r.forced_offline ? "，额度用尽已被强制下线" : ""),
+          r.forced_offline ? "强制下线" : undefined,
+          r.forced_offline ? "red" : undefined,
+        );
         break;
       }
       case "order_picked_up": {

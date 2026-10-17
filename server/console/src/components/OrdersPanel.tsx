@@ -1,9 +1,10 @@
-import { Badge, Empty, List, Select, Space, Typography } from "antd";
+import { Badge, Empty, List, Space, Typography } from "antd";
 import { STATUS_LABEL } from "../const";
 import { useIsControl, useStore } from "../hooks";
 import type { Order, RiderBrief } from "../protocol";
-import { store, yuan } from "../store";
+import { yuan } from "../store";
 import { CreateOrderButton } from "./CreateOrderModal";
+import { DispatchButton } from "./DispatchModal";
 import { Metric, MetricRow } from "./Metric";
 
 /**
@@ -18,7 +19,6 @@ export function OrdersPanel() {
 
   if (!snap) return <Empty style={{ marginTop: 48 }} description="等待快照…" />;
 
-  const candidates = snap.riders.filter((r) => r.online && !r.injured && !r.frozen);
   const nameOf = (id: number | null) =>
     id == null ? "-" : (snap.riders.find((r) => r.id === id)?.name ?? `#${id}`);
 
@@ -62,18 +62,16 @@ export function OrdersPanel() {
               }
             />
             {isControl && (
-              <Select
-                style={{ width: "100%", marginTop: 8 }}
-                showSearch
-                optionFilterProp="label"
-                placeholder="指派给…"
-                value={null}
-                options={candidates.map((r) => ({
-                  value: r.id,
-                  label: `${r.name}（${r.held.length} 单）`,
-                }))}
-                onChange={(v) => store.send("force_assign", { order_id: o.id, rider_id: v })}
-              />
+              <div style={{ marginTop: 8 }}>
+                {/* 先选口径再选人：指派单可拒、强制派单只能同意，下发前就得说清。 */}
+                <DispatchButton
+                  order={o}
+                  riders={snap.riders}
+                  limit={snap.config.max_rejects_per_day}
+                  kind="assign"
+                  label="派单"
+                />
+              </div>
             )}
           </List.Item>
         )}
@@ -97,7 +95,16 @@ export function OrdersPanel() {
               }
               description={<ActiveMeta order={o} rider={nameOf(o.assigned_to)} />}
             />
-            {isControl && <ReassignSelect order={o} candidates={candidates} rider={nameOf(o.assigned_to)} />}
+            {isControl && (
+              <div style={{ marginTop: 8 }}>
+                <ReassignAction
+                  order={o}
+                  riders={snap.riders}
+                  limit={snap.config.max_rejects_per_day}
+                  rider={nameOf(o.assigned_to)}
+                />
+              </div>
+            )}
           </List.Item>
         )}
       />
@@ -131,7 +138,10 @@ function ActiveMeta({ order: o, rider }: { order: Order; rider: string }) {
       <Metric>{(o.distance_m / 1000).toFixed(1)}km</Metric>
       <Metric>到手 ¥{yuan(o.fee.takehome_cents + o.surcharge_cents)}</Metric>
       {o.redispatch_count > 0 && <Metric>重投 {o.redispatch_count} 次</Metric>}
-      {o.forced && <Metric>强制</Metric>}
+      {/* 待确认时按口径区分；确认之后 `assign_mode` 就没了，只剩「平台派过」。 */}
+      {o.assign_mode === "forced" && <Metric>强制派单</Metric>}
+      {o.assign_mode === "offer" && <Metric>指派单</Metric>}
+      {!o.assign_mode && o.forced && <Metric>平台派单</Metric>}
       {o.back_order && <Metric>背单</Metric>}
       {o.urge_count ? <Metric>催 {o.urge_count}</Metric> : null}
     </MetricRow>
@@ -139,39 +149,35 @@ function ActiveMeta({ order: o, rider }: { order: Order; rider: string }) {
 }
 
 /**
- * 改派下拉框。
+ * 改派入口。
  *
  * 只在「已指派、还没取货」时出现：`assigned` 覆盖「去店路上」和「店里等餐」两段，
  * 这两段里餐还在商家手里，站长才有得调。一旦取到餐（`picked_up`），保温与餐损
  * 都随原骑手走，服务端会回 `WRONG_PHASE`——所以这里干脆不画，
  * 免得用户点出一个必然失败的动作。
  *
- * 候选里剔掉现任骑手：改派给自己不是改派（服务端回 `ALREADY_CLAIMED`）。
+ * 改派和派单共用同一个弹窗：新骑手同样要选「指派单 / 强制派单」。
  */
-function ReassignSelect({
+function ReassignAction({
   order,
-  candidates,
+  riders,
+  limit,
   rider,
 }: {
   order: Order;
-  candidates: RiderBrief[];
+  riders: RiderBrief[];
+  limit: number;
   rider: string;
 }) {
   if (order.status !== "assigned" || order.assigned_to == null) return null;
-  const options = candidates.filter((r) => r.id !== order.assigned_to);
-  if (options.length === 0) return null;
-
   return (
-    <Select
-      style={{ width: "100%", marginTop: 8 }}
-      showSearch
-      optionFilterProp="label"
-      placeholder={`改派给…（${rider} 还没取餐）`}
-      value={null}
-      options={options.map((r) => ({ value: r.id, label: `${r.name}（${r.held.length} 单）` }))}
-      // 这个下拉框永远显示占位符（`value={null}`），所以泛型被推成 `null`，
-      // 参数类型得自己写宽一点，否则 `null` 塞不进 `number`。
-      onChange={(v: number | null) => v != null && store.reassign(order.id, v)}
+    <DispatchButton
+      order={order}
+      riders={riders}
+      limit={limit}
+      kind="reassign"
+      fromName={rider}
+      label="改派"
     />
   );
 }

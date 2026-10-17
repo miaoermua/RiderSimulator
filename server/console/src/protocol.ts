@@ -51,6 +51,14 @@ export type BrainSource = "llm" | "cache" | "disabled" | "throttled" | "fallback
 /** 坐标系。方案 A：服务端内部保持 GCJ-02，只在下发快照时按需转换。 */
 export type CoordSystem = "gcj02" | "wgs84";
 
+/**
+ * 平台派单方式。
+ *
+ * - `offer`：指派单——骑手端弹确认，可以拒绝，拒一次吃一格当日额度；
+ * - `forced`：强制派单——只能点同意，服务端会挡回任何拒绝。
+ */
+export type AssignMode = "offer" | "forced";
+
 /** 路线任务里的一腿。`held` 只说手上有哪几张单，看不出先后，这里才有顺序。 */
 export interface RouteLegBrief {
   order_id: number;
@@ -75,6 +83,8 @@ export interface RiderBrief {
   completed: number;
   /** 今日已用掉的拒单次数。配合 `ConfigView.max_rejects_per_day` 显示额度。 */
   rejects_today: number;
+  /** 今日因拒单额度用尽被强制下线：不能自己再上线，次日日结才解封。 */
+  forced_offline: boolean;
   held: number[];
   /** 路线任务：队首是当前腿，走完出队。旧存档 / 没接单的骑手是空数组。 */
   route: RouteLegBrief[];
@@ -154,7 +164,10 @@ export interface Order {
   surcharge_cents: number;
   status: OrderStatus;
   assigned_to: number | null;
+  /** 平台派过来的单。 */
   forced: boolean;
+  /** 待确认期间的派单方式：`offer` 可拒 / `forced` 只能同意；null = 不是平台派来的。 */
+  assign_mode: AssignMode | null;
   back_order: boolean;
   task: ExtraTask | null;
   urge_count: number;
@@ -459,6 +472,8 @@ export interface EventPayloads {
     rider_name: string;
     quoted_fee_cents: number;
     forced: boolean;
+    /** 派单方式；`offer` 可拒、`forced` 只能同意。不传 = 本人抢的 / AI 派的。 */
+    assign_mode?: AssignMode;
   };
   order_expired: { order_id: number };
   /**
@@ -483,6 +498,8 @@ export interface EventPayloads {
     used: number;
     /** 上限；`0` = 不限。 */
     limit: number;
+    /** 这次拒单是否把额度用尽、当场被强制下线。 */
+    forced_offline: boolean;
   };
   order_picked_up: { order_id: number; rider_id: number; prep_minutes: number };
   order_delivered: {

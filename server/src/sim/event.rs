@@ -11,7 +11,7 @@ use super::notice::Notice;
 use super::{
     OrderId, RiderId,
     config::SimConfig,
-    order::Order,
+    order::{AssignMode, Order},
     rider::{Phase, Rider, RiderKind, SpeedMode},
     route::LegKind,
     weather::Weather,
@@ -66,6 +66,8 @@ pub struct RiderBrief {
     pub completed: u32,
     /// 今日已用掉的拒单次数。配合 `ConfigView::max_rejects_per_day` 显示额度。
     pub rejects_today: u32,
+    /// 今天是否因拒单额度用尽被强制下线（不能自己再上线）。
+    pub forced_offline: bool,
     pub held: Vec<OrderId>,
     /// 路线任务：队首是当前腿，走完出队（见 [`RouteLegBrief`]）。
     pub route: Vec<RouteLegBrief>,
@@ -107,6 +109,7 @@ impl RiderBrief {
             rating: r.rating,
             completed: r.completed,
             rejects_today: r.rejected,
+            forced_offline: r.forced_offline,
             held: r.held_ids(),
             route: route_brief(r),
             phase,
@@ -268,6 +271,10 @@ pub enum SimEvent {
         rider_name: String,
         quoted_fee_cents: i64,
         forced: bool,
+        /// 派单方式：`offer`（可拒）/ `forced`（只能同意）。
+        /// `None` = 不是平台派过来的（本人抢的 / AI 派的）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        assign_mode: Option<AssignMode>,
     },
     /// 改派：把**还没取到餐**的单从一个骑手手上转给另一个骑手（控制端动作）。
     ///
@@ -297,6 +304,8 @@ pub enum SimEvent {
         used: u32,
         /// 当日额度上限，`0` = 不限。
         limit: u32,
+        /// 这次拒单是否把额度用尽、当场被强制下线。
+        forced_offline: bool,
     },
     OrderPickedUp {
         order_id: OrderId,

@@ -691,7 +691,8 @@ mod tests {
 
         w.generate_order_batch(1);
         let first = w.pending_orders()[0];
-        scheduler::assign_forced(&mut w, first, rid).expect("强制指派该成功");
+        scheduler::assign_forced(&mut w, first, rid, crate::sim::order::AssignMode::Offer)
+            .expect("强制指派该成功");
 
         let shop = w.order(first).unwrap().merchant_pos();
         let shop_name = w.order(first).unwrap().merchant_name.clone();

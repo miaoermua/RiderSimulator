@@ -241,6 +241,12 @@ pub struct DispatchItem {
     /// 派单理由，会进控制台的事件流。缺省用服务端的默认文案。
     #[serde(default)]
     pub reason: Option<String>,
+    /// 派单方式：`offer`（指派单，可拒，默认）/ `forced`（强制派单，只能同意）。
+    ///
+    /// 缺省按 `offer`：外部工具里没写这个字段的调用，行为与改造前一致
+    /// （骑手端可接受 / 可拒绝）。
+    #[serde(default)]
+    pub mode: crate::sim::order::AssignMode,
 }
 
 impl DispatchItem {

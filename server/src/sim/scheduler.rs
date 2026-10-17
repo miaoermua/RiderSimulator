@@ -12,8 +12,8 @@ use super::{
     config::{PEAK_PREP_FACTOR, STORM_PREP_FACTOR, SimConfig},
     economy,
     event::{DecisionSource, SimEvent},
-    order::{OrderStatus, OrderTier},
-    rider::{HeldOrder, Phase, RiderKind, SpeedMode},
+    order::{AssignMode, OrderStatus, OrderTier},
+    rider::{HeldOrder, Phase, Rider, RiderKind, SpeedMode},
     route::{LegKind, RouteLeg, RouteTask},
     world::World,
 };
@@ -40,6 +40,10 @@ pub enum ClaimError {
     OffsiteOp,
     /// 今日拒单额度已用完——指派单拒不掉了，只能送。
     RejectLimitReached,
+    /// 这是一张强制派单，本来就没有「拒绝」这个动作。
+    AssignForced,
+    /// 今天已经被强制下线（拒单额度用尽），不能再自己上线。
+    ForcedOffline,
     /// 改派的目标就是这单现在的持有人——那不是改派。
     ///
     /// 单独给一个码是为了文案：`ALREADY_CLAIMED`（"订单已被抢走"）用在改派上，
@@ -71,6 +75,8 @@ impl ClaimError {
             ClaimError::FeatureDisabled => "FEATURE_DISABLED",
             ClaimError::OffsiteOp => "OFFSITE_OP",
             ClaimError::RejectLimitReached => "REJECT_LIMIT_REACHED",
+            ClaimError::AssignForced => "ASSIGN_FORCED",
+            ClaimError::ForcedOffline => "FORCED_OFFLINE",
             ClaimError::SameRider => "SAME_RIDER",
         }
     }
@@ -94,6 +100,8 @@ impl ClaimError {
             ClaimError::FeatureDisabled => "该功能未开启",
             ClaimError::OffsiteOp => "还没到位置——控制端没开「允许真人违规操作」",
             ClaimError::RejectLimitReached => "你今天拒绝已超出上限",
+            ClaimError::AssignForced => "强制派单不能拒绝",
+            ClaimError::ForcedOffline => "今天已被强制下线，明天再来",
             ClaimError::SameRider => "这单已经在该骑手手上了",
         }
     }
@@ -147,20 +155,32 @@ pub fn try_claim(
     Ok(assignment)
 }
 
-/// 控制端强制指派：无视评分门槛与抢单窗口，但骑手端仍要确认。
+/// 控制端派单：无视评分门槛与抢单窗口，但骑手端仍要确认。
+///
+/// `mode` 决定骑手能不能拒：`offer` 可拒（吃当日额度），`forced` 只能同意。
+/// 被强制下线的人只剩「平台硬塞」这一条路：即使控制端选了指派单，也会被
+/// 纠正成 `forced`，否则「额度用完」这个惩罚在他那里等于不存在。
 pub fn assign_forced(
     world: &mut World,
     order_id: OrderId,
     rider_id: RiderId,
+    mode: AssignMode,
 ) -> Result<Assignment, ClaimError> {
     let order = world.order(order_id).ok_or(ClaimError::OrderNotFound)?;
     let rider = world.rider(rider_id).ok_or(ClaimError::RiderNotFound)?;
     let now = world.elapsed_min;
+    let mode = if rider.forced_offline {
+        AssignMode::Forced
+    } else {
+        mode
+    };
 
     if order.status != OrderStatus::Pending && order.status != OrderStatus::Expired {
         return Err(ClaimError::AlreadyClaimed);
     }
-    if !rider.online {
+    // 下线的人一般不该接单；唯一例外是被强制下线后平台继续塞的强制单
+    // （他本人不能上线，但手上的活照跑）。
+    if !rider.online && !(rider.forced_offline && mode == AssignMode::Forced) {
         return Err(ClaimError::RiderOffline);
     }
     if rider.is_injured(now) {
@@ -170,13 +190,25 @@ pub fn assign_forced(
         return Err(ClaimError::HeldLimitReached);
     }
 
+    // 同一骑手身上只留一个「待确认」标记。之前那张要是还挂着派单方式，
+    // 先把它当成「默认接下」收干净，否则它再也没有机会被确认。
+    let stale = rider.assign_pending.filter(|&p| p != order_id);
+    if let Some(o) = stale.and_then(|prev| world.order_mut(prev)) {
+        o.assign_mode = None;
+    }
+
     let mut assignment =
         ai::evaluate(world, rider_id, order_id).ok_or(ClaimError::OrderNotFound)?;
     assignment.source = DecisionSource::Manual;
-    assignment.reason = "控制端强制指派".to_string();
+    assignment.reason = match mode {
+        AssignMode::Offer => "控制端指派单",
+        AssignMode::Forced => "控制端强制派单",
+    }
+    .to_string();
     attach(world, &assignment);
     if let Some(o) = world.order_mut(order_id) {
         o.forced = true;
+        o.assign_mode = Some(mode);
     }
     // 记下「还没被接受」。骑手点接受走 `accept_assign`，点拒绝走
     // `reject_order`——后者靠这个标记才知道该吃拒单额度而不是扣 5 元罚款。
@@ -226,6 +258,7 @@ pub fn reassign(
     world: &mut World,
     order_id: OrderId,
     to_rider: RiderId,
+    mode: AssignMode,
 ) -> Result<ReassignOutcome, ClaimError> {
     let now = world.elapsed_min;
 
@@ -253,9 +286,15 @@ pub fn reassign(
         return Err(ClaimError::WrongPhase);
     }
 
-    {
+    let mode = {
         let rider = world.rider(to_rider).ok_or(ClaimError::RiderNotFound)?;
-        if !rider.online {
+        // 与 `assign_forced` 同一套口径：被强制下线的人只能收强制单。
+        let mode = if rider.forced_offline {
+            AssignMode::Forced
+        } else {
+            mode
+        };
+        if !rider.online && !(rider.forced_offline && mode == AssignMode::Forced) {
             return Err(ClaimError::RiderOffline);
         }
         if rider.is_injured(now) {
@@ -270,7 +309,8 @@ pub fn reassign(
         if rider.held.len() as u32 >= rider.effective_max_held(&world.cfg) {
             return Err(ClaimError::HeldLimitReached);
         }
-    }
+        mode
+    };
 
     let from_name = world
         .rider(from_rider)
@@ -310,14 +350,28 @@ pub fn reassign(
         ai::evaluate(world, to_rider, order_id).ok_or(ClaimError::OrderNotFound)?;
     assignment.source = DecisionSource::Manual;
     assignment.reason = format!(
-        "控制端改派：{from_name}还没取到餐（{}），转给{to_name}",
+        "控制端改派（{}）：{from_name}还没取到餐（{}），转给{to_name}",
+        match mode {
+            AssignMode::Offer => "指派单",
+            AssignMode::Forced => "强制派单",
+        },
         from_phase.label()
     );
 
+    // 新骑手身上若还挂着上一张待确认的单，同样按「默认接下」收干净。
+    let stale = world
+        .rider(to_rider)
+        .and_then(|r| r.assign_pending)
+        .filter(|&p| p != order_id);
+    if let Some(o) = stale.and_then(|prev| world.order_mut(prev)) {
+        o.assign_mode = None;
+    }
+
     if let Some(order) = world.order_mut(order_id) {
         order.assigned_to = Some(to_rider);
-        // 和强制指派同理：新骑手端要弹确认，而不是「白捡一单」直接挂上。
+        // 和指派同理：新骑手端要弹确认，而不是「白捡一单」直接挂上。
         order.forced = true;
+        order.assign_mode = Some(mode);
     }
     mount_on_rider(world, &assignment);
     if let Some(rider) = world.rider_mut(to_rider) {
@@ -344,15 +398,18 @@ pub fn accept_assign(
     order_id: OrderId,
 ) -> Result<(), ClaimError> {
     let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
-    match rider.assign_pending {
-        Some(id) if id == order_id => {
-            rider.assign_pending = None;
-            Ok(())
-        }
+    if rider.assign_pending != Some(order_id) {
         // 不是待确认的指派单：可能已经接受过，或者已经拒绝了。
         // 不报错——客户端的「接受」是幂等的，重发不该弹错。
-        _ => Ok(()),
+        return Ok(());
     }
+    rider.assign_pending = None;
+    // 确认之后就不是「待选择的平台单」了：再取消要按主动取消罚钱，
+    // 订单上也不该继续挂着派单方式。
+    if let Some(o) = world.order_mut(order_id) {
+        o.assign_mode = None;
+    }
+    Ok(())
 }
 
 /// 背单：绕路不超阈值就允许叠一单。
@@ -504,6 +561,7 @@ pub fn claimed_event(world: &World, a: &Assignment) -> SimEvent {
             .map(|o| o.quoted_fee_cents())
             .unwrap_or(0),
         forced: true,
+        assign_mode: None,
     }
 }
 
@@ -605,6 +663,11 @@ pub fn set_online(
 ) -> Result<Vec<SimEvent>, ClaimError> {
     let cfg = world.cfg.clone();
     let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
+    // 拒单额度用尽被踢下线的人，今天就是不能再上——这是惩罚本身，
+    // 不是「手滑点了上线」的提示。次日日结才清 `forced_offline`。
+    if online && rider.forced_offline {
+        return Err(ClaimError::ForcedOffline);
+    }
     if !online && !rider.held.is_empty() {
         // 手上还有单不能下线
         return Err(ClaimError::WrongPhase);
@@ -829,12 +892,23 @@ pub fn deliver(
 /// 1. **拒绝系统指派单**（`rider.assign_pending` 正指向它）——骑手还没点接受，
 ///    这单是平台硬塞过来的。代价是吃掉一次**每日拒单额度**（`max_rejects_per_day`），
 ///    **不罚款**；额度用完就直接拒不掉（[`ClaimError::RejectLimitReached`]），
-///    指派什么就得送什么。
+///    指派什么就得送什么，并且**当场强制下线**（当天不能再自己上线）。
+///    强制派单（[`AssignMode::Forced`]）连这一步都没有，直接
+///    [`ClaimError::AssignForced`] 挡回去。
 /// 2. **取消已经接下的单**——骑手自己反悔，罚 `fine.cancel_cents`（5 元），
 ///    重投次数照算。
 ///
 /// 两种情况订单都**退回大厅加价重投**，绝不流单——真实场景里骑手不要这单，
 /// 平台会把单转给下一个骑手，不能让顾客的饭凭空消失。
+/// 拒单额度用尽：当场下线，今天不许自己再上。
+///
+/// **手上的单不释放**：`tick::advance_riders` 不看 `online`，人照样把餐送完。
+/// 他失去的只是「挑单」的权利——不能抢大厅，之后平台要派只能按强制派单塞。
+fn force_offline(rider: &mut Rider) {
+    rider.online = false;
+    rider.forced_offline = true;
+}
+
 pub fn reject_order(
     world: &mut World,
     rider_id: RiderId,
@@ -848,8 +922,14 @@ pub fn reject_order(
         .rider(rider_id)
         .is_some_and(|r| r.assign_pending == Some(order_id));
     if pending {
+        // 强制派单没有「拒绝」这个动作。客户端的按钮已经藏了，这里再兜一道：
+        // 旧客户端 / 手搓请求不能把它当成指派单拒掉。
+        if world.order(order_id).and_then(|o| o.assign_mode) == Some(AssignMode::Forced) {
+            return Err(ClaimError::AssignForced);
+        }
+
         let limit = cfg.max_rejects_per_day;
-        let used = {
+        let (quota_full, exhausted) = {
             let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
             if limit > 0 && rider.rejected >= limit {
                 // 额度已满。这一单**拒不掉**——它就是你的了，所以顺手摘掉
@@ -859,20 +939,42 @@ pub fn reject_order(
                 // 命令仍然算失败，客户端据此弹「你今天拒绝已超出上限」——
                 // 这是唯一会让骑手看见「拒绝被拒」的路径。
                 rider.assign_pending = None;
-                return Err(ClaimError::RejectLimitReached);
+                force_offline(rider);
+                (true, true)
+            } else {
+                rider.assign_pending = None;
+                rider.rejected += 1;
+                rider.drop_order(order_id);
+                // 拒满额度的**当下**就下线，不等下一单：这是惩罚的落点。
+                let exhausted = limit > 0 && rider.rejected >= limit;
+                if exhausted {
+                    force_offline(rider);
+                }
+                (false, exhausted)
             }
-            rider.assign_pending = None;
-            rider.rejected += 1;
-            rider.drop_order(order_id);
-            rider.rejected
         };
+        // 拒绝窗口到此为止。拒不掉的那张也一样：它已经归骑手了，
+        // 不该再挂着「待选择」的派单方式。
+        if let Some(o) = world.order_mut(order_id) {
+            o.assign_mode = None;
+        }
+        if quota_full {
+            return Err(ClaimError::RejectLimitReached);
+        }
+        let used = world.rider(rider_id).map(|r| r.rejected).unwrap_or(0);
         world.release_to_hall(order_id);
-        return Ok(vec![SimEvent::AssignRejected {
+        let mut events = vec![SimEvent::AssignRejected {
             rider_id,
             order_id,
             used,
             limit,
-        }]);
+            forced_offline: exhausted,
+        }];
+        // 下线要让客户端 / 控制台看见，靠状态事件刷新。
+        if exhausted {
+            events.extend(state_event(world, rider_id));
+        }
+        return Ok(events);
     }
 
     // ---- 情况 2：取消一张已经接下的单 ----
@@ -960,7 +1062,7 @@ mod tests {
         let mut w = World::new_for_test(cfg, 42);
         let rid = w.sim_rider_ids()[0];
         let oid = w.generate_order_batch(1)[0];
-        assign_forced(&mut w, oid, rid).expect("能强制指派");
+        assign_forced(&mut w, oid, rid, AssignMode::Offer).expect("能强制指派");
         (w, rid, oid)
     }
 
@@ -976,6 +1078,7 @@ mod tests {
                     order_id,
                     used: 1,
                     limit: 6,
+                    forced_offline: false,
                 }] if *rider_id == rid && *order_id == oid
             ),
             "拒指派单要回一条 assign_rejected，带上已用/上限：{evs:?}"
@@ -995,39 +1098,93 @@ mod tests {
         );
     }
 
+    /// 拒满额度 = 当场强制下线：当天不能再上线，之后平台只能派强制单。
     #[test]
-    fn reject_limit_blocks_further_rejections() {
+    fn exhausting_the_quota_forces_the_rider_offline() {
         let (mut w, rid, oid) = world_with_pending_assign(1);
-        reject_order(&mut w, rid, oid).expect("用掉唯一一次额度");
-
-        let oid2 = w.generate_order_batch(1)[0];
-        assign_forced(&mut w, oid2, rid).expect("能强制指派");
-        let held_before = w.rider(rid).expect("骑手在").held.len();
-
-        let err = reject_order(&mut w, rid, oid2).expect_err("额度用完必须拒绝");
-        assert_eq!(err, ClaimError::RejectLimitReached);
-        assert_eq!(err.code(), "REJECT_LIMIT_REACHED");
-        assert_eq!(err.message(), "你今天拒绝已超出上限");
+        let evs = reject_order(&mut w, rid, oid).expect("用掉唯一一次额度");
+        assert!(
+            matches!(
+                evs.as_slice(),
+                [
+                    SimEvent::AssignRejected {
+                        used: 1,
+                        limit: 1,
+                        forced_offline: true,
+                        ..
+                    },
+                    SimEvent::RiderStateChanged { .. }
+                ]
+            ),
+            "最后一拒要带上「已被强制下线」，并刷一条状态事件：{evs:?}"
+        );
 
         let r = w.rider(rid).expect("骑手在");
-        assert_eq!(r.rejected, 1, "被挡下的拒绝不许把额度继续往上加");
-        assert_eq!(r.held.len(), held_before, "单还是骑手的，不许被摘走");
+        assert_eq!(r.rejected, 1);
+        assert!(r.forced_offline, "拒满额度要被强制下线");
+        assert!(!r.online, "强制下线就是下线");
+        assert!(r.held.is_empty(), "被拒的那张已经回大厅");
+
+        // 不能自己再上线：这是惩罚，不是「手滑点了上线」的提示。
+        let err = set_online(&mut w, rid, true).expect_err("今天不许自己上线");
+        assert_eq!(err, ClaimError::ForcedOffline);
+        assert_eq!(err.code(), "FORCED_OFFLINE");
+        assert_eq!(err.message(), "今天已被强制下线，明天再来");
+
+        // 平台派的单只能以强制派单形式进来：即使控制端选的是「指派单」。
+        let oid2 = w.generate_order_batch(1)[0];
+        assign_forced(&mut w, oid2, rid, AssignMode::Offer).expect("离线也能被塞强制单");
+        assert_eq!(
+            w.order(oid2).expect("订单在").assign_mode,
+            Some(AssignMode::Forced),
+            "被强制下线的人没有挑单权，指派单要纠正成强制单"
+        );
+        let err = reject_order(&mut w, rid, oid2).expect_err("强制派单拒不掉");
+        assert_eq!(err, ClaimError::AssignForced);
+        assert_eq!(err.code(), "ASSIGN_FORCED");
         assert_eq!(
             w.order(oid2).expect("订单在").status,
             OrderStatus::Assigned,
             "拒不掉就等于接下了"
         );
+    }
+
+    /// 额度在运行期被调小（或存档跨天没清干净）时的兜底：拒不动，且补上下线。
+    /// 正常玩不会走到这里——上一单拒满的那一刻人已经下线了。
+    #[test]
+    fn quota_guard_still_blocks_rejection_without_prior_offline() {
+        let (mut w, rid, oid) = world_with_pending_assign(1);
+        w.rider_mut(rid).expect("骑手在").rejected = 1;
+
+        let err = reject_order(&mut w, rid, oid).expect_err("额度满就必须挡住");
+        assert_eq!(err, ClaimError::RejectLimitReached);
+        assert_eq!(err.code(), "REJECT_LIMIT_REACHED");
+        assert_eq!(err.message(), "你今天拒绝已超出上限");
+
+        let r = w.rider(rid).expect("骑手在");
+        assert!(r.forced_offline, "兜底分支也要补上强制下线");
+        assert_eq!(r.rejected, 1, "被挡下的拒绝不许把额度继续往上加");
+        assert_eq!(r.held.len(), 1, "单还是骑手的，不许被摘走");
         assert_eq!(
             r.assign_pending, None,
             "拒不掉要顺手摘掉待确认标记，否则骑手会卡在拒不掉也退不掉的单上"
         );
+    }
 
-        // 既然归他了，后面再退就是「取消已接单」：罚钱，且不再受额度阻拦。
-        let cancel_cents = w.cfg.fine.cancel_cents;
-        let evs = reject_order(&mut w, rid, oid2).expect("归他的单应该能退掉");
-        assert!(matches!(evs.as_slice(), [SimEvent::FineIssued { .. }]));
-        assert_eq!(w.rider(rid).expect("骑手在").cash_cents, -cancel_cents);
-        assert_eq!(w.rider(rid).expect("骑手在").rejected, 1, "退款不算拒单");
+    /// 日结之后额度与「强制下线」一起解封。
+    #[test]
+    fn day_close_lifts_the_forced_offline() {
+        let (mut w, rid, oid) = world_with_pending_assign(1);
+        reject_order(&mut w, rid, oid).expect("用掉唯一一次额度");
+        assert!(w.rider(rid).expect("骑手在").forced_offline);
+
+        let cfg = w.cfg.clone();
+        let rider = w.rider_mut(rid).expect("骑手在");
+        economy::close_day(&cfg, rider);
+        let r = w.rider(rid).expect("骑手在");
+        assert_eq!(r.rejected, 0);
+        assert!(!r.forced_offline, "新的一天要能重新上线");
+        set_online(&mut w, rid, true).expect("日结后可以上线");
     }
 
     #[test]
@@ -1049,7 +1206,7 @@ mod tests {
         // 再拒几轮也不该被挡住。
         for _ in 0..3 {
             let id = w.generate_order_batch(1)[0];
-            assign_forced(&mut w, id, rid).expect("能强制指派");
+            assign_forced(&mut w, id, rid, AssignMode::Offer).expect("能强制指派");
             reject_order(&mut w, rid, id).expect("0 = 不限，永远拒得掉");
         }
         assert_eq!(w.rider(rid).expect("骑手在").rejected, 4);
@@ -1092,7 +1249,7 @@ mod tests {
         let ids = w.sim_rider_ids();
         let (from, to) = (ids[0], ids[1]);
         let oid = w.generate_order_batch(1)[0];
-        assign_forced(&mut w, oid, from).expect("能强制指派");
+        assign_forced(&mut w, oid, from, AssignMode::Offer).expect("能强制指派");
         accept_assign(&mut w, from, oid).expect("能接单");
         (w, from, to, oid)
     }
@@ -1105,7 +1262,7 @@ mod tests {
         w.elapsed_min += 20;
         w.sim_minute += 20;
 
-        let out = reassign(&mut w, oid, to).expect("还没取餐，应能改派");
+        let out = reassign(&mut w, oid, to, AssignMode::Offer).expect("还没取餐，应能改派");
         assert_eq!(out.from_rider, from);
         assert_eq!(out.phase, Phase::ToShop, "原骑手在去店路上");
 
@@ -1138,7 +1295,7 @@ mod tests {
         w.rider_mut(from).expect("骑手在").held[0].set_leg(Phase::ToCustomer, 8);
         w.order_mut(oid).expect("订单在").status = OrderStatus::PickedUp;
 
-        let err = reassign(&mut w, oid, to).expect_err("取到餐之后不许改派");
+        let err = reassign(&mut w, oid, to, AssignMode::Offer).expect_err("取到餐之后不许改派");
         assert_eq!(err, ClaimError::WrongPhase);
         assert_eq!(w.order(oid).expect("订单在").assigned_to, Some(from));
         assert_eq!(w.rider(to).expect("新骑手在").held.len(), 0);
@@ -1155,13 +1312,13 @@ mod tests {
         let (mut w, from, to, oid) = world_with_two_riders();
         w.rider_mut(to).expect("骑手在").online = false;
         assert_eq!(
-            reassign(&mut w, oid, to).expect_err("离线的不该收到单"),
+            reassign(&mut w, oid, to, AssignMode::Offer).expect_err("离线的不该收到单"),
             ClaimError::RiderOffline
         );
 
         w.rider_mut(to).expect("骑手在").online = true;
         assert_eq!(
-            reassign(&mut w, oid, from).expect_err("改派给自己不是改派"),
+            reassign(&mut w, oid, from, AssignMode::Offer).expect_err("改派给自己不是改派"),
             ClaimError::SameRider
         );
         assert_eq!(w.stats.reassigns, 0, "失败的改派不计数");
@@ -1178,7 +1335,7 @@ mod tests {
             held.remaining_min = 3;
         }
 
-        let out = reassign(&mut w, oid, to).expect("等餐中也能改派");
+        let out = reassign(&mut w, oid, to, AssignMode::Offer).expect("等餐中也能改派");
         assert_eq!(out.phase, Phase::WaitingFood);
         assert_eq!(
             w.order(oid).expect("订单在").prep_minutes,

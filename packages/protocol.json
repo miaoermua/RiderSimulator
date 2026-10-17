@@ -99,7 +99,8 @@
     {
       "type": "force_assign",
       "roles": ["control"],
-      "fields": { "order_id": "u32", "rider_id": "u32" }
+      "fields": { "order_id": "u32", "rider_id": "u32", "mode": "offer | forced（缺省 offer）" },
+      "comment": "派单方式：offer = 指派单，骑手可拒（吃当日额度）；forced = 强制派单，只能同意，服务端会挡回 reject。被强制下线（额度用尽）的骑手只能收 forced，传 offer 也会被纠正，ack.data.assign_mode 是实际生效值。"
     },
     { "type": "set_llm_enabled", "roles": ["control"], "fields": { "enabled": "bool" } },
     {
@@ -136,7 +137,11 @@
     "sim": {
       "tick": { "audience": "public", "payload": "{ day, sim_minute, elapsed_min, speed_multiplier }" },
       "order_broadcast": { "audience": "public", "payload": "{ order, window_ms, expires_in_ms }" },
-      "order_claimed": { "audience": "public", "payload": "{ order_id, rider_id, rider_name, quoted_fee_cents, forced }" },
+      "order_claimed": {
+        "audience": "public",
+        "payload": "{ order_id, rider_id, rider_name, quoted_fee_cents, forced, assign_mode? }",
+        "comment": "assign_mode 只在平台派单待确认时出现：offer（可拒）/ forced（只能同意）。缺省 = 不是平台派过来的（本人抢的 / AI 派的）。"
+      },
       "order_expired": {
         "audience": "public",
         "payload": "{ order_id }",
@@ -153,6 +158,11 @@
       "fine_issued": { "audience": "owner+control", "payload": "{ rider_id, kind, amount_cents, reason }" },
       "config_changed": { "audience": "public", "payload": "{ speed_multiplier, commission_rate, weather }" },
       "ai_decision": { "audience": "public", "payload": "{ source, assignments, note }" },
+      "assign_rejected": {
+        "audience": "owner+control",
+        "payload": "{ rider_id, order_id, used, limit, forced_offline }",
+        "comment": "used/limit 是当日拒单额度（limit = 0 不限）；forced_offline = 这次拒单把额度用尽、当场被强制下线。"
+      },
       "task_message": { "audience": "owner+control", "payload": "{ order_id, from: rider|customer|system, text, step, task_id }" },
       "chat_message": { "audience": "public", "payload": "{ order_id, from: rider|customer|system, kind: preset|free|reply|ruling, text, day, sim_minute, compensation_cents, fault: rider|merchant|none }" },
       "notice_changed": { "audience": "public", "payload": "{ notice: { title, body, activity_id: u32|null, updated_at_min: u64 } | null }", "comment": "首页通知只有一条，改了就覆盖；null = 已清空。快照只在握手时来一次，不接这条手机端就得重连才看得见改字。" },

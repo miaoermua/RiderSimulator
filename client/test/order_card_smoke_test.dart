@@ -38,6 +38,7 @@ OrderView _order({OrderStatus status = OrderStatus.assigned}) => OrderView(
       status: status,
       assignedTo: 1,
       forced: false,
+      assignMode: null,
       backOrder: false,
       urgeCount: 0,
       prepMinutes: null,

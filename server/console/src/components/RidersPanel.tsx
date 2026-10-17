@@ -144,12 +144,14 @@ export function RidersPanel({ selected, onSelect }: Props) {
                     <Button
                       key="online"
                       size="small"
+                      // 被强制下线的人当天不可再上线，服务端也会挡；按钮直接禁掉。
+                      disabled={r.forced_offline && !r.online}
                       onClick={(e) => {
                         e.stopPropagation();
                         store.send("set_rider_online", { rider_id: r.id, online: !r.online });
                       }}
                     >
-                      {r.online ? "下线" : "上线"}
+                      {r.forced_offline && !r.online ? "今日禁上线" : r.online ? "下线" : "上线"}
                     </Button>,
                     <Button
                       key="wallet"
@@ -181,6 +183,8 @@ export function RidersPanel({ selected, onSelect }: Props) {
                   {r.kind === "human" && <Tag color="purple">真人</Tag>}
                   {r.frozen && <Badge status="warning" text="冻结" />}
                   {r.injured && <Badge status="error" text="受伤" />}
+                  {/* 拒单额度用尽 → 当天被强制下线，次日日结才解封。 */}
+                  {r.forced_offline && <Badge status="error" text="强制下线" />}
                 </Space>
               }
               description={
