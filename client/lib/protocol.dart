@@ -100,6 +100,8 @@ abstract final class ErrCode {
   static const backOrderDetourTooLong = 'BACK_ORDER_DETOUR_TOO_LONG';
   static const wrongPhase = 'WRONG_PHASE';
   static const notAssignedToYou = 'NOT_ASSIGNED_TO_YOU';
+  /// 人还没走到就点到店 / 到顾客，控制端没开「允许真人违规操作」。
+  static const offsiteOp = 'OFFSITE_OP';
   /// 今日拒单额度已用尽，这张指派单拒不掉了。
   static const rejectLimitReached = 'REJECT_LIMIT_REACHED';
 
@@ -115,6 +117,7 @@ abstract final class ErrCode {
         riderInjured => '你受伤了，先歇会儿',
         wrongPhase => '当前状态不允许这个操作',
         notAssignedToYou => '这不是你的订单',
+        offsiteOp => '还没到位置，等骑到再点',
         rejectLimitReached => '你今天拒绝已超出上限',
         noTask => '这一单没有附加任务',
         taskFinished => '任务已经做完了',

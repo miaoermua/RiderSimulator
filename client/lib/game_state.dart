@@ -190,6 +190,13 @@ class GameState extends ChangeNotifier {
   /// 未读通知数，顶栏铃铛上的小红点。
   int unreadLogs = 0;
 
+  /// 最近一条被服务端拒掉的操作，比如「还没到位置」。
+  ///
+  /// 通知列表里也有一份，但骑手点了按钮更想要当场反馈——
+  /// [errorSeq] 每来一条错误就 +1，界面靠它判断「是不是新的一条」。
+  String? lastError;
+  int errorSeq = 0;
+
   void markLogsRead() {
     if (unreadLogs == 0) return;
     unreadLogs = 0;
@@ -222,10 +229,9 @@ class GameState extends ChangeNotifier {
       case Ev.ack:
         _applyAck(Ack.fromJson(frame.payload));
       case Ev.error:
-        note(
-          '服务端错误：${ErrCode.humanize(reqStr(frame.payload['code']))}',
-          kind: LogKind.bad,
-        );
+        lastError = ErrCode.humanize(reqStr(frame.payload['code']));
+        errorSeq++;
+        note('服务端错误：$lastError', kind: LogKind.bad);
       case Ev.pong:
         _touch(frame.payload);
       case Ev.tick:

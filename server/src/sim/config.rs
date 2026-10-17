@@ -381,6 +381,13 @@ pub struct SimConfig {
     pub claim_window_secs: u32,
     pub allow_speeding: bool,
     pub allow_unrestricted: bool,
+    /// 允许真人骑手做**违规操作**：路还没走完就点到店 / 到顾客（等价于
+    /// 「人没到，手先到」）。关着的时候服务端直接拒绝，见
+    /// `scheduler::arrive_shop` / `arrive_customer`。
+    ///
+    /// AI 骑手不受这条约束——它们按 tick 自己走，本来就没有抢先点的机会。
+    #[serde(default)]
+    pub allow_rider_violation: bool,
     pub backorder_enabled: bool,
     pub max_orders_per_day: u32,
     /// 每天能拒掉多少张**系统指派**的单，0 = 不限。
@@ -489,6 +496,8 @@ impl Default for SimConfig {
             claim_window_secs: 3,
             allow_speeding: true,
             allow_unrestricted: false,
+            // 默认禁止：不到位置就点「到店 / 送达」是违规操作，得由控制端显式放行。
+            allow_rider_violation: false,
             backorder_enabled: true,
             max_orders_per_day: 0,
             max_rejects_per_day: 6,

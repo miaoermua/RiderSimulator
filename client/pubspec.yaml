@@ -18,9 +18,10 @@ dependencies:
   # 生成原生工程**，否则 Android Studio / 真机上跑不起来（本机没有 Flutter，
   # 这一步还没做，见 client/README.md）。
   #
-  # 上界卡在 7.0：7.x 起 `MobileScanner` 必须传 controller，这里只想用最朴素的
-  # 用法（见 screens/scan_login_page.dart）。
-  mobile_scanner: ">=5.2.3 <7.0.0"
+  # 6.x 在 Android 15/16 上相机起不来（报 "An unexpected error occurred."，
+  # 是插件的 generic 错误码，底层是 CameraX 初始化失败）。7.x 换了新的
+  # controller 生命周期并带上错误回调，见 screens/scan_login_page.dart。
+  mobile_scanner: ^7.4.2
   flutter_map: ^8.3.2
   latlong2: ^0.10.1
 

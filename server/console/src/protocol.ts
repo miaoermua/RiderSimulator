@@ -193,6 +193,8 @@ export interface ConfigView {
   claim_window_secs: number;
   allow_speeding: boolean;
   allow_unrestricted: boolean;
+  /** 允许真人骑手做违规操作（没过到位置就点「到店 / 送达」）。 */
+  allow_rider_violation: boolean;
   backorder_enabled: boolean;
   backorder_max: number;
   max_orders_per_day: number;

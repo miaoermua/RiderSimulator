@@ -363,6 +363,13 @@ export function SettingsPanel() {
         disabled={!isControl}
         onChange={(v) => store.send("set_config", { allow_unrestricted: v })}
       />
+      <SwitchRow
+        label="允许真人违规操作"
+        hint="打开后真人骑手可以人没到就点「到店 / 已送达」；关掉则必须骑到位置"
+        value={c.allow_rider_violation}
+        disabled={!isControl}
+        onChange={(v) => store.send("set_config", { allow_rider_violation: v })}
+      />
 
       {/* 事故率：档位基准率（0.5% / 4% / 22%）是文档定死的，倍率只管手感。
           默认 1.0 = 设计值，嫌吵就往左拉。 */}

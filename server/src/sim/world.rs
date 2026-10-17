@@ -121,6 +121,8 @@ pub struct ConfigView {
     pub claim_window_secs: u32,
     pub allow_speeding: bool,
     pub allow_unrestricted: bool,
+    /// 允许真人骑手未到位置就点到店 / 送达。
+    pub allow_rider_violation: bool,
     pub backorder_enabled: bool,
     pub backorder_max: u32,
     pub max_orders_per_day: u32,
@@ -1002,6 +1004,7 @@ impl World {
             claim_window_secs: self.cfg.claim_window_secs,
             allow_speeding: self.cfg.allow_speeding,
             allow_unrestricted: self.cfg.allow_unrestricted,
+            allow_rider_violation: self.cfg.allow_rider_violation,
             backorder_enabled: self.cfg.backorder_enabled,
             backorder_max: self.cfg.backorder.max_held,
             max_orders_per_day: self.cfg.max_orders_per_day,

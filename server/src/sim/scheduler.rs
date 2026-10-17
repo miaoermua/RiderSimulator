@@ -36,6 +36,8 @@ pub enum ClaimError {
     WrongPhase,
     NotAssignedToYou,
     FeatureDisabled,
+    /// 人还没走到，就想点到店 / 到顾客。控制端开了「允许真人违规操作」才放行。
+    OffsiteOp,
     /// 今日拒单额度已用完——指派单拒不掉了，只能送。
     RejectLimitReached,
     /// 改派的目标就是这单现在的持有人——那不是改派。
@@ -67,6 +69,7 @@ impl ClaimError {
             ClaimError::WrongPhase => "WRONG_PHASE",
             ClaimError::NotAssignedToYou => "NOT_ASSIGNED_TO_YOU",
             ClaimError::FeatureDisabled => "FEATURE_DISABLED",
+            ClaimError::OffsiteOp => "OFFSITE_OP",
             ClaimError::RejectLimitReached => "REJECT_LIMIT_REACHED",
             ClaimError::SameRider => "SAME_RIDER",
         }
@@ -89,6 +92,7 @@ impl ClaimError {
             ClaimError::WrongPhase => "当前状态不允许这个操作",
             ClaimError::NotAssignedToYou => "这不是你的单",
             ClaimError::FeatureDisabled => "该功能未开启",
+            ClaimError::OffsiteOp => "还没到位置——控制端没开「允许真人违规操作」",
             ClaimError::RejectLimitReached => "你今天拒绝已超出上限",
             ClaimError::SameRider => "这单已经在该骑手手上了",
         }
@@ -631,19 +635,34 @@ pub fn set_speed_mode(
     Ok(state_event(world, rider_id).into_iter().collect())
 }
 
+/// 真人「人没到、手先到」的容忍线：这一段路走了 85% 以上就算到了。
+///
+/// 留 15% 的余量是因为倒计时取整——站在店门口时腿上可能还剩 1 分钟，
+/// 卡死在 100% 会让人觉得「明明到了却点不了」。AI 不走这条闸门。
+const OFFSITE_TOLERANCE: f32 = 0.85;
+
 /// 到达商家（确认）。真人骑手必须点，倒计时归零后由 sim 兜底推进。
+///
+/// 控制端没开「允许真人违规操作」时，路没走完就点这里会被拒（`OFFSITE_OP`）。
 pub fn arrive_shop(
     world: &mut World,
     rider_id: RiderId,
     order_id: OrderId,
 ) -> Result<Vec<SimEvent>, ClaimError> {
     let now = world.elapsed_min;
+    let allow_violation = world.cfg.allow_rider_violation;
+    let human = world
+        .rider(rider_id)
+        .is_some_and(|r| r.kind == RiderKind::Human);
     let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
     let held = rider
         .held_mut(order_id)
         .ok_or(ClaimError::NotAssignedToYou)?;
     if held.phase != Phase::ToShop {
         return Err(ClaimError::WrongPhase);
+    }
+    if human && !allow_violation && held.leg_progress() < OFFSITE_TOLERANCE {
+        return Err(ClaimError::OffsiteOp);
     }
     held.set_leg(Phase::WaitingFood, 1);
     held.awaiting_ack = false;
@@ -655,18 +674,25 @@ pub fn arrive_shop(
     Ok(state_event(world, rider_id).into_iter().collect())
 }
 
-/// 到达顾客。
+/// 到达顾客。同 [`arrive_shop`]，路没走完就点会被拒（除非控制端放行）。
 pub fn arrive_customer(
     world: &mut World,
     rider_id: RiderId,
     order_id: OrderId,
 ) -> Result<Vec<SimEvent>, ClaimError> {
+    let allow_violation = world.cfg.allow_rider_violation;
+    let human = world
+        .rider(rider_id)
+        .is_some_and(|r| r.kind == RiderKind::Human);
     let rider = world.rider_mut(rider_id).ok_or(ClaimError::RiderNotFound)?;
     let held = rider
         .held_mut(order_id)
         .ok_or(ClaimError::NotAssignedToYou)?;
     if held.phase != Phase::ToCustomer {
         return Err(ClaimError::WrongPhase);
+    }
+    if human && !allow_violation && held.leg_progress() < OFFSITE_TOLERANCE {
+        return Err(ClaimError::OffsiteOp);
     }
     held.set_leg(Phase::ArrivedCustomer, 1);
     held.awaiting_ack = false;
@@ -680,14 +706,30 @@ pub fn deliver(
     rider_id: RiderId,
     order_id: OrderId,
 ) -> Result<Vec<SimEvent>, ClaimError> {
-    let phase = {
+    let allow_violation = world.cfg.allow_rider_violation;
+    let (phase, human, progress) = {
         let rider = world.rider(rider_id).ok_or(ClaimError::RiderNotFound)?;
-        rider
-            .held_phase(order_id)
-            .ok_or(ClaimError::NotAssignedToYou)?
+        let held = rider
+            .held
+            .iter()
+            .find(|h| h.order_id == order_id)
+            .ok_or(ClaimError::NotAssignedToYou)?;
+        (
+            held.phase,
+            rider.kind == RiderKind::Human,
+            held.leg_progress(),
+        )
     };
     if phase != Phase::ArrivedCustomer {
-        return Err(ClaimError::WrongPhase);
+        // 真人还在路上就点「送达」——这正是最典型的那种违规操作。
+        // 「快到了」按到达算；差得远时不放行就拒，放行就一步送到
+        // （不要求先点「到顾客」）。
+        if phase != Phase::ToCustomer || !human {
+            return Err(ClaimError::WrongPhase);
+        }
+        if progress < OFFSITE_TOLERANCE && !allow_violation {
+            return Err(ClaimError::OffsiteOp);
+        }
     }
     let now = world.elapsed_min;
     let cfg = world.cfg.clone();
@@ -1135,5 +1177,52 @@ mod tests {
             Some(3),
             "剩下的出餐时间要跟着单走，不能重置成整炉"
         );
+    }
+
+    /// 真人「人没到就点到店」在默认配置下要被拒；控制端放行后才生效。
+    #[test]
+    fn a_human_cannot_confirm_arrival_before_covering_the_leg() {
+        let (mut w, rid, oid) = world_with_pending_assign(6);
+        // 模拟骑手默认是 AI，这里改成真人——违规闸门只管真人。
+        w.rider_mut(rid).expect("骑手在").kind = RiderKind::Human;
+
+        let err = arrive_shop(&mut w, rid, oid).expect_err("路没走完不许点到店");
+        assert_eq!(err, ClaimError::OffsiteOp);
+        assert_eq!(err.code(), "OFFSITE_OP");
+        assert_eq!(
+            w.rider(rid).expect("骑手在").held[0].phase,
+            Phase::ToShop,
+            "被拒之后状态不能动"
+        );
+
+        // 控制端打开「允许真人违规操作」之后，同样的操作就能过。
+        w.cfg.allow_rider_violation = true;
+        arrive_shop(&mut w, rid, oid).expect("开了违规操作就该放行");
+        assert_eq!(
+            w.rider(rid).expect("骑手在").held[0].phase,
+            Phase::WaitingFood
+        );
+    }
+
+    /// 走到 85% 以上就算到了：倒计时取整不该让站在店门口的人点不了。
+    #[test]
+    fn being_nearly_there_is_not_a_violation() {
+        let (mut w, rid, oid) = world_with_pending_assign(6);
+        {
+            let r = w.rider_mut(rid).expect("骑手在");
+            r.kind = RiderKind::Human;
+            let h = &mut r.held[0];
+            // 10 分钟的取餐腿只剩 1 分钟 = 走了 90%，站在店门口了。
+            h.set_leg(Phase::ToShop, 10);
+            h.remaining_min = 1;
+        }
+        arrive_shop(&mut w, rid, oid).expect("剩最后一小段不算违规");
+    }
+
+    /// AI 骑手不受这条约束：它们本来就按 tick 自己走到位。
+    #[test]
+    fn simulated_riders_are_not_gated_by_the_violation_switch() {
+        let (mut w, rid, oid) = world_with_pending_assign(6);
+        arrive_shop(&mut w, rid, oid).expect("AI 不该被真人违规开关挡住");
     }
 }

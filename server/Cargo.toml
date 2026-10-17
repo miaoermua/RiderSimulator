@@ -19,6 +19,8 @@ thiserror = "2.0.21"
 tokio = { version = "1.53.2", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# 枚举网卡（局域网地址探测的兜底），见 src/net/join.rs
+libc = "0.2"
 
 [dev-dependencies]
 # 用 Router::oneshot 做无端口的路由测试；axum 自身依赖它，但需要显式声明才能 use。

@@ -2169,6 +2169,10 @@ impl App {
         if let Some(v) = p.allow_unrestricted {
             cfg.allow_unrestricted = v;
         }
+        // 只影响真人当下的操作能不能生效，不需要回滚任何骑手状态。
+        if let Some(v) = p.allow_rider_violation {
+            cfg.allow_rider_violation = v;
+        }
         if let Some(v) = p.backorder_enabled {
             cfg.backorder_enabled = v;
         }

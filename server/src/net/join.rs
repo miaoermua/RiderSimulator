@@ -127,12 +127,19 @@ fn with_port(host: &str, port: u16) -> String {
 
 /// 探测本机在局域网里的 IPv4。
 ///
-/// 手法是「UDP connect + 读 local_addr」：**不发任何包**，只是让内核按默认路由
-/// 挑一条出口，于是 `local_addr` 就是本机在那个方向上的地址。比枚举网卡便宜，
-/// 也不用引平台相关的依赖。
+/// 先走「UDP connect + 读 local_addr」：**不发任何包**，只是让内核按默认路由
+/// 挑一条出口。这招便宜，但**只要机器上跑着代理就会翻车**——Clash 之类把默认
+/// 路由指向 utun，探出来的是 `198.18.x.x`（fake-ip），手机永远连不上。
 ///
-/// 离线、没有默认路由、或者探到的地址不像是「别人能连上的」时返回 `None`。
+/// 所以探到的地址不可用时，退回去枚举网卡本身（见 [`enumerate_lan_ipv4`]）。
+/// 实测开发机：默认路由在 utun4（198.18.0.1），真正的 Wi-Fi 在 en0（10.35.7.250），
+/// 只靠前者会让二维码里写 `127.0.0.1`。
 pub fn lan_ipv4() -> Option<Ipv4Addr> {
+    default_route_ipv4().or_else(enumerate_lan_ipv4)
+}
+
+/// 默认路由出口的地址。离线 / 被代理接管 / 结果不可用时返回 `None`。
+fn default_route_ipv4() -> Option<Ipv4Addr> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     // 这里连的是一个「必定有路由」的公网地址，只为问内核要出口，不产生流量。
     sock.connect("8.8.8.8:80").ok()?;
@@ -140,6 +147,84 @@ pub fn lan_ipv4() -> Option<Ipv4Addr> {
         IpAddr::V4(v4) if is_usable_lan_ipv4(v4) => Some(v4),
         _ => None,
     }
+}
+
+/// 枚举网卡，挑一个最像「手机能连上」的 IPv4。
+///
+/// 在 macOS / Linux 上用 `getifaddrs`（标准库不提供网卡枚举，只好借 libc）。
+/// 优先级：`192.168/16` → `10/8` → `172.16/12` → 其余私有段。
+/// 虚拟网卡（utun / tun / tap / docker / vmnet …）一律跳过——那些地址
+/// 要么是代理的 fake-ip，要么只在容器/虚拟机里通。
+#[cfg(unix)]
+fn enumerate_lan_ipv4() -> Option<Ipv4Addr> {
+    use std::ffi::CStr;
+
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs 填一个由 freeifaddrs 释放的链表，下面逐节点只读。
+    unsafe {
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return None;
+        }
+        let mut best: Option<(u8, Ipv4Addr)> = None;
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+
+            if ifa.ifa_addr.is_null() {
+                continue;
+            }
+            let family = (*ifa.ifa_addr).sa_family as i32;
+            if family != libc::AF_INET {
+                continue;
+            }
+            let Some(name) = (!ifa.ifa_name.is_null())
+                .then(|| CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            if is_virtual_iface(&name) {
+                continue;
+            }
+            let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+            let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+            if !is_usable_lan_ipv4(ip) {
+                continue;
+            }
+            let rank = lan_rank(ip);
+            if best.map_or(true, |(r, _)| rank < r) {
+                best = Some((rank, ip));
+            }
+        }
+        libc::freeifaddrs(ifap);
+        best.map(|(_, ip)| ip)
+    }
+}
+
+#[cfg(not(unix))]
+fn enumerate_lan_ipv4() -> Option<Ipv4Addr> {
+    None
+}
+
+/// 越小的段越可能是「家里 / 公司同一个 Wi-Fi」。Tailscale 的 100.64/10 排最后。
+fn lan_rank(ip: Ipv4Addr) -> u8 {
+    let [a, b, ..] = ip.octets();
+    match (a, b) {
+        (192, 168) => 0,
+        (10, _) => 1,
+        (172, 16..=31) => 2,
+        (100, 64..=127) => 4, // CGNAT：Tailscale 之类，通常是虚拟的
+        _ => 3,
+    }
+}
+
+/// 这些名字开头的网卡是虚拟的，地址给手机没有意义。
+fn is_virtual_iface(name: &str) -> bool {
+    const VIRTUAL: &[&str] = &[
+        "utun", "tun", "tap", "ppp", "ipsec", "awdl", "llw", "bridge", "docker", "veth",
+        "vmnet", "ham", "gif", "stf", "anpi", "ap",
+    ];
+    VIRTUAL.iter().any(|p| name.starts_with(p))
 }
 
 /// 这个 IPv4 有没有可能被**别人的手机**连上。

@@ -339,6 +339,9 @@ pub struct ConfigPatch {
     pub allow_speeding: Option<bool>,
     #[serde(default)]
     pub allow_unrestricted: Option<bool>,
+    /// 允许真人骑手做违规操作（未到位置就点到店 / 送达）。
+    #[serde(default)]
+    pub allow_rider_violation: Option<bool>,
     #[serde(default)]
     pub backorder_enabled: Option<bool>,
     /// 背单上限，1~5。
