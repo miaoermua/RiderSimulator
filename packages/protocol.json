@@ -186,18 +186,22 @@
       "host": "手机可达的主机（IPv4 或域名，不含端口）。绝不能是 127.0.0.1——到了手机上那指的是手机自己。",
       "port": "u16",
       "name": "骑手名 = 账号名",
-      "password": "**明文**。见下方 tradeoff。"
+      "password": "**明文**。见下方 tradeoff。",
+      "url": "可选。服务端配了完整地址（RIDER_SIM_PUBLIC_URL / RIDER_SIM_PUBLIC_ADDR 带协议，或烽火台临时值）时才带，形如 wss://域名:443/ws；客户端优先用它，缺省退回 host/port。"
     },
     "tradeoff": "明文密码直接躺在码里，是有意的取舍（2026-10-11 定）：扫码即登录，不依赖服务端状态、不依赖票据过期。代价是这张码能截图、能打印、发出去收不回来——要作废只能去烽火台重置该骑手密码，旧码会因密码变更当场失效。",
-    "ws_url": "客户端最终连的是 ws://<host>:<port>/ws"
+    "ws_url": "客户端最终连的是 url（有的话）或 ws://<host>:<port>/ws"
   },
   "http_api": {
     "_note": "给控制台与外部工具（workbuddy 等）的一次性 HTTP 接口。鉴权与 /ws 的 hello 同一套：Authorization: Bearer <RIDER_SIM_CONTROL_TOKEN>；没配令牌时退化成 RIDER_SIM_ALLOW_CONTROL。错误体一律 {\"error\":{\"code\",\"message\"}}。",
     "accounts": {
-      "GET /api/accounts": "账号名单 + 手机可达地址。响应：{ accounts: [{name, created_at, updated_at, rider_id?, rider_key?, online?}], hosts: [string], primary_host: string? }。**不含密码**。",
-      "POST /api/accounts": "建号。请求 { name, password? }；password 缺省 = 服务端生成。重名回 409 BAD_CREDENTIALS（**不覆盖原密码**，否则已发出去的二维码会莫名失效）。密码太短回 400。响应 { name, password, join, hosts, primary_host }，其中 password 是**全系统唯一一次**能看到明文的地方。",
+      "GET /api/accounts": "账号名单 + 手机可达地址。响应：{ accounts: [{name, created_at, updated_at, rider_id?, rider_key?, online?}], hosts: [string], primary_host: string?, addr: string?, addr_override: bool }。addr 是当前生效的接入地址原样（可能来自环境变量），null = 自动探测；addr_override=true 表示来自烽火台临时设置。**不含密码**。",
+      "POST /api/accounts": "建号。请求 { name, password? }；password 缺省 = 服务端生成。重名回 409 BAD_CREDENTIALS（**不覆盖原密码**，否则已发出去的二维码会莫名失效）。密码太短回 400。响应 { name, password, join, hosts, primary_host, addr, addr_override }，其中 password 是**全系统唯一一次**能看到明文的地方。",
       "POST /api/accounts/{name}/password": "改 / 重置密码。请求 { password? }，缺省 = 服务端生成。账号不存在回 404 NO_ACCOUNT。响应同建号。",
       "DELETE /api/accounts/{name}": "删号。响应 { name, deleted }。名字按 normalize_name 规范化后删。"
+    },
+    "join_addr": {
+      "POST /api/join": "临时换「手机该连哪儿」（Cloudflared 域名用）。请求 { addr: string | null }；addr 为 null / 空串 = 恢复环境变量或自动探测。带协议时按 https→wss、缺省端口 443/8080、缺省路径 /ws 规范；只给 主机[:端口] 时按局域网老规矩拼。形状不合法回 400。响应 { ok, hosts, primary_host, addr, addr_override }。**只改内存、不落库**，服务端重启即失效；已经发出的旧二维码不会回溯，要新码须重置该骑手密码。"
     },
     "notice": {
       "GET /api/notice": "读首页通知。响应 { notice: { title, body, activity_id, updated_at_min } | null }。",

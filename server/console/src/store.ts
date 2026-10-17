@@ -405,6 +405,16 @@ class ConsoleStore {
     return this.request<AccountList>("GET", "/api/accounts");
   }
 
+  /**
+   * 换「手机该连哪儿」。`null` / 空串 = 恢复环境变量或自动探测。
+   *
+   * **只对本次运行有效**：服务端不落库，重启就回到原来的地址。
+   * 换完立刻生效，之后建的号 / 重置的密码都会按新地址出二维码。
+   */
+  setJoinAddr(addr: string | null): Promise<AccountList> {
+    return this.request<AccountList>("POST", "/api/join", { addr });
+  }
+
   /** 建号。`password` 缺省 = 服务端生成一个，响应里回显明文 + 二维码。 */
   createAccount(name: string, password?: string): Promise<AccountJoin> {
     const body: Record<string, string> = { name };

@@ -17,6 +17,10 @@
 //! | `RIDER_SIM_MAX_CONNECTIONS` | `64` | 同时在线上限 |
 //! | `RIDER_SIM_PUBLIC_ADDR` | 自动探测 | 烽火台告诉骑手「连哪个地址」时用的主机（`主机` 或 `主机:端口`） |
 //! | `RIDER_SIM_PUBLIC_URL` | 无 | 手机该连的**完整**地址（`wss://game.example.com/ws`）。配了它就以它为准，二维码与客户端原样使用 |
+//!
+//! 两个 `PUBLIC_*` 都只是**启动时**的初值：烽火台「骑手接入」面板里可以当场改
+//! （`POST /api/join`，换 Cloudflared 域名用），那条临时值优先级最高、但**不落库**，
+//! 服务端重启后仍以环境变量为准。
 //! | `RUST_LOG` | `info` | 日志级别 |
 
 use std::net::SocketAddr;

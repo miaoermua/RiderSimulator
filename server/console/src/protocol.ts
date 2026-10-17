@@ -446,6 +446,10 @@ export interface AccountJoin {
   join: JoinInfo | null;
   hosts: string[];
   primary_host: string | null;
+  /** 当前生效的接入地址（原样，可能来自环境变量）。null = 自动探测。 */
+  addr: string | null;
+  /** true = 这个地址是烽火台临时设的，服务端一重启就失效。 */
+  addr_override: boolean;
 }
 
 /** `GET /api/accounts`：名单 + 手机可达地址。 */
@@ -453,6 +457,10 @@ export interface AccountList {
   accounts: Account[];
   hosts: string[];
   primary_host: string | null;
+  /** 当前生效的接入地址（原样，可能来自环境变量）。null = 自动探测。 */
+  addr: string | null;
+  /** true = 这个地址是烽火台临时设的，服务端一重启就失效。 */
+  addr_override: boolean;
 }
 
 /** 服务端事件的载荷形状，按事件名索引。 */

@@ -184,6 +184,11 @@ pub struct App {
     /// 烽火台要拿它拼「手机的扫码地址」，所以不能在 `new` 里写死——
     /// 端口 0 只有在 `bind` 之后才知道最后落到哪儿。
     bound: Option<SocketAddr>,
+    /// 烽火台里临时改的「手机该连哪儿」。**不落库**（2026-10-17 拍板）：
+    /// 换了 Cloudflared 域名当场试一把，服务端一重启就回到环境变量 / 自动探测。
+    ///
+    /// 优先级最高——比 `RIDER_SIM_PUBLIC_URL` 还高，否则改完不生效等于没做这个入口。
+    join_addr: Option<String>,
 
     brain: TacticalBrain,
     judge: TaskJudge,
@@ -333,6 +338,7 @@ impl App {
             store,
             opts,
             bound: None,
+            join_addr: None,
             layer_models,
             brain,
             judge,
@@ -1263,6 +1269,7 @@ impl App {
             RpcRequest::SetAi(patch) => self.rpc_set_ai(&patch),
             RpcRequest::RejectAi { decision_id } => self.rpc_reject_ai(decision_id),
             RpcRequest::Accounts => Ok(self.rpc_accounts()),
+            RpcRequest::SetJoinAddr { addr } => self.rpc_set_join_addr(addr.as_deref()),
             RpcRequest::CreateAccount { name, password } => {
                 self.rpc_create_account(&name, password)
             }
@@ -1433,6 +1440,24 @@ impl App {
         self.with_join_hosts(json!({ "accounts": accounts }))
     }
 
+    /// 换「手机该连哪儿」。`None` / 空串 = 清掉临时值，回到环境变量或自动探测。
+    ///
+    /// **只存在内存里**：服务端一重启就没了（2026-10-17 拍板）。这是有意的——
+    /// Cloudflared 每次启动给的域名都不一样，把它写进库反而会让下次启动
+    /// 拿着一个已经死掉的域名去生成二维码。
+    ///
+    /// 地址不合法的输入**直接拒**：静默接受会让管理员对着一张连不上的二维码
+    /// 排查半天，而他刚填的东西就在眼前。
+    fn rpc_set_join_addr(&mut self, addr: Option<&str>) -> RpcReply {
+        let raw = addr.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(raw) = raw {
+            validate_join_addr(raw, self.listen_port()).map_err(ApiError::bad_request)?;
+        }
+        self.join_addr = raw.map(str::to_string);
+        tracing::info!(addr = ?self.join_addr, "烽火台改了骑手接入地址（只在本次运行内有效）");
+        Ok(self.with_join_hosts(json!({ "ok": true })))
+    }
+
     /// 建号。`password` 缺省就生成一个——管理员不该被迫想密码。
     ///
     /// 返回里带**明文密码和二维码**：库里只有哈希，所以这是唯一一次机会。
@@ -1535,11 +1560,14 @@ impl App {
         }
     }
 
-    /// 管理员配的「手机该连哪儿」：完整 URL 优先，其次纯主机。
+    /// 管理员配的「手机该连哪儿」：运行时临时值 > 完整 URL > 纯主机。
     ///
-    /// 两个都没配时返回 `None`，交给 [`crate::net::join::reachable_hosts`] 自己探。
+    /// 三个都没配时返回 `None`，交给 [`crate::net::join::reachable_hosts`] 自己探。
+    /// 烽火台那条排第一，是因为它存在的意义就是「不重启换 Cloudflared 域名」——
+    /// 排在环境变量后面就永远改不动。
     fn configured_join_addr(&self) -> Option<&str> {
         [
+            self.join_addr.as_deref(),
             self.opts.public_url.as_deref(),
             self.opts.public_addr.as_deref(),
         ]
@@ -1583,6 +1611,14 @@ impl App {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("hosts".to_string(), json!(hosts));
             obj.insert("primary_host".to_string(), json!(hosts.first()));
+            // 烽火台拿它回显输入框：`addr` 是当前生效的配置（可能来自环境变量），
+            // `addr_override` 区分「运行时临时设的」与「环境变量定的」——
+            // 前者才允许「恢复自动探测」清掉。
+            obj.insert(
+                "addr".to_string(),
+                json!(self.configured_join_addr().map(str::to_string)),
+            );
+            obj.insert("addr_override".to_string(), json!(self.join_addr.is_some()));
         }
         payload
     }
@@ -2834,6 +2870,44 @@ fn valid_latlng(lat: f64, lng: f64) -> bool {
         // (0, 0) 本身就是合法坐标，但它同时是「字段漏传」的缺省值，
         // 在这个界面里只可能是误操作，直接当非法处理。
         && !(lat == 0.0 && lng == 0.0)
+}
+
+/// 校验烽火台填进来的「手机该连哪儿」。
+///
+/// 两种写法都收：
+/// - 完整 URL（`https://xxx.trycloudflare.com`、`wss://域名/rider/ws`）——
+///   Cloudflared / 反代只能这么写，协议与端口不能靠猜；
+/// - `主机` 或 `主机:端口`——局域网那条老路，8080 由服务端补。
+///
+/// 带协议时统一交给 [`crate::net::join::normalize_public_url`] 判（它就是
+/// 实际拼二维码用的那套规则）；不带协议时这里只挡住明显写坏的输入。
+fn validate_join_addr(raw: &str, port: u16) -> Result<(), String> {
+    if raw.contains("://") {
+        return crate::net::join::normalize_public_url(raw, port)
+            .map(|_| ())
+            .ok_or_else(|| {
+                "地址不完整：写全 https://域名（反代后面只能用它）或 主机:端口".to_string()
+            });
+    }
+    if raw.contains(|c: char| c.is_whitespace() || c == '/' || c == '?' || c == '#') {
+        return Err("地址里不能有空格或路径；要挂子路径请写完整 URL（https://域名/路径）".into());
+    }
+    if raw.matches(':').count() > 1 {
+        // IPv6 字面量（`[::1]:8080`）不在支持范围内——二维码里给的地址是
+        // 「局域网 IPv4 或域名」，真要上 IPv6 得连方括号一起重新想。
+        return Err("只支持 主机 或 主机:端口；IPv6 地址不在支持范围内".into());
+    }
+    if let Some((_, p)) = raw.rsplit_once(':')
+        && p.parse::<u16>().is_err()
+    {
+        return Err(format!("端口「{p}」不是数字：写成 域名:端口"));
+    }
+    let (host, _) = crate::net::join::authority_host_port(raw, port)
+        .ok_or_else(|| "地址不能是空的".to_string())?;
+    if host == "0.0.0.0" {
+        return Err("0.0.0.0 只对本机有意义，手机连不上；填局域网 IP 或域名".into());
+    }
+    Ok(())
 }
 
 /// 控制端指令的执行结果占位。`control` 用它区分「成功」和「业务失败」。

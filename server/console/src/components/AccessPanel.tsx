@@ -35,6 +35,7 @@ import { store } from "../store";
  */
 export function AccessPanel() {
   const isControl = useIsControl();
+  const { message } = AntApp.useApp();
   const riders = useStore((s) => s.snap?.riders);
 
   const [list, setList] = useState<AccountList | null>(null);
@@ -42,11 +43,16 @@ export function AccessPanel() {
   const [error, setError] = useState<string | null>(null);
   /** 刚建号 / 刚重置出来的那一份「唯一一次」材料。 */
   const [minted, setMinted] = useState<AccountJoin | null>(null);
+  /** 「手机该连哪儿」输入框的草稿。刷新 / 保存后与服务端回显对齐。 */
+  const [addrDraft, setAddrDraft] = useState("");
+  const [savingAddr, setSavingAddr] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      setList(await store.listAccounts());
+      const fresh = await store.listAccounts();
+      setList(fresh);
+      setAddrDraft(fresh.addr ?? "");
       setError(null);
     } catch (e) {
       setError(errText(e));
@@ -54,6 +60,24 @@ export function AccessPanel() {
       setLoading(false);
     }
   }, []);
+
+  /** 保存接入地址。空串 = 恢复自动探测（环境变量 / 局域网探测）。 */
+  const saveAddr = async (addr: string | null) => {
+    setSavingAddr(true);
+    try {
+      const fresh = await store.setJoinAddr(addr);
+      setList(fresh);
+      setAddrDraft(fresh.addr ?? "");
+      message.success(
+        fresh.primary_host ? `手机该连 ${fresh.primary_host}` : "已恢复自动探测",
+      );
+    } catch (e) {
+      // 地址写坏了服务端会 400，文案已经写清楚，直接透传。
+      message.error(errText(e));
+    } finally {
+      setSavingAddr(false);
+    }
+  };
 
   useEffect(() => {
     if (isControl) void refresh();
@@ -74,7 +98,18 @@ export function AccessPanel() {
     <div className="console-scroll">
       <Heading>手机可达地址</Heading>
       {primary ? (
-        <AddressCard primary={primary} hosts={hosts} />
+        <>
+          <AddressCard primary={primary} hosts={hosts} />
+          <JoinAddrEditor
+            draft={addrDraft}
+            onChange={setAddrDraft}
+            onSave={() => void saveAddr(addrDraft.trim() || null)}
+            onReset={() => void saveAddr(null)}
+            saving={savingAddr}
+            override={list?.addr_override ?? false}
+            effective={primary}
+          />
+        </>
       ) : (
         <Typography.Text type="secondary">
           {loading ? "读取中…" : "服务端还没给出可达地址。"}
@@ -145,12 +180,68 @@ function AddressCard({ primary, hosts }: { primary: string; hosts: string[] }) {
           <Alert
             type="warning"
             showIcon
-            message="这是回环地址，手机连不上；请用局域网 IP 或域名（可设 RIDER_SIM_PUBLIC_ADDR）。"
+            message="这是回环地址，手机连不上；请用局域网 IP 或域名（可设 RIDER_SIM_PUBLIC_ADDR，或在下方直接填）。"
           />
         )}
         {hosts.length > 1 && (
           <Typography.Text type="secondary">备选：{hosts.slice(1).join("、")}</Typography.Text>
         )}
+      </Space>
+    </Card>
+  );
+}
+
+/**
+ * 临时换「手机该连哪儿」。
+ *
+ * Cloudflared 的域名每次起隧道都可能变，所以这里**不落库**：填完当场生效，
+ * 服务端重启就回到环境变量 / 自动探测。二维码是按当前地址现画的，改完之后
+ * 建的号、重置的密码都会用新地址——已经发出去的旧码不会变。
+ */
+function JoinAddrEditor({
+  draft,
+  onChange,
+  onSave,
+  onReset,
+  saving,
+  override,
+  effective,
+}: {
+  draft: string;
+  onChange: (v: string) => void;
+  onSave: () => void;
+  onReset: () => void;
+  saving: boolean;
+  /** 当前地址是不是烽火台临时设的（false = 来自环境变量或自动探测）。 */
+  override: boolean;
+  effective: string;
+}) {
+  return (
+    <Card size="small" style={{ marginTop: 8 }} title="自定义接入地址（临时）">
+      <Space direction="vertical" size={8} style={{ width: "100%" }}>
+        <Input
+          placeholder="https://xxx.trycloudflare.com"
+          value={draft}
+          allowClear
+          onChange={(e) => onChange(e.target.value)}
+          onPressEnter={onSave}
+        />
+        <Space wrap size={8}>
+          <Button type="primary" size="small" loading={saving} onClick={onSave}>
+            保存并生效
+          </Button>
+          <Button size="small" disabled={!override || saving} onClick={onReset}>
+            恢复自动探测
+          </Button>
+          <Typography.Text type="secondary">当前：{effective}</Typography.Text>
+        </Space>
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          Cloudflared 填完整地址（https://xxx.trycloudflare.com），服务端会转成
+          wss://…:443/ws；只填 IP 或域名时按 ws://…:8080/ws 处理。
+        </Typography.Text>
+        <Typography.Text type="warning" style={{ fontSize: 12 }}>
+          只在本次运行内有效，重启回到环境变量或自动探测。已经发出去的旧二维码不会跟着变——要新码请重置该骑手的密码。
+        </Typography.Text>
       </Space>
     </Card>
   );

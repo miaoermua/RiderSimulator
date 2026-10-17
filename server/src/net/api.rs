@@ -69,6 +69,12 @@ pub const ACCOUNTS_PATH: &str = "/api/accounts";
 pub const ACCOUNT_PASSWORD_PATH: &str = "/api/accounts/{name}/password";
 /// `DELETE` 删账号。
 pub const ACCOUNT_PATH: &str = "/api/accounts/{name}";
+/// `POST` 换「手机该连哪儿」（`{"addr": "https://xxx.trycloudflare.com"}`，
+/// `null` / 空串 = 恢复环境变量或自动探测）。
+///
+/// **只在本次运行内有效，不落库**：Cloudflared 每次给的域名都不一样，
+/// 存进库只会让下次启动拿着一个已经死掉的地址生成二维码。
+pub const JOIN_PATH: &str = "/api/join";
 /// 平台活动：`GET` 列全部（含已下架），`POST` 新建。
 pub const ACTIVITIES_PATH: &str = "/api/activities";
 /// `POST` 上架 / 下架某个活动（`{"active": false}`）。
@@ -149,6 +155,10 @@ pub enum RpcRequest {
     RejectAi { decision_id: u64 },
     /// 账号名单 + 手机可达的接入地址。
     Accounts,
+    /// 换「手机该连哪儿」。`None` = 清掉临时值，回到环境变量 / 自动探测。
+    ///
+    /// 只改内存，不落库——见 [`JOIN_PATH`] 的说明。
+    SetJoinAddr { addr: Option<String> },
     /// 建号。`password` 缺省 = 服务端生成一个（响应里回显明文 + 二维码）。
     CreateAccount {
         name: String,
@@ -344,6 +354,7 @@ pub fn routes(state: ApiState) -> Router {
         )
         .route(ACCOUNT_PASSWORD_PATH, post(account_password_route))
         .route(ACCOUNT_PATH, delete(account_delete_route))
+        .route(JOIN_PATH, post(join_addr_route))
         .route(
             ACTIVITIES_PATH,
             get(activities_route).post(create_activity_route),
@@ -464,6 +475,22 @@ async fn notice_delete_route(State(api): State<ApiState>, headers: HeaderMap) ->
 
 async fn accounts_route(State(api): State<ApiState>, headers: HeaderMap) -> Response {
     api.call(&headers, RpcRequest::Accounts).await
+}
+
+/// `POST /api/join` —— 换骑手的接入地址。
+///
+/// `addr` 缺省 / `null` / 空串都表示「恢复自动」——清掉临时值后，环境变量
+/// （`RIDER_SIM_PUBLIC_URL` / `_ADDR`）或局域网探测重新接管。
+///
+/// 只校验形状，不验证「这个域名现在通不通」：服务端没法替手机试一遍，
+/// 而且 Cloudflared 域名是等隧道起来后才可用的。
+async fn join_addr_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let addr = body.get("addr").and_then(Value::as_str).map(str::to_string);
+    api.call(&headers, RpcRequest::SetJoinAddr { addr }).await
 }
 
 async fn create_account_route(

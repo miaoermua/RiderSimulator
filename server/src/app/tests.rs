@@ -1920,6 +1920,105 @@ fn rpc_accounts_marks_who_is_on_the_field() {
 }
 
 #[test]
+fn join_addr_can_be_swapped_at_runtime_and_new_qr_follows() {
+    // 管理员不用重启就能把「手机该连哪儿」换成 Cloudflared 域名。
+    let mut app = control_app();
+    let v = rpc(
+        &mut app,
+        RpcRequest::SetJoinAddr {
+            addr: Some("https://abc.trycloudflare.com".into()),
+        },
+    )
+    .expect("合法地址不该被拒");
+
+    assert_eq!(
+        v["primary_host"].as_str(),
+        Some("wss://abc.trycloudflare.com:443/ws"),
+        "https 要规范成 wss + 443 + /ws"
+    );
+    assert_eq!(v["addr"].as_str(), Some("https://abc.trycloudflare.com"));
+    assert_eq!(v["addr_override"].as_bool(), Some(true), "要标出这是临时值");
+
+    // 名单接口也立刻反映新地址（控制台保存后就是靠它刷新的）。
+    let list = rpc(&mut app, RpcRequest::Accounts).unwrap();
+    assert_eq!(
+        list["primary_host"].as_str(),
+        Some("wss://abc.trycloudflare.com:443/ws")
+    );
+
+    // 之后建的号，二维码里必须是新地址（`url=` 字段带上 wss），否则扫码连的还是老的。
+    let made = create_account(&mut app, "张师傅", Some("pass1234"));
+    assert_eq!(
+        made["join"]["ws_url"].as_str(),
+        Some("wss://abc.trycloudflare.com:443/ws")
+    );
+    assert!(
+        made["join"]["uri"]
+            .as_str()
+            .unwrap()
+            .contains("url=wss%3A%2F%2Fabc.trycloudflare.com"),
+        "{}",
+        made["join"]["uri"]
+    );
+}
+
+#[test]
+fn join_addr_runtime_value_beats_env_and_clearing_gives_env_back() {
+    let mut app = App::new(
+        world(),
+        Store::in_memory().unwrap(),
+        AppOptions {
+            allow_control: true,
+            public_url: Some("wss://from-env.example.com/ws".into()),
+            ..AppOptions::default()
+        },
+    );
+    assert_eq!(
+        app.join_hosts()[0],
+        "wss://from-env.example.com:443/ws",
+        "没设临时值时用环境变量"
+    );
+
+    rpc(
+        &mut app,
+        RpcRequest::SetJoinAddr {
+            addr: Some("10.0.0.9:9000".into()),
+        },
+    )
+    .unwrap();
+    assert_eq!(app.join_hosts()[0], "10.0.0.9:9000", "临时值要压过环境变量");
+
+    let v = rpc(&mut app, RpcRequest::SetJoinAddr { addr: None }).expect("清空不该失败");
+    assert!(v["addr_override"].as_bool() == Some(false));
+    assert_eq!(
+        app.join_hosts()[0],
+        "wss://from-env.example.com:443/ws",
+        "清掉临时值后回到环境变量"
+    );
+}
+
+#[test]
+fn join_addr_rejects_malformed_input_instead_of_silently_connecting_nowhere() {
+    let mut app = control_app();
+    for bad in ["wss://", "https:///ws", "0.0.0.0", "host:8080:9000"] {
+        let err = rpc(
+            &mut app,
+            RpcRequest::SetJoinAddr {
+                addr: Some(bad.into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "「{bad}」应该被拒"
+        );
+    }
+    // 拒了就不能悄悄改掉原来的值。
+    assert!(rpc(&mut app, RpcRequest::Accounts).unwrap()["addr"].is_null());
+}
+
+#[test]
 fn deleting_an_account_stops_the_login() {
     let mut app = control_app();
     create_account(&mut app, "张师傅", Some("pass1234"));
