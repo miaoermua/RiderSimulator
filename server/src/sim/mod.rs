@@ -7,6 +7,7 @@
 //! （见 [`tick::TickInput`]）。本模块是被所有上层依赖的一层，不许反向依赖。
 //! 源码级断言见 `server/tests/layering.rs`。
 
+pub mod activity;
 pub mod ai;
 pub mod chat;
 pub mod config;

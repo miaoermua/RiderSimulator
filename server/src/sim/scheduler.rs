@@ -779,6 +779,9 @@ pub fn deliver(
         takehome_cents: takehome,
         hourly_wage_cents: hourly,
     });
+    // 活动奖金是**额外一笔**：不参与本单的抽水 / 超时罚款计算，达标的当场入账。
+    // 放在这里而不是 `economy` 里面，是因为它跟这一单的钱怎么算完全无关。
+    events.extend(super::activity::credit(world, rider_id));
     if late {
         events.push(SimEvent::FineIssued {
             rider_id,

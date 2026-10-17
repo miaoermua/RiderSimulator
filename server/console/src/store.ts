@@ -4,6 +4,7 @@ import {
   isLlmSource,
   type AccountJoin,
   type AccountList,
+  type ActivityView,
   type AiOpBrief,
   type AiState,
   type ConfigView,
@@ -407,6 +408,36 @@ class ConsoleStore {
     return this.request<AccountJoin>("POST", "/api/accounts", body);
   }
 
+  // ---------------- 平台活动（HTTP） ----------------
+
+  /** 全部活动（含已下架的）。手机端看的是快照里的同一份数据。 */
+  listActivities(): Promise<{ activities: ActivityView[] }> {
+    return this.request<{ activities: ActivityView[] }>("GET", "/api/activities");
+  }
+
+  /**
+   * 建一个活动。**达成即自动入账**，不需要骑手点领取。
+   *
+   * `target_orders` 必须 > 0：0 单等于「所有人下一单就达标」，纯送钱。
+   */
+  createActivity(fields: {
+    title: string;
+    target_orders: number;
+    reward_cents: number;
+  }): Promise<{ id: number }> {
+    return this.request<{ id: number }>("POST", "/api/activities", fields);
+  }
+
+  /** 上架 / 下架。下架后不再累计、不再发奖；已发的不收回。 */
+  setActivityActive(id: number, active: boolean): Promise<unknown> {
+    return this.request("POST", `/api/activities/${id}/active`, { active });
+  }
+
+  /** 删掉活动。已发的奖金不收回。 */
+  deleteActivity(id: number): Promise<unknown> {
+    return this.request("DELETE", `/api/activities/${id}`);
+  }
+
   /** 改 / 重置密码。`password` 缺省 = 服务端生成一个。 */
   setAccountPassword(name: string, password?: string): Promise<AccountJoin> {
     const body: Record<string, string> = {};
@@ -544,6 +575,32 @@ class ConsoleStore {
       case "config_changed":
         this.resync();
         break;
+      case "activities_changed": {
+        // 快照只在连接时来一次，活动列表靠这条事件就地更新。
+        const a = p as EventPayloads["activities_changed"];
+        const snap = this.state.snap;
+        if (snap) this.set({ snap: { ...snap, activities: a.activities } });
+        break;
+      }
+      case "activity_progress": {
+        const a = p as EventPayloads["activity_progress"];
+        const snap = this.state.snap;
+        if (!snap) break;
+        const next = mergeRider(snap.riders, a.rider_id, {
+          activities: a.activities,
+        });
+        this.set({ snap: { ...snap, riders: next } });
+        break;
+      }
+      case "activity_reward": {
+        const a = p as EventPayloads["activity_reward"];
+        this.log(
+          `活动奖励「${a.title}」+${yuan(a.amount_cents)}（${a.completed}/${a.target_orders} 单）`,
+          "活动",
+          "green",
+        );
+        break;
+      }
       case "ai_decision": {
         const a = p as EventPayloads["ai_decision"];
         const llm = isLlmSource(a.source);

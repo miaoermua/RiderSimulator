@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     OrderId, RiderId,
+    activity::ActivityProgress,
     config::{PEAK_THRESHOLD_MULTIPLIER, SimConfig},
     geo::LatLng,
     route::{LegKind, RouteTask},
@@ -457,6 +458,10 @@ pub struct Rider {
 
     /// 最近一次收入变动的说明，给账单用。
     pub last_ledger: Vec<LedgerEntry>,
+
+    /// 平台活动进度，每人一份。老存档没有这个字段 = 没参加过任何活动。
+    #[serde(default)]
+    pub activities: Vec<ActivityProgress>,
 }
 
 /// 账单明细一条。罚单必须带原因。
@@ -510,6 +515,7 @@ impl Rider {
             home_lng: pos.lng,
             recall_count: 0,
             last_ledger: Vec::new(),
+            activities: Vec::new(),
         }
     }
 

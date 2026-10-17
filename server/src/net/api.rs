@@ -69,6 +69,12 @@ pub const ACCOUNTS_PATH: &str = "/api/accounts";
 pub const ACCOUNT_PASSWORD_PATH: &str = "/api/accounts/{name}/password";
 /// `DELETE` 删账号。
 pub const ACCOUNT_PATH: &str = "/api/accounts/{name}";
+/// 平台活动：`GET` 列全部（含已下架），`POST` 新建。
+pub const ACTIVITIES_PATH: &str = "/api/activities";
+/// `POST` 上架 / 下架某个活动（`{"active": false}`）。
+pub const ACTIVITY_ACTIVE_PATH: &str = "/api/activities/{id}/active";
+/// `DELETE` 删掉某个活动。
+pub const ACTIVITY_ITEM_PATH: &str = "/api/activities/{id}";
 
 /// 鉴权配置。由 `main.rs` 的环境变量决定。
 #[derive(Debug, Clone, Default)]
@@ -151,6 +157,18 @@ pub enum RpcRequest {
     },
     /// 删号。
     DeleteAccount { name: String },
+    /// 列活动（含已下架的）。
+    Activities,
+    /// 建活动。达成后奖金自动入账。
+    CreateActivity {
+        title: String,
+        target_orders: u32,
+        reward_cents: i64,
+    },
+    /// 上架 / 下架。
+    SetActivityActive { id: u32, active: bool },
+    /// 删活动。
+    DeleteActivity { id: u32 },
 }
 
 /// 主循环回给 HTTP 的结果。
@@ -306,7 +324,75 @@ pub fn routes(state: ApiState) -> Router {
         )
         .route(ACCOUNT_PASSWORD_PATH, post(account_password_route))
         .route(ACCOUNT_PATH, delete(account_delete_route))
+        .route(
+            ACTIVITIES_PATH,
+            get(activities_route).post(create_activity_route),
+        )
+        .route(ACTIVITY_ACTIVE_PATH, post(activity_active_route))
+        .route(ACTIVITY_ITEM_PATH, delete(activity_delete_route))
         .with_state(state)
+}
+
+async fn activities_route(State(api): State<ApiState>, headers: HeaderMap) -> Response {
+    api.call(&headers, RpcRequest::Activities).await
+}
+
+/// `POST /api/activities` —— 建一个活动。
+///
+/// `reward_cents` 是**分**；控制台用元填表，转好再发。`target_orders` 必须 > 0，
+/// 否则「跑 0 单给钱」会立刻给所有在线骑手发钱。
+async fn create_activity_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(title) = body.get("title").and_then(Value::as_str) else {
+        return ApiError::bad_request("需要 title（活动标题）").into_response();
+    };
+    let Some(target_orders) = body.get("target_orders").and_then(Value::as_u64) else {
+        return ApiError::bad_request("需要 target_orders（正整数）").into_response();
+    };
+    let Ok(target_orders) = u32::try_from(target_orders) else {
+        return ApiError::bad_request("target_orders 太大").into_response();
+    };
+    // 允许只传 reward_yuan（控制台表单就是元），服务端当场换成整数分。
+    let reward_cents = match body.get("reward_cents").and_then(Value::as_i64) {
+        Some(cents) => cents,
+        None => {
+            let Some(yuan) = body.get("reward_yuan").and_then(Value::as_f64) else {
+                return ApiError::bad_request("需要 reward_cents 或 reward_yuan").into_response();
+            };
+            (yuan * 100.0).round() as i64
+        }
+    };
+    api.call(
+        &headers,
+        RpcRequest::CreateActivity {
+            title: title.to_string(),
+            target_orders,
+            reward_cents,
+        },
+    )
+    .await
+}
+
+async fn activity_active_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<u32>,
+    Json(body): Json<Value>,
+) -> Response {
+    let active = body.get("active").and_then(Value::as_bool).unwrap_or(true);
+    api.call(&headers, RpcRequest::SetActivityActive { id, active })
+        .await
+}
+
+async fn activity_delete_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<u32>,
+) -> Response {
+    api.call(&headers, RpcRequest::DeleteActivity { id }).await
 }
 
 async fn accounts_route(State(api): State<ApiState>, headers: HeaderMap) -> Response {

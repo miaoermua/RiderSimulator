@@ -49,6 +49,13 @@ class GameState extends ChangeNotifier {
   List<OrderView> activeOrders = [];
   List<DayLedgerView> ledgers = const [];
 
+  /// 平台活动（含已下架的）。进行中的见 [runningActivities]。
+  List<ActivityView> activities = const [];
+
+  /// 进行中的活动。活动中心只列这些。
+  List<ActivityView> get runningActivities =>
+      activities.where((a) => a.active).toList();
+
   /// 每条订单的任务对话（绑在附加任务上）。
   final Map<int, List<TaskLine>> taskLines = {};
 
@@ -258,6 +265,29 @@ class GameState extends ChangeNotifier {
           '${reqStr(frame.payload['reason'], '违规')}',
           kind: LogKind.bad,
         );
+      case Ev.activitiesChanged:
+        // 快照只在连接时来一次，烽火台改活动靠这条事件推过来。
+        activities = listOf(frame.payload['activities'], ActivityView.fromJson);
+      case Ev.activityProgress:
+        // 每完成一单推一条：活动页的进度条实时动。
+        final rid = reqInt(frame.payload['rider_id']);
+        final updated = listOf(
+          frame.payload['activities'],
+          ActivityProgressView.fromJson,
+        );
+        final rider = riders[rid];
+        if (rid == riderId && rider != null) {
+          riders[rid] = _copyRider(rider, activities: updated);
+        }
+      case Ev.activityReward:
+        // 奖金已经进账（服务端自动发），这里只负责让人知道。
+        note(
+          '活动奖励 +${yuan(reqInt(frame.payload['amount_cents']))} 元：'
+          '${reqStr(frame.payload['title'], '平台活动')}'
+          '（${reqInt(frame.payload['completed'])}/'
+          '${reqInt(frame.payload['target_orders'])} 单）',
+          kind: LogKind.money,
+        );
       case Ev.weatherChanged:
         _applyWeather(frame.payload);
       case Ev.configChanged:
@@ -313,6 +343,7 @@ class GameState extends ChangeNotifier {
     hall = List.of(s.hall);
     activeOrders = List.of(s.activeOrders);
     ledgers = s.lastDayLedgers;
+    activities = s.activities;
     if (announce) note('已同步世界状态');
   }
 
@@ -601,6 +632,7 @@ class GameState extends ChangeNotifier {
     int? takehomeCents,
     double? lat,
     double? lng,
+    List<ActivityProgressView>? activities,
   }) =>
       RiderView(
         id: r.id,
@@ -623,5 +655,6 @@ class GameState extends ChangeNotifier {
         takehomeCents: takehomeCents ?? r.takehomeCents,
         cashCents: r.cashCents,
         finesCents: r.finesCents,
+        activities: activities ?? r.activities,
       );
 }

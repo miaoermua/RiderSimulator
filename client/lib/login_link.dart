@@ -30,6 +30,7 @@ class LoginLink {
     required this.port,
     required this.name,
     required this.password,
+    this.url,
   });
 
   /// 手机可达的地址（IP 或域名），**不含端口**。
@@ -42,8 +43,13 @@ class LoginLink {
   /// 明文密码。
   final String password;
 
+  /// 服务端配了完整地址时带的那一条（`wss://game.example.com/ws`）。
+  ///
+  /// 反代后面协议、端口、路径都可能不是默认值，有它就不要再拼。
+  final String? url;
+
   /// 该连的 WebSocket 地址。
-  String get wsUrl => 'ws://$host:$port$kWsPath';
+  String get wsUrl => url ?? 'ws://$host:$port$kWsPath';
 
   /// 拼回连接串。
   ///
@@ -55,12 +61,14 @@ class LoginLink {
     required int port,
     required String name,
     required String password,
+    String? url,
   }) =>
       '$kLoginScheme://$kLoginHost'
       '?host=${Uri.encodeComponent(host)}'
       '&port=$port'
       '&name=${Uri.encodeComponent(name)}'
-      '&password=${Uri.encodeComponent(password)}';
+      '&password=${Uri.encodeComponent(password)}'
+      '${url == null ? '' : '&url=${Uri.encodeComponent(url)}'}';
 
   /// 解析一条连接串。
   ///
@@ -95,7 +103,17 @@ class LoginLink {
     if (host.isEmpty || name.isEmpty || password.isEmpty) return null;
     if (port == null || port <= 0 || port > 65535) return null;
 
-    return LoginLink(host: host, port: port, name: name, password: password);
+    // 服务端配了完整地址时优先用它；写坏了就当没带，退回 host/port。
+    final rawUrl = (q['url'] ?? '').trim();
+    final url = rawUrl.isEmpty ? null : normalizeServerUrl(rawUrl);
+
+    return LoginLink(
+      host: host,
+      port: port,
+      name: name,
+      password: password,
+      url: (url == null || url.isEmpty) ? null : url,
+    );
   }
 }
 

@@ -64,6 +64,12 @@ abstract final class Ev {
   static const riderFinance = 'rider_finance';
   static const weatherChanged = 'weather_changed';
   static const fineIssued = 'fine_issued';
+  /// 活动定义变化（新建 / 上下架 / 删除）。
+  static const activitiesChanged = 'activities_changed';
+  /// 活动进度变化（又完成了一单）。只推给本人与控制端。
+  static const activityProgress = 'activity_progress';
+  /// 活动达成，奖金已自动入账。只推给本人与控制端。
+  static const activityReward = 'activity_reward';
   static const configChanged = 'config_changed';
   static const aiDecision = 'ai_decision';
   static const taskMessage = 'task_message';
@@ -521,6 +527,55 @@ class OrderView {
   }
 }
 
+/// 一个平台活动（公开信息）。
+class ActivityView {
+  const ActivityView({
+    required this.id,
+    required this.title,
+    required this.targetOrders,
+    required this.rewardCents,
+    required this.active,
+  });
+
+  final int id;
+  final String title;
+  /// 目标单数。
+  final int targetOrders;
+  /// 奖金（分）。
+  final int rewardCents;
+  /// 是否在进行中。下架的活动不再累计，也不发奖。
+  final bool active;
+
+  factory ActivityView.fromJson(Map<String, dynamic> j) => ActivityView(
+        id: reqInt(j['id']),
+        title: reqStr(j['title']),
+        targetOrders: reqInt(j['target_orders']),
+        rewardCents: reqInt(j['reward_cents']),
+        active: reqBool(j['active']),
+      );
+}
+
+/// 我在某个活动上的进度。**只有本人 / 控制端拿得到**。
+class ActivityProgressView {
+  const ActivityProgressView({
+    required this.activityId,
+    required this.completed,
+    required this.rewarded,
+  });
+
+  final int activityId;
+  final int completed;
+  /// 奖金是否已发（发过就只涨进度、不再发钱）。
+  final bool rewarded;
+
+  factory ActivityProgressView.fromJson(Map<String, dynamic> j) =>
+      ActivityProgressView(
+        activityId: reqInt(j['activity_id']),
+        completed: reqInt(j['completed']),
+        rewarded: reqBool(j['rewarded']),
+      );
+}
+
 /// 骑手对外快照。收入字段只有本人 / 控制端才有值。
 class RiderView {
   const RiderView({
@@ -544,6 +599,7 @@ class RiderView {
     required this.takehomeCents,
     required this.cashCents,
     required this.finesCents,
+    required this.activities,
   });
 
   final int id;
@@ -569,7 +625,18 @@ class RiderView {
   final int? cashCents;
   final int? finesCents;
 
+  /// 活动进度。公开版为空数组（别人的进度不关你的事）。
+  final List<ActivityProgressView> activities;
+
   bool get hasFinance => takehomeCents != null;
+
+  /// 我在某个活动上跑了几单。没参加过返回 `null`。
+  ActivityProgressView? progressOf(int activityId) {
+    for (final p in activities) {
+      if (p.activityId == activityId) return p;
+    }
+    return null;
+  }
 
   factory RiderView.fromJson(Map<String, dynamic> j) => RiderView(
         id: reqInt(j['id']),
@@ -594,6 +661,7 @@ class RiderView {
         takehomeCents: optInt(j['takehome_cents']),
         cashCents: optInt(j['cash_cents']),
         finesCents: optInt(j['fines_cents']),
+        activities: listOf(j['activities'], ActivityProgressView.fromJson),
       );
 }
 
@@ -775,6 +843,7 @@ class Snapshot {
     required this.merchants,
     required this.lastDayLedgers,
     required this.claimWindowMs,
+    required this.activities,
   });
 
   final int day;
@@ -792,6 +861,9 @@ class Snapshot {
   final List<DayLedgerView> lastDayLedgers;
   final int claimWindowMs;
 
+  /// 平台活动（含已下架的，展示时自己过滤 [ActivityView.active]）。
+  final List<ActivityView> activities;
+
   factory Snapshot.fromJson(Map<String, dynamic> j) => Snapshot(
         day: reqInt(j['day'], 1),
         simMinute: reqInt(j['sim_minute']),
@@ -807,6 +879,7 @@ class Snapshot {
         merchants: listOf(j['merchants'], MerchantView.fromJson),
         lastDayLedgers: listOf(j['last_day_ledgers'], DayLedgerView.fromJson),
         claimWindowMs: reqInt(j['claim_window_ms'], 5000),
+        activities: listOf(j['activities'], ActivityView.fromJson),
       );
 }
 

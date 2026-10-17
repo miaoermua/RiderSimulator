@@ -15,6 +15,8 @@
 //! | `RIDER_SIM_CONTROL_TOKEN` | 无 | 控制端令牌。WS 用 `hello.token = "control:<令牌>"`；HTTP 用 `Authorization: Bearer <令牌>` |
 //! | `RIDER_SIM_LLM` | `false` | 是否启用 LLM（无 Key 时自动关闭） |
 //! | `RIDER_SIM_MAX_CONNECTIONS` | `64` | 同时在线上限 |
+//! | `RIDER_SIM_PUBLIC_ADDR` | 自动探测 | 烽火台告诉骑手「连哪个地址」时用的主机（`主机` 或 `主机:端口`） |
+//! | `RIDER_SIM_PUBLIC_URL` | 无 | 手机该连的**完整**地址（`wss://game.example.com/ws`）。配了它就以它为准，二维码与客户端原样使用 |
 //! | `RUST_LOG` | `info` | 日志级别 |
 
 use std::net::SocketAddr;
@@ -80,6 +82,8 @@ async fn main() -> std::io::Result<()> {
             .filter(|t| !t.trim().is_empty()),
         max_connections: env_parse("RIDER_SIM_MAX_CONNECTIONS").unwrap_or(64),
         llm_enabled: env_flag("RIDER_SIM_LLM", false),
+        public_addr: env_text("RIDER_SIM_PUBLIC_ADDR"),
+        public_url: env_text("RIDER_SIM_PUBLIC_URL"),
         ..AppOptions::default()
     };
 
@@ -113,6 +117,14 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
             None
         }
     }
+}
+
+/// 读一段非空文本；缺失或只有空白都返回 `None`。
+fn env_text(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// 布尔开关：`1/true/yes/on` 为真，其余为假。

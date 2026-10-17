@@ -32,7 +32,7 @@ class RiderDrawer extends StatelessWidget {
               const Divider(height: 1),
               ListTile(
                 leading: const Icon(Icons.notifications_none),
-                title: const Text('通知消息'),
+                title: const Text('通知和活动中心'),
                 trailing: state.unreadLogs == 0
                     ? null
                     : Badge(label: Text('${state.unreadLogs}')),

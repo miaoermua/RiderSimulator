@@ -7,7 +7,7 @@ use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 
 use super::{
-    MINUTES_PER_DAY, OrderId, RiderId,
+    MINUTES_PER_DAY, OrderId, RiderId, activity,
     ai::{self, LlmPlan},
     config::{
         MAX_REDISPATCH_ATTEMPTS, REDISPATCH_PROMISE_FLOOR_MIN, REDISPATCH_SURCHARGE_STEP_CENTS,
@@ -191,6 +191,8 @@ pub struct PublicSnapshot {
     pub last_day_ledgers: Vec<DayLedger>,
     /// 抢单窗口（毫秒）。
     pub claim_window_ms: u64,
+    /// 平台活动定义（含已下架的，手机端自己过滤）。进度在骑手身上。
+    pub activities: Vec<activity::PlatformActivity>,
 }
 
 /// 全局状态。
@@ -217,6 +219,10 @@ pub struct World {
     /// 本 tick 待消费的 LLM 计划（由 app 层异步拿到后塞进来）。
     pub llm_plan: Option<LlmPlan>,
     pub last_day_ledgers: Vec<DayLedger>,
+    /// 平台活动定义。进度不在这里——见 [`activity`]。
+    pub activities: Vec<activity::PlatformActivity>,
+    /// 下一个活动 id，只增不减。
+    pub next_activity_id: u32,
 }
 
 impl World {
@@ -246,6 +252,8 @@ impl World {
             stats: SimStats::default(),
             llm_plan: None,
             last_day_ledgers: Vec::new(),
+            activities: Vec::new(),
+            next_activity_id: 1,
         };
         for _ in 0..w.cfg.sim_rider_count {
             w.spawn_sim_rider();
@@ -1090,6 +1098,7 @@ impl World {
             // 实时档下窗口退化为 1 tick，这里必须跟着变成 60000，否则
             // 客户端会照着 3 秒去倒计时，而订单其实还能挂一分钟。
             claim_window_ms: self.cfg.claim_window_ticks() as u64 * self.cfg.tick_interval_ms(),
+            activities: self.activities.clone(),
         }
     }
 }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { App as AntApp, Layout, Tabs, theme } from "antd";
 import { useStore } from "./hooks";
 import { AccessPanel } from "./components/AccessPanel";
+import { ActivitiesPanel } from "./components/ActivitiesPanel";
 import { AiPanel } from "./components/AiPanel";
 import { ChatPanel } from "./components/ChatPanel";
 import { LoginGate } from "./components/LoginGate";
@@ -17,8 +18,8 @@ import { store } from "./store";
 const SIDER_MIN = 380;
 const SIDER_MAX = 720;
 const SIDER_DEFAULT = 420;
-/** 7 个标签按中文 14px 实测需要约 571px，见 styles.css 里的说明。 */
-const SIDER_FITS_TABS = 600;
+/** 8 个标签（多了「活动」）按中文 14px 实测需要约 650px，见 styles.css 里的说明。 */
+const SIDER_FITS_TABS = 680;
 
 export function App() {
   const { message } = AntApp.useApp();
@@ -75,6 +76,7 @@ export function App() {
     { key: "chat", label: "会话", children: <ChatPanel /> },
     { key: "ai", label: "AI", children: <AiPanel /> },
     { key: "access", label: "骑手接入", children: <AccessPanel /> },
+    { key: "activities", label: "活动", children: <ActivitiesPanel /> },
     { key: "settings", label: "设置", children: <SettingsPanel /> },
     { key: "log", label: "日志", children: <LogPanel /> },
   ];

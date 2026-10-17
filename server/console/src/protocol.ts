@@ -81,6 +81,8 @@ export interface RiderBrief {
   phase: Phase | null;
   lat: number;
   lng: number;
+  /** 活动进度。公开版是空数组，本人 / 控制端才有。 */
+  activities: ActivityProgressView[];
   /** 以下收入字段只对本人 / 控制端下发，其余角色为 null。 */
   hourly_wage_cents: number | null;
   takehome_cents: number | null;
@@ -244,6 +246,28 @@ export interface Snapshot {
   merchants: MerchantBrief[];
   stats: SimStats;
   claim_window_ms: number;
+  /** 平台活动（含已下架的）。 */
+  activities: ActivityView[];
+}
+
+/** 一个平台活动。达成奖金由服务端自动入账。 */
+export interface ActivityView {
+  id: number;
+  title: string;
+  /** 目标单数（活动期间完成多少单算达成）。 */
+  target_orders: number;
+  /** 奖金（分）。 */
+  reward_cents: number;
+  active: boolean;
+  /** 建活动时的模拟分钟（自开局起算）。 */
+  created_at_min: number;
+}
+
+/** 某位骑手在某个活动上的进度。 */
+export interface ActivityProgressView {
+  activity_id: number;
+  completed: number;
+  rewarded: boolean;
 }
 
 export interface Tick {
@@ -513,6 +537,23 @@ export interface EventPayloads {
     ops?: Array<Record<string, unknown>>;
     narrate?: string | null;
     dropped?: number;
+  };
+  /** 活动定义变了（建 / 上下架 / 删）。全体可见。 */
+  activities_changed: { activities: ActivityView[] };
+  /** 某位骑手的活动进度变了（又完成一单）。只推给本人与控制端。 */
+  activity_progress: {
+    rider_id: number;
+    activities: ActivityProgressView[];
+  };
+  /** 活动达成，奖金已自动入账。只推给本人与控制端。 */
+  activity_reward: {
+    rider_id: number;
+    activity_id: number;
+    title: string;
+    amount_cents: number;
+    completed: number;
+    target_orders: number;
+    takehome_cents: number;
   };
   /** AI 说的一句话（烽火台旁白等）。只影响气氛，不改数值。 */
   narration: { layer: string; text: string };

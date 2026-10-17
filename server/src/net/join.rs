@@ -36,6 +36,11 @@ pub struct JoinInfo {
     pub name: String,
     /// 明文密码。见模块头的取舍说明。
     pub password: String,
+    /// 管理员配的**完整** WebSocket 地址（`wss://game.example.com/ws`）。
+    ///
+    /// `None` = 没配，按 `host` + `port` + `/ws` 现拼。配了就必须原样用——
+    /// 反代后面协议（wss）、端口、路径都可能不是默认值，再拼一次必然连错。
+    pub url: Option<String>,
 }
 
 impl JoinInfo {
@@ -50,23 +55,41 @@ impl JoinInfo {
             port,
             name: name.into(),
             password: password.into(),
+            url: None,
         }
+    }
+
+    /// 带上管理员配置的完整地址。见 [`JoinInfo::url`] 的说明。
+    pub fn with_url(mut self, url: Option<String>) -> Self {
+        self.url = url;
+        self
     }
 
     /// 客户端真正去连的地址。手填路径与扫码路径最终都归到它。
     pub fn ws_url(&self) -> String {
-        format!("ws://{}:{}/ws", self.host, self.port)
+        match &self.url {
+            Some(url) => url.clone(),
+            None => format!("ws://{}:{}/ws", self.host, self.port),
+        }
     }
 
     /// 二维码内容。手填路径要输的三样，全在里面。
+    ///
+    /// 配了完整地址时额外带 `url=`：客户端优先用它，老客户端忽略它、
+    /// 继续用 `host`/`port`（扫描结果仍然可用，只是可能连不到反代后面）。
     pub fn login_uri(&self) -> String {
-        format!(
+        let mut uri = format!(
             "{LOGIN_SCHEME}://login?host={}&port={}&name={}&password={}",
             percent_encode(&self.host),
             self.port,
             percent_encode(&self.name),
             percent_encode(&self.password),
-        )
+        );
+        if let Some(url) = &self.url {
+            uri.push_str("&url=");
+            uri.push_str(&percent_encode(url));
+        }
+        uri
     }
 
     /// 二维码图，SVG 文本。控制台直接塞进 DOM，不用引前端二维码库。
@@ -89,7 +112,16 @@ pub fn reachable_hosts(bound: SocketAddr, configured: Option<&str>) -> Vec<Strin
     let mut out: Vec<String> = Vec::new();
 
     if let Some(c) = configured.map(str::trim).filter(|c| !c.is_empty()) {
-        push_unique(&mut out, with_port(c, port));
+        // 配了完整 URL（`wss://game.example.com/ws`）就整条推出去：它本身就是
+        // 「手机该连哪儿」的答案，拆成 host:port 再拼一次会把协议和路径弄丢。
+        let url = c
+            .contains("://")
+            .then(|| normalize_public_url(c, port))
+            .flatten();
+        match url {
+            Some(url) => push_unique(&mut out, url),
+            None => push_unique(&mut out, with_port(c, port)),
+        }
     }
 
     let ip = bound.ip();
@@ -111,6 +143,81 @@ fn push_unique(out: &mut Vec<String>, host: String) {
     if !out.contains(&host) {
         out.push(host);
     }
+}
+
+/// 把管理员配置的「地址」规范成手机该连的完整 WebSocket URL。
+///
+/// ```
+/// # use rider_sim::net::join::normalize_public_url;
+/// assert_eq!(
+///     normalize_public_url("wss://game.example.com", 8080).as_deref(),
+///     Some("wss://game.example.com:443/ws")
+/// );
+/// assert_eq!(
+///     normalize_public_url("ws://10.0.0.9:9000/rider/ws", 8080).as_deref(),
+///     Some("ws://10.0.0.9:9000/rider/ws")
+/// );
+/// ```
+///
+/// 只接受带协议头的写法；`host:port` 由 [`with_port`] 处理，走原来那条路。
+/// 协议与端口按客户端 [`normalizeServerUrl`] 同一套规则补：`https`→`wss`，
+/// 没写端口时 `ws` 用 8080、`wss` 用 443，没写路径时用 `/ws`。
+pub fn normalize_public_url(raw: &str, default_port: u16) -> Option<String> {
+    let text = raw.trim();
+    let (scheme, rest) = text.split_once("://")?;
+    let scheme = match scheme.to_ascii_lowercase().as_str() {
+        "wss" | "https" => "wss",
+        _ => "ws",
+    };
+    let rest = rest.trim_end_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, p),
+        None => (rest, ""),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let default = if scheme == "wss" {
+        443
+    } else {
+        default_port.max(1)
+    };
+    let (host, port) = authority_host_port(authority, default)?;
+    let path = if path.is_empty() {
+        "/ws".to_string()
+    } else {
+        format!("/{}", path.trim_start_matches('/'))
+    };
+    Some(format!("{scheme}://{host}:{port}{path}"))
+}
+
+/// 从 `主机[:端口]` 或完整 URL 里拆出主机与端口。
+///
+/// 端口缺省时用 `default_port`。IPv6 字面量不在考虑范围内，与 [`with_port`] 一致。
+pub fn authority_host_port(raw: &str, default_port: u16) -> Option<(String, u16)> {
+    let text = raw.trim();
+    let (scheme, rest) = match text.split_once("://") {
+        Some((s, r)) => (s.to_ascii_lowercase(), r),
+        None => (String::new(), text),
+    };
+    // 完整 URL 自带协议时，默认端口跟着协议走（wss 不写端口就是 443）。
+    let default_port = match scheme.as_str() {
+        "wss" | "https" => 443,
+        _ => default_port,
+    };
+    let authority = rest.split('/').next()?.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if let (Ok(port), false) = (port.parse::<u16>(), host.is_empty()) {
+            return Some((host.to_string(), port));
+        }
+    }
+    Some((authority.to_string(), default_port))
 }
 
 /// 给一个可能是「纯主机」的配置补上端口。已经是 `主机:端口` 就原样返回。
@@ -375,6 +482,66 @@ mod tests {
         let bound: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let hosts = reachable_hosts(bound, None);
         assert!(!hosts.iter().any(|h| h.starts_with("0.0.0.0")), "{hosts:?}");
+    }
+
+    #[test]
+    fn a_full_url_is_offered_verbatim() {
+        let bound: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let hosts = reachable_hosts(bound, Some("wss://game.example.com"));
+        assert_eq!(
+            hosts[0], "wss://game.example.com:443/ws",
+            "配了完整 URL 就原样推它，不再补 /ws 与端口"
+        );
+
+        let hosts = reachable_hosts(bound, Some("ws://10.0.0.9:9000/rider/ws"));
+        assert_eq!(hosts[0], "ws://10.0.0.9:9000/rider/ws");
+    }
+
+    #[test]
+    fn normalize_respects_scheme_port_and_path() {
+        assert_eq!(
+            normalize_public_url("https://game.example.com", 8080).as_deref(),
+            Some("wss://game.example.com:443/ws")
+        );
+        assert_eq!(
+            normalize_public_url("ws://game.example.com:9000", 8080).as_deref(),
+            Some("ws://game.example.com:9000/ws")
+        );
+        assert_eq!(
+            normalize_public_url("http://game.example.com/", 8080).as_deref(),
+            Some("ws://game.example.com:8080/ws")
+        );
+        assert_eq!(normalize_public_url("game.example.com", 8080), None);
+        assert_eq!(normalize_public_url("ws://", 8080), None);
+    }
+
+    #[test]
+    fn authority_host_port_reads_both_shapes() {
+        assert_eq!(
+            authority_host_port("192.168.1.7:9000", 8080),
+            Some(("192.168.1.7".into(), 9000))
+        );
+        assert_eq!(
+            authority_host_port("game.example.com", 8080),
+            Some(("game.example.com".into(), 8080))
+        );
+        assert_eq!(
+            authority_host_port("wss://game.example.com/ws", 8080),
+            Some(("game.example.com".into(), 443))
+        );
+    }
+
+    #[test]
+    fn a_full_url_rides_along_in_the_login_uri() {
+        let info = join().with_url(Some("wss://game.example.com/ws".into()));
+        assert_eq!(info.ws_url(), "wss://game.example.com/ws");
+        let uri = info.login_uri();
+        assert!(
+            uri.contains("url=wss%3A%2F%2Fgame.example.com%2Fws"),
+            "{uri}"
+        );
+        // 老的 host/port 仍然在，老客户端扫了还能用
+        assert!(uri.contains("host=192.168.1.7"), "{uri}");
     }
 
     #[test]

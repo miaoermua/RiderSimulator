@@ -87,6 +87,14 @@ pub struct AppOptions {
     /// **开着代理 / VPN 的机器必须显式配它**：那种环境下默认路由指向虚拟网卡，
     /// 探测出来的是 fake-ip 段，骑手照着连必然超时。
     pub public_addr: Option<String>,
+    /// 手机该连的**完整** WebSocket 地址（`wss://game.example.com/ws`）。
+    ///
+    /// 与 [`AppOptions::public_addr`] 的分工：`public_addr` 只换主机、端口与
+    /// `/ws` 仍由服务端补；这个连协议、端口、路径都照用——反代在 https 后面
+    /// （wss）、或把服务挂在子路径下时，只有完整地址能表达。
+    ///
+    /// 两个都配时**以它为准**（更具体的配置赢）。
+    pub public_url: Option<String>,
 }
 
 impl Default for AppOptions {
@@ -99,6 +107,7 @@ impl Default for AppOptions {
             autosave_every_min: 60,
             server_info_every_ticks: 60,
             public_addr: None,
+            public_url: None,
         }
     }
 }
@@ -374,7 +383,7 @@ impl App {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr().unwrap_or(addr);
         self.bound = Some(bound);
-        let join_hosts = crate::net::join::reachable_hosts(bound, self.opts.public_addr.as_deref());
+        let join_hosts = crate::net::join::reachable_hosts(bound, self.configured_join_addr());
         tracing::info!(
             addr = %bound,
             ws = %format!("ws://{bound}{}", crate::net::WS_PATH),
@@ -1208,7 +1217,80 @@ impl App {
                 self.rpc_set_account_password(&name, password)
             }
             RpcRequest::DeleteAccount { name } => self.rpc_delete_account(&name),
+            RpcRequest::Activities => Ok(self.rpc_activities()),
+            RpcRequest::CreateActivity {
+                title,
+                target_orders,
+                reward_cents,
+            } => self.rpc_create_activity(&title, target_orders, reward_cents),
+            RpcRequest::SetActivityActive { id, active } => {
+                self.rpc_set_activity_active(id, active)
+            }
+            RpcRequest::DeleteActivity { id } => self.rpc_delete_activity(id),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // 平台活动（烽火台）
+    // ---------------------------------------------------------------------
+
+    fn rpc_activities(&self) -> Value {
+        json!({ "activities": self.world.activities })
+    }
+
+    /// 建活动。**达成后自动入账**，不需要骑手点领取。
+    fn rpc_create_activity(
+        &mut self,
+        title: &str,
+        target_orders: u32,
+        reward_cents: i64,
+    ) -> RpcReply {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(ApiError::bad_request("活动标题不能为空"));
+        }
+        if title.chars().count() > 40 {
+            return Err(ApiError::bad_request("活动标题最多 40 个字"));
+        }
+        if target_orders == 0 {
+            // 0 单意味着活动一建好，所有在线骑手下一单就达标——纯送钱。
+            return Err(ApiError::bad_request("目标单数必须大于 0"));
+        }
+        if !(0..=10_000_000).contains(&reward_cents) {
+            return Err(ApiError::bad_request("奖金需在 0..=100000 元之间"));
+        }
+        let id = crate::sim::activity::create(&mut self.world, title, target_orders, reward_cents);
+        // 快照只在连接时发，活动列表必须单独广播，否则骑手要重连才看得见。
+        self.publish_activities_changed();
+        Ok(json!({ "id": id }))
+    }
+
+    fn rpc_set_activity_active(&mut self, id: u32, active: bool) -> RpcReply {
+        if !crate::sim::activity::set_active(&mut self.world, id, active) {
+            return Err(ApiError::conflict(
+                "ACTIVITY_NOT_FOUND",
+                format!("没有 id={id} 的活动"),
+            ));
+        }
+        self.publish_activities_changed();
+        Ok(json!({ "id": id, "active": active }))
+    }
+
+    fn rpc_delete_activity(&mut self, id: u32) -> RpcReply {
+        if !crate::sim::activity::remove(&mut self.world, id) {
+            return Err(ApiError::conflict(
+                "ACTIVITY_NOT_FOUND",
+                format!("没有 id={id} 的活动"),
+            ));
+        }
+        self.publish_activities_changed();
+        Ok(json!({ "id": id, "deleted": true }))
+    }
+
+    /// 把当前活动定义推给所有人（骑手端 + 控制端）。
+    fn publish_activities_changed(&mut self) {
+        let activities = self.world.activities.clone();
+        self.publish(&[crate::sim::event::SimEvent::ActivitiesChanged { activities }]);
     }
 
     /// 烽火台「骑手接入」面板要的全部东西：名单 + 手机可达地址。
@@ -1324,7 +1406,8 @@ impl App {
         let Some((host, port)) = self.primary_join_addr() else {
             return Value::Null;
         };
-        let info = crate::net::join::JoinInfo::new(host, port, name, password);
+        let info = crate::net::join::JoinInfo::new(host, port, name, password)
+            .with_url(self.public_join_url());
         match info.qr_svg() {
             Ok(svg) => json!({
                 "ws_url": info.ws_url(),
@@ -1338,6 +1421,34 @@ impl App {
         }
     }
 
+    /// 管理员配的「手机该连哪儿」：完整 URL 优先，其次纯主机。
+    ///
+    /// 两个都没配时返回 `None`，交给 [`crate::net::join::reachable_hosts`] 自己探。
+    fn configured_join_addr(&self) -> Option<&str> {
+        [
+            self.opts.public_url.as_deref(),
+            self.opts.public_addr.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+    }
+
+    /// 监听端口。还没 `serve()` 起来时按 8080 算，与 [`App::join_hosts`] 一致。
+    fn listen_port(&self) -> u16 {
+        self.bound.map(|b| b.port()).unwrap_or(8080)
+    }
+
+    /// 配了完整 URL 时返回规范化的那条（`wss://host:port/path`），否则 `None`。
+    fn public_join_url(&self) -> Option<String> {
+        let raw = self.configured_join_addr()?;
+        if !raw.contains("://") {
+            return None;
+        }
+        crate::net::join::normalize_public_url(raw, self.listen_port())
+    }
+
     /// 手机可达地址列表，主推的排第一。
     ///
     /// 还没 `serve()` 起来时（单测里的 App）没有监听地址，按 `127.0.0.1:8080` 算。
@@ -1345,13 +1456,12 @@ impl App {
         let bound = self
             .bound
             .unwrap_or_else(|| "127.0.0.1:8080".parse().expect("字面量地址"));
-        crate::net::join::reachable_hosts(bound, self.opts.public_addr.as_deref())
+        crate::net::join::reachable_hosts(bound, self.configured_join_addr())
     }
 
     fn primary_join_addr(&self) -> Option<(String, u16)> {
         let host = self.join_hosts().into_iter().next()?;
-        let (h, p) = host.rsplit_once(':')?;
-        Some((h.to_string(), p.parse().ok()?))
+        crate::net::join::authority_host_port(&host, self.listen_port())
     }
 
     fn with_join_hosts(&self, mut payload: Value) -> Value {
@@ -1567,8 +1677,10 @@ impl App {
             return;
         }
         let Some(r) = self.world.rider_mut(rid) else {
-            self.hub
-                .send_ack(conn_id, &Ack::err("set_position", code::BAD_REQUEST, "骑手不存在"));
+            self.hub.send_ack(
+                conn_id,
+                &Ack::err("set_position", code::BAD_REQUEST, "骑手不存在"),
+            );
             return;
         };
         r.set_pos(crate::sim::geo::LatLng { lat, lng });
@@ -1588,7 +1700,9 @@ impl App {
             )));
         }
         let Some(r) = self.world.rider_mut(rider_id) else {
-            return Err(ApiError::bad_request(format!("没有 id 为 {rider_id} 的骑手")));
+            return Err(ApiError::bad_request(format!(
+                "没有 id 为 {rider_id} 的骑手"
+            )));
         };
         r.set_pos(crate::sim::geo::LatLng { lat, lng });
         Ok(json!({

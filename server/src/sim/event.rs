@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::activity::{ActivityProgressView, PlatformActivity};
+
 use super::{
     OrderId, RiderId,
     config::SimConfig,
@@ -84,6 +86,8 @@ pub struct RiderBrief {
     /// 就得再抄一份默认值，迟早对不上。
     pub slacking: bool,
     pub expected_value_cents: Option<i64>,
+    /// 平台活动进度。**只给本人 / 控制端**，公开版是空数组。
+    pub activities: Vec<ActivityProgressView>,
 }
 
 impl RiderBrief {
@@ -115,6 +119,7 @@ impl RiderBrief {
             mood: None,
             slacking: false,
             expected_value_cents: None,
+            activities: Vec::new(),
         }
     }
 
@@ -130,6 +135,7 @@ impl RiderBrief {
         b.takehome_cents = Some(r.takehome_cents());
         b.cash_cents = Some(r.cash_cents);
         b.fines_cents = Some(r.fines_cents);
+        b.activities = super::activity::progress_views(r);
         b
     }
 
@@ -396,6 +402,30 @@ pub enum SimEvent {
         compensation_cents: i64,
         /// 责任方：`rider` | `merchant` | `none`。钱从谁身上出由它决定。
         fault: &'static str,
+    },
+    /// 活动定义变化（新建 / 上下架 / 删除）。全体可见。
+    ///
+    /// 快照只在连接时下发，不广播这个事件的话，烽火台建完活动骑手要重连才看得见。
+    ActivitiesChanged {
+        activities: Vec<PlatformActivity>,
+    },
+    /// 活动进度变化（又完成了一单）。只推给本人与控制端。
+    ActivityProgressChanged {
+        rider_id: RiderId,
+        activities: Vec<ActivityProgressView>,
+    },
+    /// 活动达成，奖金已自动入账。只推给本人与控制端。
+    ActivityReward {
+        rider_id: RiderId,
+        activity_id: u32,
+        title: String,
+        /// 奖金（分）。
+        amount_cents: i64,
+        /// 达成时的完成单数（≥ 目标）。
+        completed: u32,
+        target_orders: u32,
+        /// 入账后的今日到手，手机端直接拿来刷新顶部数字。
+        takehome_cents: i64,
     },
     /// 日结。
     DayClosed {

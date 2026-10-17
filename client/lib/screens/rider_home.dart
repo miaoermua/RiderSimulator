@@ -18,7 +18,7 @@ import 'running_settings_sheet.dart';
 /// 骑手端主界面。
 ///
 /// 版式走众包骑手端的通行骨架：
-/// 顶栏（折叠菜单 + 时钟 + 通知）/ 状态条 / 待抢·待取·待送 / 底栏（跑单设置 + 刷新）。
+/// 顶栏（折叠菜单 + 上线/下线 + 通知）/ 状态条 / 待抢·待取·待送 / 底栏（跑单设置 + 刷新）。
 class RiderHomePage extends StatefulWidget {
   const RiderHomePage({super.key, required this.state, required this.client});
 
@@ -125,7 +125,7 @@ class _RiderHomePageState extends State<RiderHomePage> {
           child: Scaffold(
             drawer: RiderDrawer(state: state, client: widget.client),
             appBar: AppBar(
-              title: _Title(state: state),
+              title: _Title(state: state, client: widget.client),
               actions: [_BellButton(state: state)],
             ),
             body: Column(
@@ -185,33 +185,107 @@ class _RiderHomePageState extends State<RiderHomePage> {
   static String _tabLabel(String name, int n) => n == 0 ? name : '$name $n';
 }
 
+/// 顶栏左侧：连接状态点 + 上线 / 下线按钮。
+///
+/// 原来这里是「绿点 + 第 N 天 + 时钟 + 天气」。时间天气不再常驻（骑手看单
+/// 不看表），但**连接状态必须留着**——断线时抢单没反应，得能一眼看出是网络
+/// 问题。绿点因此并进了按钮左边，按钮本身点了就弹出「上线 / 下线」。
 class _Title extends StatelessWidget {
-  const _Title({required this.state});
+  const _Title({required this.state, required this.client});
 
   final GameState state;
+  final GameClient client;
 
   @override
   Widget build(BuildContext context) {
-    final color = switch (state.status) {
+    final me = state.me;
+    final online = me?.online ?? false;
+    final conn = switch (state.status) {
       ConnStatus.online => Colors.greenAccent,
       ConnStatus.connecting || ConnStatus.retrying => Colors.orangeAccent,
       _ => Colors.redAccent,
     };
-    return Row(
-      children: [
-        Container(
-          width: 10,
-          height: 10,
-          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: me == null ? null : () => _openSheet(context, me),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: (online ? Colors.green : Colors.grey).withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // 连接状态点：绿 = 连着，黄 = 重连中，红 = 断了。
+              Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(color: conn, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: 6),
+              Icon(
+                online ? Icons.wifi_tethering : Icons.wifi_tethering_off,
+                size: 16,
+                color: online ? Colors.green : Colors.grey,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                me == null ? '观战' : (online ? '上线' : '下线'),
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: online ? Colors.green : Colors.grey,
+                ),
+              ),
+              if (me != null) const Icon(Icons.arrow_drop_down, size: 18),
+            ],
+          ),
         ),
-        const SizedBox(width: 8),
-        Text('第 ${state.day} 天 ${clockLabel(state.minuteOfDay)}'),
-        const SizedBox(width: 10),
-        Text(
-          state.weatherLabel,
-          style: Theme.of(context).textTheme.bodyMedium,
+      ),
+    );
+  }
+
+  /// 弹出「上线 / 下线」。选中的那一项打勾，点另一项就切换。
+  void _openSheet(BuildContext context, RiderView me) {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheet) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: const Text('出勤状态'),
+              subtitle: Text(me.online ? '现在在线，大厅的单可以抢' : '现在离线，接不到新单'),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.wifi_tethering, color: Colors.green),
+              title: const Text('上线'),
+              subtitle: const Text('开始接单'),
+              trailing: me.online ? const Icon(Icons.check) : null,
+              onTap: () {
+                Navigator.of(sheet).pop();
+                if (!me.online) client.setOnline(true);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.wifi_tethering_off, color: Colors.grey),
+              title: const Text('下线'),
+              subtitle: const Text('暂停接单，手上的单还在'),
+              trailing: me.online ? null : const Icon(Icons.check),
+              onTap: () {
+                Navigator.of(sheet).pop();
+                if (me.online) client.setOnline(false);
+              },
+            ),
+            const SizedBox(height: 8),
+          ],
         ),
-      ],
+      ),
     );
   }
 }
@@ -226,7 +300,7 @@ class _BellButton extends StatelessWidget {
   Widget build(BuildContext context) {
     final n = state.unreadLogs;
     return IconButton(
-      tooltip: '通知消息',
+      tooltip: '通知和活动中心',
       onPressed: () => Navigator.of(context).push<void>(
         MaterialPageRoute<void>(
           builder: (_) => NotificationsPage(state: state),

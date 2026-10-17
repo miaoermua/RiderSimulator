@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../login_link.dart';
+import '../login_store.dart';
 import '../protocol.dart';
 import 'scan_login_page.dart';
 
@@ -59,6 +60,33 @@ class _LoginPageState extends State<LoginPage> {
     _name = TextEditingController();
     _password = TextEditingController();
     _token = TextEditingController();
+    _restore();
+  }
+
+  /// 把上次的登录信息填回表单。**只填，不自动进**——启动永远停在登录页。
+  Future<void> _restore() async {
+    final saved = await loadSavedLogin();
+    if (!mounted || saved == null) return;
+    setState(() {
+      _host.text = saved.host;
+      _port.text = saved.port;
+      _name.text = saved.name;
+      _password.text = saved.password;
+      _token.text = saved.token ?? '';
+    });
+  }
+
+  /// 记住这一份输入，下次打开还在。密码错也照存：错的密码下一把改一个字就行。
+  void _remember() {
+    saveLogin(
+      SavedLogin(
+        host: _host.text.trim(),
+        port: _port.text.trim(),
+        name: _name.text.trim(),
+        password: _password.text,
+        token: _token.text.trim(),
+      ),
+    );
   }
 
   @override
@@ -101,6 +129,7 @@ class _LoginPageState extends State<LoginPage> {
     }
 
     setState(() => _localError = null);
+    _remember();
     widget.onEnter(
       LoginRequest(
         url: url,
@@ -124,7 +153,8 @@ class _LoginPageState extends State<LoginPage> {
       return;
     }
 
-    _host.text = link.host;
+    // 码里带了完整地址（反代 / wss）就用它，否则退回主机 + 端口。
+    _host.text = link.url ?? link.host;
     _port.text = '${link.port}';
     _name.text = link.name;
     _password.text = link.password;
