@@ -17,6 +17,7 @@ use super::{
     event::{DayLedger, RiderBrief},
     geo::{CoordSystem, LatLng, bearing_deg, haversine_m},
     merchant::Merchant,
+    notice,
     order::{ExtraTask, FeeBreakdown, Order, OrderStatus, OrderTier},
     rider::{Phase, Rider, RiderKind, SpeedMode},
     task::TaskTemplate,
@@ -193,6 +194,8 @@ pub struct PublicSnapshot {
     pub claim_window_ms: u64,
     /// 平台活动定义（含已下架的，手机端自己过滤）。进度在骑手身上。
     pub activities: Vec<activity::PlatformActivity>,
+    /// 首页通知（烽火台写的单条公告）。`None` = 没有通知。
+    pub notice: Option<notice::Notice>,
 }
 
 /// 全局状态。
@@ -223,6 +226,8 @@ pub struct World {
     pub activities: Vec<activity::PlatformActivity>,
     /// 下一个活动 id，只增不减。
     pub next_activity_id: u32,
+    /// 首页通知。单条，改了就覆盖——见 [`notice`]。
+    pub notice: Option<notice::Notice>,
 }
 
 impl World {
@@ -254,6 +259,7 @@ impl World {
             last_day_ledgers: Vec::new(),
             activities: Vec::new(),
             next_activity_id: 1,
+            notice: None,
         };
         for _ in 0..w.cfg.sim_rider_count {
             w.spawn_sim_rider();
@@ -1099,6 +1105,7 @@ impl World {
             // 客户端会照着 3 秒去倒计时，而订单其实还能挂一分钟。
             claim_window_ms: self.cfg.claim_window_ticks() as u64 * self.cfg.tick_interval_ms(),
             activities: self.activities.clone(),
+            notice: self.notice.clone(),
         }
     }
 }

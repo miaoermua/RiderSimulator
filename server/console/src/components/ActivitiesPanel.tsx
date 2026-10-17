@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   App as AntApp,
   Button,
@@ -10,6 +10,7 @@ import {
   InputNumber,
   Popconfirm,
   Progress,
+  Select,
   Space,
   Switch,
   Tag,
@@ -17,7 +18,157 @@ import {
 } from "antd";
 import { useIsControl, useStore } from "../hooks";
 import type { ActivityView } from "../protocol";
-import { store, yuan } from "../store";
+import { hhmm, store, yuan } from "../store";
+
+/**
+ * 首页通知：烽火台写给骑手的一句话。
+ *
+ * 手机首页原来那条「在线 / 今日收入」的绿色条子已经换成它——不写就不显示。
+ * **只有一条**：改了就覆盖，没有历史、没有列表，所以这里没有「新建」，
+ * 只有「保存」和「清空」。可以挂一个活动，骑手点开通知时顺带看到自己的进度。
+ */
+function NoticeEditor({ activities }: { activities: ActivityView[] }) {
+  const { message } = AntApp.useApp();
+  const snap = useStore((s) => s.snap);
+  const [form] = Form.useForm<{
+    title: string;
+    body: string;
+    activity_id?: number;
+  }>();
+  const [busy, setBusy] = useState(false);
+  const notice = snap?.notice ?? null;
+
+  // 别人改了通知（或多个控制端同时开着）时跟着刷新；但**别覆盖正在打的字**。
+  useEffect(() => {
+    if (form.isFieldsTouched()) return;
+    form.setFieldsValue({
+      title: notice?.title ?? "",
+      body: notice?.body ?? "",
+      activity_id: notice?.activity_id ?? undefined,
+    });
+  }, [notice, form]);
+
+  const save = async () => {
+    let values: { title: string; body: string; activity_id?: number };
+    try {
+      values = await form.validateFields();
+    } catch {
+      return; // 校验失败，antd 已在字段下面写原因。
+    }
+    setBusy(true);
+    try {
+      await store.setNotice({
+        title: values.title.trim(),
+        body: values.body.trim(),
+        activity_id: values.activity_id ?? null,
+      });
+      message.success("首页通知已更新，在线骑手立刻可见");
+    } catch (e) {
+      message.error((e as Error).message || "保存失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const clear = async () => {
+    setBusy(true);
+    try {
+      await store.clearNotice();
+      form.setFieldsValue({ title: "", body: "", activity_id: undefined });
+      message.success("已清空，手机首页不再显示通知");
+    } catch (e) {
+      message.error((e as Error).message || "清空失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 「第 N 天 HH:MM 发布」：时间按模拟钟算，控制台自己的时区不参与。
+  const postedAt = (() => {
+    if (!notice || !snap) return null;
+    const minutesAgo = Math.max(0, snap.elapsed_min - notice.updated_at_min);
+    const at = Math.max(0, snap.sim_minute - minutesAgo);
+    return `第 ${Math.floor(at / 1440) + 1} 天 ${hhmm(at)}`;
+  })();
+
+  return (
+    <Card
+      size="small"
+      style={{ marginBottom: 16 }}
+      title="首页通知"
+      extra={
+        notice ? (
+          <Tag color="orange">正在显示{postedAt ? ` · ${postedAt}` : ""}</Tag>
+        ) : (
+          <Tag>未设置</Tag>
+        )
+      }
+    >
+      <Form form={form} layout="vertical" disabled={busy}>
+        <Form.Item
+          name="title"
+          label="标题"
+          rules={[
+            { required: true, whitespace: true, message: "写一句抓眼球的话" },
+            { max: 40, message: "最多 40 个字（手机上只显示一行）" },
+          ]}
+        >
+          <Input placeholder="例如：暴雨天注意安全" maxLength={40} showCount />
+        </Form.Item>
+        <Form.Item
+          name="body"
+          label="正文"
+          rules={[
+            { required: true, whitespace: true, message: "写清楚要骑手做什么" },
+            { max: 500, message: "最多 500 个字" },
+          ]}
+          extra="骑手点开首页那条通知看全文；不设置就不显示这一条。"
+        >
+          <Input.TextArea
+            rows={3}
+            maxLength={500}
+            showCount
+            placeholder="例如：今天下午有雷雨，接单前看一眼路况；超时罚款今天减半。"
+          />
+        </Form.Item>
+        <Form.Item
+          name="activity_id"
+          label="关联活动（可选）"
+          extra="选一个活动后，骑手点开通知会看到自己在该活动上的进度。"
+        >
+          <Select
+            allowClear
+            placeholder="不关联活动"
+            options={activities.map((a) => ({
+              value: a.id,
+              label: a.active ? a.title : `${a.title}（已下架）`,
+            }))}
+          />
+        </Form.Item>
+        <Space>
+          <Button type="primary" loading={busy} onClick={save}>
+            保存
+          </Button>
+          <Popconfirm
+            title="清空首页通知？"
+            description="立即从所有骑手首页消失，内容不留档。"
+            okText="清空"
+            cancelText="取消"
+            disabled={!notice}
+            onConfirm={clear}
+          >
+            <Button danger disabled={!notice}>
+              清空
+            </Button>
+          </Popconfirm>
+          <Typography.Text type="secondary">
+            只有一条：保存即覆盖，没有历史
+          </Typography.Text>
+        </Space>
+      </Form>
+    </Card>
+  );
+}
 
 /**
  * 平台活动：跑够 N 单给一笔奖金。
@@ -90,6 +241,8 @@ export function ActivitiesPanel() {
 
   return (
     <div className="panel-scroll">
+      <NoticeEditor activities={activities} />
+
       <Card size="small" title="新建活动">
         <Form
           form={form}

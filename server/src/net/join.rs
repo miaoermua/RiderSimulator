@@ -212,10 +212,11 @@ pub fn authority_host_port(raw: &str, default_port: u16) -> Option<(String, u16)
     if authority.is_empty() {
         return None;
     }
-    if let Some((host, port)) = authority.rsplit_once(':') {
-        if let (Ok(port), false) = (port.parse::<u16>(), host.is_empty()) {
-            return Some((host.to_string(), port));
-        }
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+        && !host.is_empty()
+    {
+        return Some((host.to_string(), port));
     }
     Some((authority.to_string(), default_port))
 }

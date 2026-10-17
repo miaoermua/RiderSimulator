@@ -56,7 +56,13 @@ class GameState extends ChangeNotifier {
   List<ActivityView> get runningActivities =>
       activities.where((a) => a.active).toList();
 
+  /// 首页通知（烽火台写的单条公告）。`null` = 没写，首页不显示条子。
+  NoticeView? notice;
+
   /// 每条订单的任务对话（绑在附加任务上）。
+  ///
+  /// 与 [chatLines] 分开存：服务端是两条通道，判定语义不同。UI 侧把两者
+  /// 混成一条时间线，见 [timelineFor]。
   final Map<int, List<TaskLine>> taskLines = {};
 
   /// 每条订单的**末端会话**（末端交付沟通，与附加任务无关）。
@@ -64,6 +70,15 @@ class GameState extends ChangeNotifier {
   /// 服务端那边时效一天，日结时清库；本地缓存跟着在 `day_closed` 时清空，
   /// 见 [applyFrame]。
   final Map<int, List<ChatLine>> chatLines = {};
+
+  /// 每条订单的「在线对话」时间线：末端会话 + 任务对话，按到达顺序混排。
+  ///
+  /// 单开一份而不是每次 merge 两个列表：同一分钟内的先后顺序只有到达顺序
+  /// 知道，merge 会把它弄丢（骑手会觉得「我刚说的话跑到上面去了」）。
+  final Map<int, List<ChatEntry>> _timelines = {};
+
+  /// 一条订单的对话（含任务消息）。没说过话就是空的。
+  List<ChatEntry> timelineFor(int orderId) => _timelines[orderId] ?? const [];
 
   final List<LogLine> logs = [];
 
@@ -268,6 +283,14 @@ class GameState extends ChangeNotifier {
       case Ev.activitiesChanged:
         // 快照只在连接时来一次，烽火台改活动靠这条事件推过来。
         activities = listOf(frame.payload['activities'], ActivityView.fromJson);
+      case Ev.noticeChanged:
+        // 烽火台改文字 / 清空。快照只在连接时来一次，不接这条就得重连。
+        notice = frame.payload['notice'] is Map
+            ? NoticeView.fromJson(asMap(frame.payload['notice']))
+            : null;
+        if (notice != null) {
+          note('通知：${notice!.title}', kind: LogKind.info);
+        }
       case Ev.activityProgress:
         // 每完成一单推一条：活动页的进度条实时动。
         final rid = reqInt(frame.payload['rider_id']);
@@ -303,6 +326,8 @@ class GameState extends ChangeNotifier {
         // 会话时效一天：服务端日结时清了库，本地缓存跟着清，
         // 否则翻回昨天的单，还能看见早就该没了的话。
         chatLines.clear();
+        taskLines.clear();
+        _timelines.clear();
       default:
         break; // 未知事件：忽略，向前兼容
     }
@@ -344,6 +369,7 @@ class GameState extends ChangeNotifier {
     activeOrders = List.of(s.activeOrders);
     ledgers = s.lastDayLedgers;
     activities = s.activities;
+    notice = s.notice;
     if (announce) note('已同步世界状态');
   }
 
@@ -545,12 +571,19 @@ class GameState extends ChangeNotifier {
 
   void _applyTaskMessage(Map<String, dynamic> p) {
     final id = reqInt(p['order_id']);
+    // 任务消息服务端不带时间，收到时用插值后的时钟补一个，才能和末端会话混排。
+    final minute = nowMinute;
+    final hh = (minute % 1440 ~/ 60).toString().padLeft(2, '0');
+    final mm = (minute % 60).toString().padLeft(2, '0');
     final line = TaskLine(
       from: reqStr(p['from'], 'customer'),
       text: reqStr(p['text']),
       step: reqInt(p['step']),
+      at: '$hh:$mm',
+      atMin: minute,
     );
     taskLines.putIfAbsent(id, () => []).add(line);
+    _timelines.putIfAbsent(id, () => []).add(ChatEntry.ofTask(line));
     note(
       '${line.isMe ? '我' : '顾客'}：${line.text}',
       kind: LogKind.chat,
@@ -565,6 +598,7 @@ class GameState extends ChangeNotifier {
     final id = reqInt(p['order_id']);
     final line = ChatLine.fromJson(p);
     chatLines.putIfAbsent(id, () => []).add(line);
+    _timelines.putIfAbsent(id, () => []).add(ChatEntry.ofChat(line));
 
     final who = switch (line.from) {
       'rider' => '我',

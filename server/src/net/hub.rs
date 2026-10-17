@@ -281,6 +281,7 @@ pub fn event_name(ev: &SimEvent) -> &'static str {
         SimEvent::WeatherChanged { .. } => "weather_changed",
         SimEvent::FineIssued { .. } => "fine_issued",
         SimEvent::ActivitiesChanged { .. } => "activities_changed",
+        SimEvent::NoticeChanged { .. } => "notice_changed",
         SimEvent::ActivityProgressChanged { .. } => "activity_progress",
         SimEvent::ActivityReward { .. } => "activity_reward",
         SimEvent::ConfigChanged { .. } => "config_changed",
@@ -384,6 +385,7 @@ fn render_filtered(world: &World, ev: &SimEvent, role: Role, now_min: u64) -> Op
             payload_of(ev)
         }
         SimEvent::ActivitiesChanged { .. } => payload_of(ev),
+        SimEvent::NoticeChanged { .. } => payload_of(ev),
         SimEvent::ActivityProgressChanged { rider_id, .. } => {
             if !gate(*rider_id) {
                 return None;

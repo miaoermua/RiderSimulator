@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::activity::{ActivityProgressView, PlatformActivity};
+use super::notice::Notice;
 
 use super::{
     OrderId, RiderId,
@@ -408,6 +409,13 @@ pub enum SimEvent {
     /// 快照只在连接时下发，不广播这个事件的话，烽火台建完活动骑手要重连才看得见。
     ActivitiesChanged {
         activities: Vec<PlatformActivity>,
+    },
+    /// 首页通知变了（烽火台改了文字 / 清空）。全体可见。
+    ///
+    /// `None` = 已清空，手机端要把条子收起来。快照只在连接时下发，
+    /// 不广播这个事件的话，改了通知骑手得重连才看得见。
+    NoticeChanged {
+        notice: Option<Notice>,
     },
     /// 活动进度变化（又完成了一单）。只推给本人与控制端。
     ActivityProgressChanged {

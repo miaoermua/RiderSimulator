@@ -127,7 +127,7 @@
   "server_events": {
     "transport": {
       "welcome": "握手成功。payload: { protocol_version, role, rider_id, rider_key, tick_interval_ms, server_minute, snapshot }",
-      "snapshot": "完整世界快照。payload: { day, sim_minute, elapsed_min, weather, config, riders, hall, active_orders, merchants, stats, claim_window_ms }。config.coord_system 决定所有下发坐标的坐标系。config.fee 是计价规则（起步价 / 里程阶梯 / 每公里单价 / 等级加成 / 重投补贴），订单自己的 fee 是按其算出的单笔明细，另加 surcharge_cents（重投补贴）。claim_window_ms 是抢单窗口的**真实挂钟时长**，实时档下为 60000。",
+      "snapshot": "完整世界快照。payload: { day, sim_minute, elapsed_min, weather, config, riders, hall, active_orders, merchants, stats, claim_window_ms, activities, notice }。notice 是烽火台写的单条首页通知（可关联活动），null = 没写。config.coord_system 决定所有下发坐标的坐标系。config.fee 是计价规则（起步价 / 里程阶梯 / 每公里单价 / 等级加成 / 重投补贴），订单自己的 fee 是按其算出的单笔明细，另加 surcharge_cents（重投补贴）。claim_window_ms 是抢单窗口的**真实挂钟时长**，实时档下为 60000。",
       "ack": "动作应答。payload: { action, ok, code?, message?, data? }",
       "error": "传输层错误。payload: { code, message }",
       "pong": "心跳应答。payload: { elapsed_min }",
@@ -155,6 +155,7 @@
       "ai_decision": { "audience": "public", "payload": "{ source, assignments, note }" },
       "task_message": { "audience": "owner+control", "payload": "{ order_id, from: rider|customer|system, text, step, task_id }" },
       "chat_message": { "audience": "public", "payload": "{ order_id, from: rider|customer|system, kind: preset|free|reply|ruling, text, day, sim_minute, compensation_cents, fault: rider|merchant|none }" },
+      "notice_changed": { "audience": "public", "payload": "{ notice: { title, body, activity_id: u32|null, updated_at_min: u64 } | null }", "comment": "首页通知只有一条，改了就覆盖；null = 已清空。快照只在握手时来一次，不接这条手机端就得重连才看得见改字。" },
       "day_closed": { "audience": "public (ledgers 只保留本人/控制端可见的部分)", "payload": "{ day, ledgers, total_takehome_cents, total_orders }" }
     }
   },
@@ -185,6 +186,11 @@
       "POST /api/accounts": "建号。请求 { name, password? }；password 缺省 = 服务端生成。重名回 409 BAD_CREDENTIALS（**不覆盖原密码**，否则已发出去的二维码会莫名失效）。密码太短回 400。响应 { name, password, join, hosts, primary_host }，其中 password 是**全系统唯一一次**能看到明文的地方。",
       "POST /api/accounts/{name}/password": "改 / 重置密码。请求 { password? }，缺省 = 服务端生成。账号不存在回 404 NO_ACCOUNT。响应同建号。",
       "DELETE /api/accounts/{name}": "删号。响应 { name, deleted }。名字按 normalize_name 规范化后删。"
+    },
+    "notice": {
+      "GET /api/notice": "读首页通知。响应 { notice: { title, body, activity_id, updated_at_min } | null }。",
+      "POST /api/notice": "写（覆盖）首页通知。请求 { title, body, activity_id? }；标题 1..40 字、正文 1..500 字（服务端 trim 后计），activity_id 不存在回 409 ACTIVITY_NOT_FOUND。响应 { notice }，并广播 notice_changed。",
+      "DELETE /api/notice": "清空首页通知。响应 { cleared: bool }，并广播 notice_changed（notice=null）。"
     },
     "join": "join 字段 = { ws_url, uri, qr_svg }，即上方的 login_uri 与它的 SVG 二维码（控制台直接塞进 DOM，不用引前端二维码库）。qr_svg 在内容编不成码时为 null。"
   },

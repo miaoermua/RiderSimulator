@@ -1227,6 +1227,13 @@ impl App {
                 self.rpc_set_activity_active(id, active)
             }
             RpcRequest::DeleteActivity { id } => self.rpc_delete_activity(id),
+            RpcRequest::Notice => Ok(self.rpc_notice()),
+            RpcRequest::SetNotice {
+                title,
+                body,
+                activity_id,
+            } => self.rpc_set_notice(&title, &body, activity_id),
+            RpcRequest::ClearNotice => self.rpc_clear_notice(),
         }
     }
 
@@ -1291,6 +1298,60 @@ impl App {
     fn publish_activities_changed(&mut self) {
         let activities = self.world.activities.clone();
         self.publish(&[crate::sim::event::SimEvent::ActivitiesChanged { activities }]);
+    }
+
+    // ---------------------------------------------------------------------
+    // 首页通知（烽火台）
+    // ---------------------------------------------------------------------
+
+    fn rpc_notice(&self) -> Value {
+        json!({ "notice": self.world.notice })
+    }
+
+    /// 写（覆盖）首页通知。只有一条，所以没有「新建」，永远是在改这一条。
+    ///
+    /// 允许关联一个**已存在**的活动（下架的也允许——可以先备课再上架）。
+    /// 不存在的 id 直接拒绝，免得骑手点开看到一句「活动找不到了」。
+    fn rpc_set_notice(&mut self, title: &str, body: &str, activity_id: Option<u32>) -> RpcReply {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(ApiError::bad_request("通知标题不能为空"));
+        }
+        if title.chars().count() > 40 {
+            return Err(ApiError::bad_request("通知标题最多 40 个字"));
+        }
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(ApiError::bad_request(
+                "通知正文不能为空；不想再显示就清空通知",
+            ));
+        }
+        if body.chars().count() > 500 {
+            return Err(ApiError::bad_request("通知正文最多 500 个字"));
+        }
+        if let Some(id) = activity_id
+            && !self.world.activities.iter().any(|a| a.id == id)
+        {
+            return Err(ApiError::conflict(
+                "ACTIVITY_NOT_FOUND",
+                format!("没有 id={id} 的活动"),
+            ));
+        }
+        let notice = crate::sim::notice::set(&mut self.world, title, body, activity_id);
+        self.publish_notice_changed();
+        Ok(json!({ "notice": notice }))
+    }
+
+    fn rpc_clear_notice(&mut self) -> RpcReply {
+        let cleared = crate::sim::notice::clear(&mut self.world);
+        // 即使本来就是空的也广播：多个控制端同时开着时，让它们一起回到一致状态。
+        self.publish_notice_changed();
+        Ok(json!({ "cleared": cleared }))
+    }
+
+    fn publish_notice_changed(&mut self) {
+        let notice = self.world.notice.clone();
+        self.publish(&[crate::sim::event::SimEvent::NoticeChanged { notice }]);
     }
 
     /// 烽火台「骑手接入」面板要的全部东西：名单 + 手机可达地址。

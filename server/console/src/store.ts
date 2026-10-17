@@ -11,6 +11,7 @@ import {
   type EventName,
   type EventPayloads,
   type ModelInfo,
+  type NoticeView,
   type Role,
   type ServerInfo,
   type Snapshot,
@@ -438,6 +439,31 @@ class ConsoleStore {
     return this.request("DELETE", `/api/activities/${id}`);
   }
 
+  // ---------------- 首页通知（HTTP） ----------------
+
+  /** 读当前通知。手机端快照里也有同一份，这里给首屏兜底。 */
+  getNotice(): Promise<{ notice: NoticeView | null }> {
+    return this.request<{ notice: NoticeView | null }>("GET", "/api/notice");
+  }
+
+  /**
+   * 写（覆盖）首页通知。**单条**：没有「新建」，永远是在改这一条。
+   *
+   * `activity_id` 不传 / `null` = 和活动无关；传了就必须是已存在的活动。
+   */
+  setNotice(fields: {
+    title: string;
+    body: string;
+    activity_id?: number | null;
+  }): Promise<{ notice: NoticeView }> {
+    return this.request<{ notice: NoticeView }>("POST", "/api/notice", fields);
+  }
+
+  /** 清空通知。手机端首页那条条子随之收起。 */
+  clearNotice(): Promise<{ cleared: boolean }> {
+    return this.request<{ cleared: boolean }>("DELETE", "/api/notice");
+  }
+
   /** 改 / 重置密码。`password` 缺省 = 服务端生成一个。 */
   setAccountPassword(name: string, password?: string): Promise<AccountJoin> {
     const body: Record<string, string> = {};
@@ -580,6 +606,13 @@ class ConsoleStore {
         const a = p as EventPayloads["activities_changed"];
         const snap = this.state.snap;
         if (snap) this.set({ snap: { ...snap, activities: a.activities } });
+        break;
+      }
+      case "notice_changed": {
+        // 单条通知：整块替换，手机端据此显示 / 收起首页条子。
+        const n = p as EventPayloads["notice_changed"];
+        const snap = this.state.snap;
+        if (snap) this.set({ snap: { ...snap, notice: n.notice } });
         break;
       }
       case "activity_progress": {

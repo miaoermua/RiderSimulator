@@ -75,6 +75,10 @@ pub const ACTIVITIES_PATH: &str = "/api/activities";
 pub const ACTIVITY_ACTIVE_PATH: &str = "/api/activities/{id}/active";
 /// `DELETE` 删掉某个活动。
 pub const ACTIVITY_ITEM_PATH: &str = "/api/activities/{id}";
+/// 首页通知：`GET` 读、`POST` 写（覆盖）、`DELETE` 清空。
+///
+/// 只有一条，改了就覆盖——见 [`crate::sim::notice`] 的取舍说明。
+pub const NOTICE_PATH: &str = "/api/notice";
 
 /// 鉴权配置。由 `main.rs` 的环境变量决定。
 #[derive(Debug, Clone, Default)]
@@ -169,6 +173,16 @@ pub enum RpcRequest {
     SetActivityActive { id: u32, active: bool },
     /// 删活动。
     DeleteActivity { id: u32 },
+    /// 读首页通知。
+    Notice,
+    /// 写 / 覆盖首页通知。`activity_id` 关联一个活动，点开时带上进度。
+    SetNotice {
+        title: String,
+        body: String,
+        activity_id: Option<u32>,
+    },
+    /// 清空首页通知。
+    ClearNotice,
 }
 
 /// 主循环回给 HTTP 的结果。
@@ -330,6 +344,12 @@ pub fn routes(state: ApiState) -> Router {
         )
         .route(ACTIVITY_ACTIVE_PATH, post(activity_active_route))
         .route(ACTIVITY_ITEM_PATH, delete(activity_delete_route))
+        .route(
+            NOTICE_PATH,
+            get(notice_get_route)
+                .post(notice_set_route)
+                .delete(notice_delete_route),
+        )
         .with_state(state)
 }
 
@@ -393,6 +413,47 @@ async fn activity_delete_route(
     Path(id): Path<u32>,
 ) -> Response {
     api.call(&headers, RpcRequest::DeleteActivity { id }).await
+}
+
+async fn notice_get_route(State(api): State<ApiState>, headers: HeaderMap) -> Response {
+    api.call(&headers, RpcRequest::Notice).await
+}
+
+/// `POST /api/notice` —— 写（覆盖）首页通知。
+///
+/// `activity_id` 可以不传（`null` 也算没关联）。关联的活动不存在由
+/// 主循环拒绝——这里不做二次查询，避免「查的时候在、写的时候没了」。
+async fn notice_set_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(title) = body.get("title").and_then(Value::as_str) else {
+        return ApiError::bad_request("需要 title（通知标题）").into_response();
+    };
+    let Some(text) = body.get("body").and_then(Value::as_str) else {
+        return ApiError::bad_request("需要 body（通知正文）").into_response();
+    };
+    let activity_id = match body.get("activity_id").and_then(Value::as_u64) {
+        Some(id) => match u32::try_from(id) {
+            Ok(id) => Some(id),
+            Err(_) => return ApiError::bad_request("activity_id 太大").into_response(),
+        },
+        None => None,
+    };
+    api.call(
+        &headers,
+        RpcRequest::SetNotice {
+            title: title.to_string(),
+            body: text.to_string(),
+            activity_id,
+        },
+    )
+    .await
+}
+
+async fn notice_delete_route(State(api): State<ApiState>, headers: HeaderMap) -> Response {
+    api.call(&headers, RpcRequest::ClearNotice).await
 }
 
 async fn accounts_route(State(api): State<ApiState>, headers: HeaderMap) -> Response {

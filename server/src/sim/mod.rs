@@ -15,6 +15,7 @@ pub mod economy;
 pub mod event;
 pub mod geo;
 pub mod merchant;
+pub mod notice;
 pub mod order;
 pub mod rider;
 pub mod risk;

@@ -420,14 +420,13 @@ class _Actions extends StatelessWidget {
   final VoidCallback? onAccept;
   final VoidCallback? onReject;
 
-  /// 「联系顾客」按钮上的字。
+  /// 「在线对话」按钮上的字。任务对话也在这条时间线里，所以一并算「新消息」。
   ///
   /// 顾客开口是稀罕事（大约 5% 的单子），一来消息就值得在按钮上报一声，
   /// 免得骑手错过——尤其是带赔付的那种。
   String get _chatLabel {
-    final has = (state.chatLines[order.id] ?? const <ChatLine>[])
-        .any((l) => l.from == 'customer');
-    return has ? '联系顾客 · 新消息' : '联系顾客';
+    final has = state.timelineFor(order.id).any((e) => e.from == 'customer');
+    return has ? '在线对话 · 新消息' : '在线对话';
   }
 
   void _openChat(BuildContext context) => showChatSheet(

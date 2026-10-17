@@ -7,9 +7,9 @@ import '../game_state.dart';
 import '../location_service.dart';
 import '../protocol.dart';
 import '../widgets/app_toast.dart';
+import '../widgets/notice_sheet.dart';
 import '../widgets/order_card.dart';
 import '../widgets/rider_drawer.dart';
-import '../widgets/task_sheet.dart';
 import 'assign_order_page.dart';
 import 'notifications_page.dart';
 import 'route_plan_page.dart';
@@ -130,7 +130,7 @@ class _RiderHomePageState extends State<RiderHomePage> {
             ),
             body: Column(
               children: [
-                _StatusStrip(state: state, client: widget.client),
+                _NoticeStrip(state: state),
                 TabBar(
                   dividerColor: Colors.black12,
                   tabs: [
@@ -313,79 +313,108 @@ class _BellButton extends StatelessWidget {
   }
 }
 
-/// 常驻状态条：出勤、模式、今日收入。
+/// 首页通知条：烽火台写的单条公告，点开看全文。
 ///
-/// 竞品调研第一条结论就是「状态条必须常驻顶部」——骑手要随时确认
-/// 自己是否在线、什么模式，否则接不到单都不知道为什么。
-class _StatusStrip extends StatelessWidget {
-  const _StatusStrip({required this.state, required this.client});
+/// 这里原来是「在线 / 模式 / 今日收入」的绿色条子，现在整条换掉了：
+/// - 在线（含上下线）就在顶栏按钮上，本来就是重复的；
+/// - 收入与单量去侧边抽屉 / 战报看，跑单时盯着数字没意义；
+/// - 「冻结 / 受伤 / 观战」这类**现在根本跑不了单**的状态仍然顶在最上面，
+///   不然骑手会以为 App 坏了。它们不该被通知条盖掉，所以单独一行。
+class _NoticeStrip extends StatelessWidget {
+  const _NoticeStrip({required this.state});
 
   final GameState state;
-  final GameClient client;
 
   @override
   Widget build(BuildContext context) {
     final me = state.me;
+    final notice = state.notice;
+    final rows = <Widget>[];
+
     if (me == null) {
-      return Container(
+      rows.add(Container(
         width: double.infinity,
         color: Colors.black12,
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         child: const Text('观战中：你看到的是公开信息，无法抢单。'),
-      );
+      ));
     }
-    final online = me.online;
-    return Container(
-      width: double.infinity,
-      color: online ? Colors.green.withValues(alpha: 0.10) : Colors.black12,
-      padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
-      child: Row(
-        children: [
-          InkWell(
-            borderRadius: BorderRadius.circular(14),
-            onTap: () => client.setOnline(!online),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(
-                color: online ? Colors.green : Colors.grey,
-                borderRadius: BorderRadius.circular(14),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    online ? Icons.wifi_tethering : Icons.wifi_tethering_off,
-                    size: 14,
-                    color: Colors.white,
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    online ? '在线' : '离线',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
+
+    if (notice != null) {
+      rows.add(InkWell(
+        onTap: () => showNoticeSheet(context, state: state, notice: notice),
+        child: Container(
+          width: double.infinity,
+          color: Colors.amber.withValues(alpha: 0.16),
+          padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+          child: Row(
+            children: [
+              Icon(Icons.campaign_outlined,
+                  size: 18, color: Colors.orange.shade800),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      notice.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
-                  ),
-                ],
+                    const SizedBox(height: 1),
+                    Text(
+                      notice.body,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Colors.grey.shade700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              // 关联了活动：给个奖杯提示，让骑手知道点进去还有进度可看。
+              if (notice.activityId != null)
+                Padding(
+                  padding: const EdgeInsets.only(left: 4),
+                  child: Icon(Icons.emoji_events_outlined,
+                      size: 16, color: Colors.deepOrange.shade400),
+                ),
+              const Icon(Icons.chevron_right,
+                  size: 18, color: Colors.black38),
+            ],
+          ),
+        ),
+      ));
+    }
+
+    if (me != null && (me.frozen || me.injured)) {
+      rows.add(Container(
+        width: double.infinity,
+        color: Colors.red.withValues(alpha: 0.08),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        child: Row(
+          children: [
+            if (me.frozen) const _Badge('冻结', Colors.red),
+            if (me.injured) const _Badge('受伤', Colors.orange),
+            Expanded(
+              child: Text(
+                '现在跑不了单，先联系调度。',
+                style: TextStyle(fontSize: 12, color: Colors.red.shade900),
               ),
             ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            '${me.speedMode.label} · ${state.config.isPeak ? '高峰' : '平峰'}',
-            style: const TextStyle(fontSize: 12),
-          ),
-          const Spacer(),
-          if (me.frozen) const _Badge('冻结', Colors.red),
-          if (me.injured) const _Badge('受伤', Colors.orange),
-          Text(
-            '今日 ¥${yuan(me.takehomeCents ?? 0)} · ${me.completed} 单',
-            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-          ),
-        ],
-      ),
-    );
+          ],
+        ),
+      ));
+    }
+
+    if (rows.isEmpty) return const SizedBox.shrink();
+    return Column(children: rows);
   }
 }
 
@@ -468,22 +497,8 @@ class _OrderList extends StatelessWidget {
             client: client,
             mode: mode,
           ),
-          // 送单路上要能顺手回顾客消息，别藏到别的页面去。
-          // 「联系顾客」已经挪进订单卡的操作区（原催单位置），见 OrderCard。
-          if (mode != OrderCardMode.hall && o.task != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-              child: OutlinedButton.icon(
-                onPressed: () => showTaskSheet(
-                  context,
-                  order: o,
-                  state: state,
-                  client: client,
-                ),
-                icon: const Icon(Icons.chat_bubble_outline, size: 18),
-                label: Text('任务对话：${o.task!.name}'),
-              ),
-            ),
+          // 任务对话已经并进「在线对话」——订单卡的操作区那一个按钮就够了，
+          // 不必在卡片下面再挂一条「任务对话」的入口。见 showChatSheet。
         ],
       );
 }

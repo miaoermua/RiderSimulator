@@ -157,8 +157,9 @@ class _Header extends StatelessWidget {
             borderRadius: BorderRadius.circular(10),
           ),
           child: Center(
+            // 时钟不再常驻（骑手看单不看表），只留天数。
             child: Text(
-              '第 ${state.day} 天 ${clockLabel(state.minuteOfDay)}',
+              '第 ${state.day} 天',
               style: const TextStyle(fontSize: 11, color: Colors.white),
             ),
           ),

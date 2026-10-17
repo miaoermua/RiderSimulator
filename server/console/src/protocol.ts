@@ -248,6 +248,18 @@ export interface Snapshot {
   claim_window_ms: number;
   /** 平台活动（含已下架的）。 */
   activities: ActivityView[];
+  /** 首页通知（烽火台写的单条公告）。`null` = 没写。 */
+  notice: NoticeView | null;
+}
+
+/** 首页通知：只有一条，改了就覆盖。骑手手机首页显示它，点开看全文。 */
+export interface NoticeView {
+  title: string;
+  body: string;
+  /** 关联的平台活动。`null` = 和活动无关。 */
+  activity_id: number | null;
+  /** 最后编辑的模拟分钟（自开局起算）。 */
+  updated_at_min: number;
 }
 
 /** 一个平台活动。达成奖金由服务端自动入账。 */
@@ -540,6 +552,8 @@ export interface EventPayloads {
   };
   /** 活动定义变了（建 / 上下架 / 删）。全体可见。 */
   activities_changed: { activities: ActivityView[] };
+  /** 首页通知变了（改文字 / 清空）。全体可见。 */
+  notice_changed: { notice: NoticeView | null };
   /** 某位骑手的活动进度变了（又完成一单）。只推给本人与控制端。 */
   activity_progress: {
     rider_id: number;

@@ -70,6 +70,8 @@ abstract final class Ev {
   static const activityProgress = 'activity_progress';
   /// 活动达成，奖金已自动入账。只推给本人与控制端。
   static const activityReward = 'activity_reward';
+  /// 首页通知变了（烽火台改文字 / 清空）。全体可见。
+  static const noticeChanged = 'notice_changed';
   static const configChanged = 'config_changed';
   static const aiDecision = 'ai_decision';
   static const taskMessage = 'task_message';
@@ -555,6 +557,34 @@ class ActivityView {
       );
 }
 
+/// 首页通知：烽火台写的一条公告，全服同一份。
+///
+/// 只有一条（改了就覆盖），可以关联一个平台活动——点开时附带「我的进度」。
+class NoticeView {
+  const NoticeView({
+    required this.title,
+    required this.body,
+    required this.activityId,
+    required this.updatedAtMin,
+  });
+
+  final String title;
+  final String body;
+
+  /// 关联的活动 id。`null` = 和活动无关。
+  final int? activityId;
+
+  /// 最后一次修改的模拟分钟（自开局起算），只用于展示。
+  final int updatedAtMin;
+
+  factory NoticeView.fromJson(Map<String, dynamic> j) => NoticeView(
+        title: reqStr(j['title']),
+        body: reqStr(j['body']),
+        activityId: optInt(j['activity_id']),
+        updatedAtMin: reqInt(j['updated_at_min']),
+      );
+}
+
 /// 我在某个活动上的进度。**只有本人 / 控制端拿得到**。
 class ActivityProgressView {
   const ActivityProgressView({
@@ -844,6 +874,7 @@ class Snapshot {
     required this.lastDayLedgers,
     required this.claimWindowMs,
     required this.activities,
+    required this.notice,
   });
 
   final int day;
@@ -864,6 +895,9 @@ class Snapshot {
   /// 平台活动（含已下架的，展示时自己过滤 [ActivityView.active]）。
   final List<ActivityView> activities;
 
+  /// 首页通知。`null` = 烽火台没写（首页不显示条子）。
+  final NoticeView? notice;
+
   factory Snapshot.fromJson(Map<String, dynamic> j) => Snapshot(
         day: reqInt(j['day'], 1),
         simMinute: reqInt(j['sim_minute']),
@@ -880,6 +914,9 @@ class Snapshot {
         lastDayLedgers: listOf(j['last_day_ledgers'], DayLedgerView.fromJson),
         claimWindowMs: reqInt(j['claim_window_ms'], 5000),
         activities: listOf(j['activities'], ActivityView.fromJson),
+        notice: j['notice'] is Map
+            ? NoticeView.fromJson(asMap(j['notice']))
+            : null,
       );
 }
 
@@ -938,11 +975,21 @@ class Ack {
 
 /// 任务对话里的一句话。
 class TaskLine {
-  const TaskLine({required this.from, required this.text, required this.step});
+  const TaskLine({
+    required this.from,
+    required this.text,
+    required this.step,
+    this.at = '',
+    this.atMin = 0,
+  });
 
   final String from; // rider | customer | system
   final String text;
   final int step;
+
+  /// 展示用时间戳（`HH:MM`）。服务端不给任务消息打时间，收到时本地补。
+  final String at;
+  final int atMin;
 
   bool get isMe => from == 'rider';
 }
@@ -978,6 +1025,7 @@ class ChatLine {
     required this.text,
     required this.kind,
     required this.at,
+    required this.atMin,
     this.compensationCents = 0,
     this.fault = 'none',
   });
@@ -992,6 +1040,7 @@ class ChatLine {
       text: reqStr(j['text']),
       kind: reqStr(j['kind'], 'free'),
       at: '$hh:$mm',
+      atMin: m,
       compensationCents: reqInt(j['compensation_cents']),
       fault: reqStr(j['fault'], 'none'),
     );
@@ -1006,6 +1055,9 @@ class ChatLine {
   /// 展示用的时间戳（`HH:MM`）。由 UI 侧补，服务端只给 `sim_minute`。
   final String at;
 
+  /// 同一条消息的当日分钟数。与任务消息混排时按它排序。
+  final int atMin;
+
   /// 这条消息带来的赔付（分）。`0` = 无经济后果。
   final int compensationCents;
 
@@ -1015,5 +1067,57 @@ class ChatLine {
   bool get isMe => from == 'rider';
 
   /// 有经济后果的消息要显眼——骑手得立刻知道这单被扣了钱。
+  bool get isCostly => compensationCents > 0;
+}
+
+/// 「在线对话」时间线上的一条。
+///
+/// 服务端把**订单会话**与**附加任务对话**分成两条通道（后者要判定进度），
+/// 但骑手眼里只有「跟这单的人说话」。手机端把它们按到达顺序混排成一条，
+/// 任务消息带 [isTask] 标记；输入框按「有没有未完成的任务」自动选通道。
+class ChatEntry {
+  const ChatEntry({
+    required this.from,
+    required this.text,
+    required this.kind,
+    required this.at,
+    required this.atMin,
+    this.isTask = false,
+    this.compensationCents = 0,
+    this.fault = 'none',
+  });
+
+  factory ChatEntry.ofChat(ChatLine line) => ChatEntry(
+        from: line.from,
+        text: line.text,
+        kind: line.kind,
+        at: line.at,
+        atMin: line.atMin,
+        compensationCents: line.compensationCents,
+        fault: line.fault,
+      );
+
+  factory ChatEntry.ofTask(TaskLine line) => ChatEntry(
+        from: line.from,
+        text: line.text,
+        kind: 'task',
+        at: line.at,
+        atMin: line.atMin,
+        isTask: true,
+      );
+
+  final String from; // rider | customer | system
+  final String text;
+  final String kind;
+  final String at;
+  final int atMin;
+
+  /// 来自附加任务对话（会推进任务进度），UI 上要打「任务」标记。
+  final bool isTask;
+
+  final int compensationCents;
+  final String fault;
+
+  bool get isMe => from == 'rider';
   bool get isCostly => compensationCents > 0;
 }

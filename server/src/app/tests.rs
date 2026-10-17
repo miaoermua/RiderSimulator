@@ -1324,6 +1324,100 @@ fn rpc_state_uses_the_control_view_but_no_server_secrets() {
 }
 
 #[test]
+fn rpc_notice_overwrites_one_row_and_reaches_the_snapshot() {
+    let mut app = control_app();
+    let (mut ctrl, _w) = hello(&mut app, 1, None);
+
+    let v = rpc(
+        &mut app,
+        RpcRequest::SetNotice {
+            title: " 冲单奖 ".into(),
+            body: " 跑满 10 单再奖 10 元 ".into(),
+            activity_id: None,
+        },
+    )
+    .expect("写通知不该失败");
+    assert_eq!(v["notice"]["title"].as_str(), Some("冲单奖"), "标题要 trim");
+    assert_eq!(
+        v["notice"]["body"].as_str(),
+        Some("跑满 10 单再奖 10 元"),
+        "正文要 trim"
+    );
+
+    let msgs = drain(&mut ctrl);
+    let ev = event(&msgs, "notice_changed").expect("必须广播，否则骑手要重连才看得见");
+    assert_eq!(ev["payload"]["notice"]["title"].as_str(), Some("冲单奖"));
+    assert!(ev["payload"]["notice"]["activity_id"].is_null());
+
+    // 单条：再写一次就是覆盖，不是追加
+    rpc(
+        &mut app,
+        RpcRequest::SetNotice {
+            title: "第二版".into(),
+            body: "换句话".into(),
+            activity_id: None,
+        },
+    )
+    .expect("覆盖不该失败");
+    assert_eq!(
+        app.world.notice.as_ref().map(|n| n.title.as_str()),
+        Some("第二版")
+    );
+
+    // 快照里也带着，刚重连的骑手能立刻看到
+    let snap = rpc(&mut app, RpcRequest::State).expect("取快照不该失败");
+    assert_eq!(snap["notice"]["title"].as_str(), Some("第二版"));
+
+    // 清空后广播 null，手机端据此收起条子
+    drain(&mut ctrl);
+    rpc(&mut app, RpcRequest::ClearNotice).expect("清空不该失败");
+    let msgs = drain(&mut ctrl);
+    let ev = event(&msgs, "notice_changed").expect("清空也要广播");
+    assert!(ev["payload"]["notice"].is_null());
+    assert!(app.world.notice.is_none());
+}
+
+#[test]
+fn rpc_notice_rejects_bad_text_and_unknown_activity() {
+    let mut app = control_app();
+
+    let err = rpc(
+        &mut app,
+        RpcRequest::SetNotice {
+            title: "   ".into(),
+            body: "正文".into(),
+            activity_id: None,
+        },
+    )
+    .expect_err("空标题该被拒");
+    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+
+    let err = rpc(
+        &mut app,
+        RpcRequest::SetNotice {
+            title: "标题".into(),
+            body: String::new(),
+            activity_id: None,
+        },
+    )
+    .expect_err("空正文该被拒");
+    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+
+    let err = rpc(
+        &mut app,
+        RpcRequest::SetNotice {
+            title: "标题".into(),
+            body: "正文".into(),
+            activity_id: Some(9999),
+        },
+    )
+    .expect_err("关联一个不存在的活动该被拒");
+    assert_eq!(err.code, "ACTIVITY_NOT_FOUND");
+    assert_eq!(err.status, axum::http::StatusCode::CONFLICT);
+    assert!(app.world.notice.is_none(), "校验失败不能留下半截状态");
+}
+
+#[test]
 fn rpc_dispatch_assigns_the_order_and_tells_the_console() {
     let mut app = control_app();
     let (mut ctrl, _w) = hello(&mut app, 1, None);
