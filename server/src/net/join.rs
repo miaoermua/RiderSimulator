@@ -192,7 +192,7 @@ fn enumerate_lan_ipv4() -> Option<Ipv4Addr> {
                 continue;
             }
             let rank = lan_rank(ip);
-            if best.map_or(true, |(r, _)| rank < r) {
+            if best.is_none_or(|(r, _)| rank < r) {
                 best = Some((rank, ip));
             }
         }
@@ -221,8 +221,8 @@ fn lan_rank(ip: Ipv4Addr) -> u8 {
 /// 这些名字开头的网卡是虚拟的，地址给手机没有意义。
 fn is_virtual_iface(name: &str) -> bool {
     const VIRTUAL: &[&str] = &[
-        "utun", "tun", "tap", "ppp", "ipsec", "awdl", "llw", "bridge", "docker", "veth",
-        "vmnet", "ham", "gif", "stf", "anpi", "ap",
+        "utun", "tun", "tap", "ppp", "ipsec", "awdl", "llw", "bridge", "docker", "veth", "vmnet",
+        "ham", "gif", "stf", "anpi", "ap",
     ];
     VIRTUAL.iter().any(|p| name.starts_with(p))
 }

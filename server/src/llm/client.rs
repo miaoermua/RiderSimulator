@@ -805,11 +805,7 @@ fn sse_content(raw: &str) -> String {
         let piece = choice
             .get("delta")
             .and_then(|d| d.get("content"))
-            .or_else(|| {
-                choice
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-            })
+            .or_else(|| choice.get("message").and_then(|m| m.get("content")))
             .and_then(|c| c.as_str());
         if let Some(s) = piece {
             out.push_str(s);
@@ -1258,9 +1254,7 @@ mod tests {
         // 「你」是 3 字节 UTF-8。真实流式里它**很可能被切在两个分片之间**。
         // 关键防线是：先整个缓冲区一次性转字符串，再按行切——
         // 顺序反了（逐片 from_utf8_lossy）就会在这里变成 U+FFFD。
-        let raw = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n",
-        );
+        let raw = concat!("data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n",);
         assert_eq!(sse_content(raw), "你");
         assert!(!sse_content(raw).contains('\u{FFFD}'));
     }

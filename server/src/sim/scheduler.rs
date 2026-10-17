@@ -306,7 +306,8 @@ pub fn reassign(
         }
     }
 
-    let mut assignment = ai::evaluate(world, to_rider, order_id).ok_or(ClaimError::OrderNotFound)?;
+    let mut assignment =
+        ai::evaluate(world, to_rider, order_id).ok_or(ClaimError::OrderNotFound)?;
     assignment.source = DecisionSource::Manual;
     assignment.reason = format!(
         "控制端改派：{from_name}还没取到餐（{}），转给{to_name}",
@@ -1138,7 +1139,11 @@ mod tests {
         assert_eq!(err, ClaimError::WrongPhase);
         assert_eq!(w.order(oid).expect("订单在").assigned_to, Some(from));
         assert_eq!(w.rider(to).expect("新骑手在").held.len(), 0);
-        assert_eq!(w.rider(from).expect("原骑手在").held.len(), 1, "原骑手不该丢单");
+        assert_eq!(
+            w.rider(from).expect("原骑手在").held.len(),
+            1,
+            "原骑手不该丢单"
+        );
         assert_eq!(w.stats.reassigns, 0);
     }
 
@@ -1224,5 +1229,31 @@ mod tests {
     fn simulated_riders_are_not_gated_by_the_violation_switch() {
         let (mut w, rid, oid) = world_with_pending_assign(6);
         arrive_shop(&mut w, rid, oid).expect("AI 不该被真人违规开关挡住");
+    }
+
+    /// 真人还在路上就点「送达」：默认拒掉，放行后一步送到。
+    #[test]
+    fn a_human_cannot_deliver_before_reaching_the_customer() {
+        let (mut w, rid, oid) = world_with_pending_assign(6);
+        {
+            let r = w.rider_mut(rid).expect("骑手在");
+            r.kind = RiderKind::Human;
+            r.held[0].set_leg(Phase::ToCustomer, 8);
+        }
+        w.order_mut(oid).expect("订单在").status = OrderStatus::PickedUp;
+
+        assert_eq!(
+            deliver(&mut w, rid, oid).expect_err("没到顾客不能点送达"),
+            ClaimError::OffsiteOp
+        );
+        assert_eq!(
+            w.order(oid).expect("订单在").status,
+            OrderStatus::PickedUp,
+            "被拒之后单子不能变成已送达"
+        );
+
+        w.cfg.allow_rider_violation = true;
+        deliver(&mut w, rid, oid).expect("放行后可以一步送到");
+        assert_eq!(w.order(oid).expect("订单在").status, OrderStatus::Delivered);
     }
 }

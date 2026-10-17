@@ -1787,11 +1787,8 @@ impl App {
                     }
                 },
             ),
-            M::Reassign { order_id, rider_id } => self.control(
-                conn_id,
-                role,
-                "reassign",
-                |app| match scheduler::reassign(&mut app.world, order_id, rider_id) {
+            M::Reassign { order_id, rider_id } => self.control(conn_id, role, "reassign", |app| {
+                match scheduler::reassign(&mut app.world, order_id, rider_id) {
                     Ok(out) => {
                         let events = app.reassign_events(&out);
                         app.outbox.extend(events);
@@ -1805,8 +1802,8 @@ impl App {
                         app.outbox_err = Some(e);
                         None
                     }
-                },
-            ),
+                }
+            }),
             M::SetLlmEnabled { enabled } => self.control(conn_id, role, "set_llm_enabled", |app| {
                 let actual = enabled && app.brain.is_enabled();
                 app.opts.llm_enabled = actual;
