@@ -36,6 +36,7 @@ class DeliveryMap extends StatefulWidget {
     this.showBasemapPicker = true,
     this.fitPadding = 56,
     this.focus,
+    this.arcRoutes = false,
   });
 
   final GameState state;
@@ -52,6 +53,12 @@ class DeliveryMap extends StatefulWidget {
   /// 非空时首帧不做框选，后续变化会平移过去——切点的预期就是「镜头跟过去」，
   /// 而不是每切一次都重新框一遍整单。
   final LatLng? focus;
+
+  /// 取送之间画圆弧而不是直线。
+  ///
+  /// 多单叠在一张图上时，直线会糊成一团；弧线各走一边，能看出哪条属于哪一单。
+  /// 单张订单卡里仍用直线——那里只需要「这两点连着」。
+  final bool arcRoutes;
 
   @override
   State<DeliveryMap> createState() => _DeliveryMapState();
@@ -195,10 +202,15 @@ class _DeliveryMapState extends State<DeliveryMap> {
         polylines: [
           for (final o in widget.orders)
             Polyline(
-              points: [
-                LatLng(o.merchantLat, o.merchantLng),
-                LatLng(o.customerLat, o.customerLng),
-              ],
+              points: widget.arcRoutes
+                  ? _arcBetween(
+                      LatLng(o.merchantLat, o.merchantLng),
+                      LatLng(o.customerLat, o.customerLng),
+                    )
+                  : [
+                      LatLng(o.merchantLat, o.merchantLng),
+                      LatLng(o.customerLat, o.customerLng),
+                    ],
               color: _orderLineColor[o.status] ?? Colors.deepOrange,
               strokeWidth: 3,
               // 还没接的单画虚线：路线是「可能会走」，不是「正在走」。
@@ -369,6 +381,32 @@ class _BasemapTile extends StatelessWidget {
       onTap: onTap,
     );
   }
+}
+
+/// 取 → 送两点之间的圆弧：二次贝塞尔，控制点抬在中点一侧。
+///
+/// 偏移取弦长的 35%：多单叠在一起时足够分开，单看又不至于像绕路。
+List<LatLng> _arcBetween(LatLng a, LatLng b, {int steps = 28}) {
+  final midLat = (a.latitude + b.latitude) / 2;
+  final midLng = (a.longitude + b.longitude) / 2;
+  final dLat = b.latitude - a.latitude;
+  final dLng = b.longitude - a.longitude;
+  // 法线方向：把弦转 90°，所有订单都朝同一侧弯，不会互相穿插。
+  final cLat = midLat - dLng * 0.35;
+  final cLng = midLng + dLat * 0.35;
+
+  final points = <LatLng>[];
+  for (var i = 0; i <= steps; i++) {
+    final t = i / steps;
+    final u = 1 - t;
+    points.add(
+      LatLng(
+        u * u * a.latitude + 2 * u * t * cLat + t * t * b.latitude,
+        u * u * a.longitude + 2 * u * t * cLng + t * t * b.longitude,
+      ),
+    );
+  }
+  return points;
 }
 
 /// 取送点的圆标。地图上的字都要有白底，不然压在路网上看不清。

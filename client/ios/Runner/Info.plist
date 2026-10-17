@@ -8,6 +8,8 @@
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
 	<string>骑手端</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>用你的位置校准骑手在模拟地图上的位置，并计算到店、送达的距离。</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../game_client.dart';
 import '../game_state.dart';
+import '../location_service.dart';
 import '../map/basemaps.dart';
 import '../protocol.dart';
 
@@ -31,7 +32,7 @@ class _RunningSettingsSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: state,
+      animation: Listenable.merge([state, LocationService.instance]),
       builder: (context, _) {
         final me = state.me;
         final cfg = state.config;
@@ -87,6 +88,36 @@ class _RunningSettingsSheet extends StatelessWidget {
                   ),
                   const Divider(height: 26),
                 ],
+                const _Label('定位上报'),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    for (final r in LocationRate.values)
+                      ChoiceChip(
+                        label: Text(r.label),
+                        selected: LocationService.instance.rate == r,
+                        onSelected: (_) =>
+                            LocationService.instance.setRate(r),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '${LocationService.instance.rate.detail}。越勤越准、也越耗电；只在前台跑单时定位，关了就不问权限也不上报。',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _locationStatus(),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: LocationService.instance.error != null
+                        ? Colors.orange.shade800
+                        : Colors.grey,
+                  ),
+                ),
+                const Divider(height: 26),
                 const _Label('地图底图'),
                 const SizedBox(height: 6),
                 Wrap(
@@ -153,6 +184,21 @@ class _RunningSettingsSheet extends StatelessWidget {
         );
       },
     );
+  }
+
+  static String _locationStatus() {
+    final loc = LocationService.instance;
+    if (loc.error != null) return loc.error!;
+    if (!loc.running) {
+      return loc.rate == LocationRate.off ? '已关闭：骑手停在服务端最后给的位置。' : '尚未启动';
+    }
+    final at = loc.lastFixAt;
+    if (at == null) return '已申请权限，等待第一次定位…';
+    final t = '${at.hour.toString().padLeft(2, '0')}:'
+        '${at.minute.toString().padLeft(2, '0')}:'
+        '${at.second.toString().padLeft(2, '0')}';
+    return '运行中 · 最近 $t · '
+        '世界坐标 ${loc.lastLat!.toStringAsFixed(5)}, ${loc.lastLng!.toStringAsFixed(5)}';
   }
 
   static String _statusLabel(ConnStatus s) => switch (s) {

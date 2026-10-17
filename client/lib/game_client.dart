@@ -201,6 +201,12 @@ class GameClient {
 
   void setOnline(bool online) =>
       _send({ 'type': Msg.setOnline, 'online': online });
+  /// 上报手机定位（世界坐标 GCJ-02，换算在 `LocationService` 里做）。
+  ///
+  /// 服务端只改坐标、不动状态机，所以这一步不会让人跳过「到店 / 送达」。
+  void sendPosition(double lat, double lng) =>
+      _send({'type': Msg.setPosition, 'lat': lat, 'lng': lng});
+
   void setSpeedMode(SpeedMode mode) =>
       _send({ 'type': Msg.setSpeedMode, 'mode': mode.wire });
 

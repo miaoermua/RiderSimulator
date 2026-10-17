@@ -29,6 +29,9 @@ abstract final class Msg {
   static const deliver = 'deliver';
   static const setOnline = 'set_online';
   static const setSpeedMode = 'set_speed_mode';
+
+  /// 手机 GPS 上报，校准自己在模拟世界里的坐标（世界坐标系是 GCJ-02）。
+  static const setPosition = 'set_position';
   static const changePassword = 'change_password';
   static const taskMessage = 'task_message';
   /// 订单会话（末端交付沟通）里打字说一句。**不要求订单挂任务**，

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'game_client.dart';
 import 'game_state.dart';
+import 'location_service.dart';
 import 'screens/login_page.dart';
 import 'screens/rider_home.dart';
 
@@ -18,6 +19,13 @@ class RiderApp extends StatefulWidget {
 class _RiderAppState extends State<RiderApp> {
   final GameState _state = GameState();
   GameClient? _client;
+
+  @override
+  void initState() {
+    super.initState();
+    // 定位频率是本地偏好，跟账号无关，先读出来再决定要不要开流。
+    LocationService.instance.loadSaved();
+  }
 
   /// 已经发起了连接（等着握手结果）。
   bool _entered = false;

@@ -1,7 +1,7 @@
 name: rider_client
 description: 骑手模拟器 · 骑手端（Flutter）
 publish_to: "none"
-version: 0.1.0+1
+version: 0.2.0+2
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
@@ -28,6 +28,8 @@ dependencies:
   # SnackBar 是页面内横幅，会压住底栏、还会顶掉上一条，
   # 不适合「按完按钮立刻给反馈」这种场景。
   fluttertoast: ^10.0.2
+  geolocator: ^14.1.1
+  shared_preferences: ^2.5.6
 
 dev_dependencies:
   flutter_test:

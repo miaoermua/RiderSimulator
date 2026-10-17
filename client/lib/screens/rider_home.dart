@@ -4,14 +4,15 @@ import 'package:flutter/material.dart';
 
 import '../game_client.dart';
 import '../game_state.dart';
+import '../location_service.dart';
 import '../protocol.dart';
 import '../widgets/app_toast.dart';
 import '../widgets/order_card.dart';
 import '../widgets/rider_drawer.dart';
-import '../widgets/chat_sheet.dart';
 import '../widgets/task_sheet.dart';
 import 'assign_order_page.dart';
 import 'notifications_page.dart';
+import 'route_plan_page.dart';
 import 'running_settings_sheet.dart';
 
 /// 骑手端主界面。
@@ -37,13 +38,20 @@ class _RiderHomePageState extends State<RiderHomePage> {
   /// 已经提示过第几条错误，避免同一条提示连着弹。
   int _seenErrorSeq = 0;
 
+  /// 已经提示过的定位失败原因。
+  String? _seenLocationError;
+
   @override
   void initState() {
     super.initState();
     widget.state.addListener(_onState);
+    // 进主界面才开定位：登录页没必要问权限，也不想在没连上时就上报。
+    LocationService.instance.attach(widget.client, widget.state);
     // 每秒重绘一次，让倒计时 / 时钟走字。
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
+      if (!mounted) return;
+      _complainLocation();
+      setState(() {});
     });
   }
 
@@ -65,6 +73,16 @@ class _RiderHomePageState extends State<RiderHomePage> {
       if (!mounted) return;
       showAppToast(err, bad: true);
     });
+  }
+
+  /// 定位出问题（没权限 / 系统定位没开）时当场说一声。
+  ///
+  /// 不说的话「我」会一直停在老位置，骑手只会觉得地图坏了。
+  void _complainLocation() {
+    final err = LocationService.instance.error;
+    if (err == null || err == _seenLocationError) return;
+    _seenLocationError = err;
+    showAppToast(err, bad: true);
   }
 
   /// 收到系统指派就弹确认界面。导航不能放在 build 里，推到下一帧。
@@ -376,23 +394,8 @@ class _OrderList extends StatelessWidget {
             client: client,
             mode: mode,
           ),
-          // 末端交付沟通：**任何到手单都能说**，不要求挂任务——
-          // 这正是它和下面那个「任务对话」按钮的区别。
-          if (mode != OrderCardMode.hall)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-              child: OutlinedButton.icon(
-                onPressed: () => showChatSheet(
-                  context,
-                  order: o,
-                  state: state,
-                  client: client,
-                ),
-                icon: const Icon(Icons.support_agent, size: 18),
-                label: Text(_chatLabel(o)),
-              ),
-            ),
           // 送单路上要能顺手回顾客消息，别藏到别的页面去。
+          // 「联系顾客」已经挪进订单卡的操作区（原催单位置），见 OrderCard。
           if (mode != OrderCardMode.hall && o.task != null)
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
@@ -409,21 +412,11 @@ class _OrderList extends StatelessWidget {
             ),
         ],
       );
-
-  /// 「联系顾客」按钮上的字。
-  ///
-  /// 顾客开口是稀罕事（大约 5% 的单子），所以一来消息就值得在按钮上报一声，
-  /// 免得骑手错过——尤其是带赔付的那种。
-  String _chatLabel(OrderView o) {
-    final has = (state.chatLines[o.id] ?? const <ChatLine>[])
-        .any((l) => l.from == 'customer');
-    return has ? '联系顾客 · 有新消息' : '联系顾客';
-  }
 }
 
-/// 底部工具栏：跑单设置占两成宽，刷新占八成。
+/// 底部工具栏：跑单设置与路线规划各占两成，刷新占六成。
 ///
-/// 设置是低频操作，做小：图标在上、文字在下、不带边框；
+/// 前两个是低频操作，做小：图标在上、文字在下、不带边框；
 /// 刷新是跑单时一直想按的，做大，单手拇指好够。
 class _BottomTools extends StatefulWidget {
   const _BottomTools({
@@ -454,40 +447,69 @@ class _BottomToolsState extends State<_BottomTools> {
     }
   }
 
+  /// 底栏左侧的小入口：图标在上、文字在下，不带边框也不带底色。
+  Widget _toolButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    final color = Theme.of(context).colorScheme.onSurfaceVariant;
+    return InkWell(
+      borderRadius: BorderRadius.circular(10),
+      onTap: onTap,
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(icon, size: 19, color: color),
+          const SizedBox(height: 2),
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 10, color: color),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
     return BottomAppBar(
       height: 64,
       padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
       child: Row(
         children: [
-          // 两成：图标 + 文字的素按钮，没有边框也没有底色。
+          // 设置与规划是低频入口，各占两成；刷新是高频动作，占余下的六成。
           Expanded(
             flex: 2,
-            child: InkWell(
-              borderRadius: BorderRadius.circular(10),
-              onTap: () =>
-                  showRunningSettings(context, state: widget.state, client: widget.client),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(Icons.tune, size: 19, color: scheme.onSurfaceVariant),
-                  const SizedBox(height: 2),
-                  Text(
-                    '跑单设置',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 10, color: scheme.onSurfaceVariant),
-                  ),
-                ],
+            child: _toolButton(
+              icon: Icons.tune,
+              label: '跑单设置',
+              onTap: () => showRunningSettings(
+                context,
+                state: widget.state,
+                client: widget.client,
+              ),
+            ),
+          ),
+          const SizedBox(width: 4),
+          Expanded(
+            flex: 2,
+            child: _toolButton(
+              icon: Icons.alt_route,
+              label: '路线规划',
+              onTap: () => showRoutePlan(
+                context,
+                state: widget.state,
+                client: widget.client,
               ),
             ),
           ),
           const SizedBox(width: 8),
-          // 八成：一颗大按钮，转圈就是刷新动效。
+          // 六成：一颗大按钮，转圈就是刷新动效。
           Expanded(
-            flex: 8,
+            flex: 6,
             child: FilledButton.tonal(
               onPressed: _busy ? null : _refresh,
               style: FilledButton.styleFrom(

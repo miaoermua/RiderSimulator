@@ -83,6 +83,32 @@ class OrderDetailPage extends StatelessWidget {
                       // 已结束的单只看不操作。
                       showActions: order.status.isActive,
                     ),
+                    // 催单挪进详情页：它只对「已到店、还没出餐」有用
+                    // （服务端要求 Phase::WaitingFood），放在列表卡上
+                    // 十有八九点下去是被拒，不如收进详情里当低频操作。
+                    if (order.status == OrderStatus.assigned)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+                        child: Row(
+                          children: [
+                            OutlinedButton.icon(
+                              onPressed: () => client.urge(order.id),
+                              icon: const Icon(Icons.campaign_outlined, size: 18),
+                              label: const Text('催单'),
+                            ),
+                            const SizedBox(width: 10),
+                            Text(
+                              order.urgeCount == 0
+                                  ? '催商家快点出餐'
+                                  : '已催 ${order.urgeCount} 次',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
                     _Timeline(order: order),
                   ],
                 ),

@@ -59,6 +59,12 @@
       "roles": ["rider", "control"],
       "fields": { "mode": "compliant | tolerant | unrestricted" }
     },
+    {
+      "type": "set_position",
+      "roles": ["rider"],
+      "fields": { "lat": "f64 (-90..90)", "lng": "f64 (-180..180)" },
+      "comment": "手机 GPS 上报，校准自己在模拟世界里的坐标。只改坐标、不动状态机：手上的单与阶段不变，仍要按流程到店 / 送达。坐标系是**世界坐标 GCJ-02**，WGS-84 必须在客户端先换算（直接塞会偏几百米）。骑手身份取自连接本身，只能改自己的位置。"
+    },
 
     {
       "type": "task_message",

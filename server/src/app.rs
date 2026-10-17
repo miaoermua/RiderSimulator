@@ -1194,6 +1194,9 @@ impl App {
             RpcRequest::SetRiderOnline { rider_id, online } => {
                 self.rpc_set_online(rider_id, online)
             }
+            RpcRequest::SetRiderPosition { rider_id, lat, lng } => {
+                self.rpc_set_position(rider_id, lat, lng)
+            }
             RpcRequest::AiState => Ok(self.ai_state()),
             RpcRequest::SetAi(patch) => self.rpc_set_ai(&patch),
             RpcRequest::RejectAi { decision_id } => self.rpc_reject_ai(decision_id),
@@ -1547,6 +1550,56 @@ impl App {
         }
     }
 
+    /// WS 侧的 [`ClientMessage::SetPosition`]：手机 GPS 上报，校准自己的坐标。
+    ///
+    /// 与 HTTP 的 [`Self::rpc_set_position`] 同一个语义（只改坐标、不动状态机），
+    /// 区别是骑手身份来自连接本身——**收不到别人的坐标**，不需要控制端令牌。
+    fn do_set_position(&mut self, conn_id: ConnId, rid: RiderId, lat: f64, lng: f64) {
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
+            self.hub.send_ack(
+                conn_id,
+                &Ack::err(
+                    "set_position",
+                    code::BAD_REQUEST,
+                    format!("坐标越界：lat={lat} lng={lng}"),
+                ),
+            );
+            return;
+        }
+        let Some(r) = self.world.rider_mut(rid) else {
+            self.hub
+                .send_ack(conn_id, &Ack::err("set_position", code::BAD_REQUEST, "骑手不存在"));
+            return;
+        };
+        r.set_pos(crate::sim::geo::LatLng { lat, lng });
+        self.hub.send_ack(conn_id, &Ack::ok("set_position"));
+    }
+
+    /// 校准骑手坐标。**只改位置，不动状态机**——阶段与手上单保持原样，
+    /// 所以骑手仍得自己按流程走到店、按流程送达，不会跳过 `arrive_shop`。
+    ///
+    /// 坐标范围在 HTTP 层已校验，这里再兜一次：RPC 也能从 WS 进来，
+    /// 绕开 HTTP 层的检查。一个越界经度会让 haversine 算出天文数字，
+    /// 把路线长度、时薪、承诺时限全带崩，而且**不会报错**——所以宁可拒。
+    fn rpc_set_position(&mut self, rider_id: RiderId, lat: f64, lng: f64) -> RpcReply {
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
+            return Err(ApiError::bad_request(format!(
+                "坐标越界：lat={lat} lng={lng}"
+            )));
+        }
+        let Some(r) = self.world.rider_mut(rider_id) else {
+            return Err(ApiError::bad_request(format!("没有 id 为 {rider_id} 的骑手")));
+        };
+        r.set_pos(crate::sim::geo::LatLng { lat, lng });
+        Ok(json!({
+            "rider_id": rider_id,
+            "lat": lat,
+            "lng": lng,
+            // 明说「只改了坐标」，调用方才知道状态机没被动过。
+            "note": "只校准了坐标，阶段与手持单未改动",
+        }))
+    }
+
     fn on_closed(&mut self, conn_id: ConnId) {
         let role = self.hub.role_of(conn_id);
         self.hub.unregister(conn_id);
@@ -1607,6 +1660,7 @@ impl App {
             | M::Deliver { .. }
             | M::SetOnline { .. }
             | M::SetSpeedMode { .. }
+            | M::SetPosition { .. }
             | M::TaskMessage { .. }
             | M::ChatSay { .. }
             | M::ChatPreset { .. }
@@ -1680,6 +1734,7 @@ impl App {
                 let r = scheduler::set_speed_mode(&mut self.world, rid, mode);
                 self.finish_simple(conn_id, "set_speed_mode", r)
             }
+            M::SetPosition { lat, lng } => self.do_set_position(conn_id, rid, lat, lng),
             M::ChangePassword {
                 old_password,
                 new_password,
@@ -3173,6 +3228,7 @@ fn client_action_name(msg: &ClientMessage) -> &'static str {
         M::Deliver { .. } => "deliver",
         M::SetOnline { .. } => "set_online",
         M::SetSpeedMode { .. } => "set_speed_mode",
+        M::SetPosition { .. } => "set_position",
         M::ChangePassword { .. } => "change_password",
         M::TaskMessage { .. } => "task_message",
         M::ChatSay { .. } => "chat_say",

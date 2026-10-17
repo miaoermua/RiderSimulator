@@ -50,6 +50,8 @@ pub const REASSIGN_PATH: &str = "/api/reassign";
 pub const CONFIG_PATH: &str = "/api/config";
 /// 强制某个骑手上线 / 下线。
 pub const RIDER_ONLINE_PATH: &str = "/api/riders/{id}/online";
+/// 校准某个骑手的位置（`{"lat":..,"lng":..}`）。只改坐标，不动状态机。
+pub const RIDER_POSITION_PATH: &str = "/api/riders/{id}/position";
 /// 三层 AI 的观测与开关：`GET` 读状态，`POST` 改开关 / 托管模式。
 pub const AI_PATH: &str = "/api/ai";
 /// `GET` 读三层 AI 状态。与 `GET /api/ai` 等价，留给只认显式路径的调用方。
@@ -120,6 +122,15 @@ pub enum RpcRequest {
     SetConfig(ConfigPatch),
     /// 上 / 下线。
     SetRiderOnline { rider_id: RiderId, online: bool },
+    /// **校准骑手坐标**：只改位置，不动状态机（手上还是那些单，阶段照旧）。
+    ///
+    /// 给「手机没定位权限 / 定位漂了」的真人骑手用——否则只能自己走回去。
+    /// 坐标范围已在 HTTP 层校验，这里只兜底（HTTP 层可以被绕过）。
+    SetRiderPosition {
+        rider_id: RiderId,
+        lat: f64,
+        lng: f64,
+    },
     /// 读三层 AI 的完整状态（开关 / 预算 / 统计 / 站点 KPI / 否决记录）。
     AiState,
     /// 改 AI 开关与托管模式。
@@ -284,6 +295,7 @@ pub fn routes(state: ApiState) -> Router {
         .route(REASSIGN_PATH, post(reassign_route))
         .route(CONFIG_PATH, post(config_route))
         .route(RIDER_ONLINE_PATH, post(rider_online_route))
+        .route(RIDER_POSITION_PATH, post(rider_position_route))
         .route(AI_PATH, get(ai_state_route).post(ai_config_route))
         .route(AI_STATE_PATH, get(ai_state_route))
         .route(AI_CONFIG_PATH, post(ai_config_route))
@@ -451,6 +463,50 @@ async fn rider_online_route(
         RpcRequest::SetRiderOnline {
             rider_id: id,
             online,
+        },
+    )
+    .await
+}
+
+/// `POST /api/riders/{id}/position` —— **校准真人骑手的位置**。
+///
+/// 存在的理由：真人骑手的位置来自手机 GPS 上报，但**没定位权限 / 定位不准时
+/// 就没有任何办法把他放回该在的地方**——没有这个接口，一个卡在错误位置的
+/// 真人骑手只能自己走回去，或者干脆重新建号。
+///
+/// 语义上是「校准」而不是「传送」：**只改坐标，不动状态机**。
+/// 手上的单还是那些单，阶段还是原来那个阶段。所以校准之后他得自己按流程
+/// 走到店、按流程送达——不会凭空跳过 `arrive_shop` / `deliver` 那几步。
+///
+/// 坐标用哪套由**调用方**决定（这个接口不做换算）：服务端世界是 GCJ-02，
+/// 但骑手端拿到的可能是 WGS-84，两者差几百米。要用别的坐标系，
+/// 传 WGS-84 的值之前先换好。
+async fn rider_position_route(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<u32>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(lat) = body.get("lat").and_then(Value::as_f64) else {
+        return ApiError::bad_request("缺少 lat（数字）").into_response();
+    };
+    let Some(lng) = body.get("lng").and_then(Value::as_f64) else {
+        return ApiError::bad_request("缺少 lng（数字）").into_response();
+    };
+    // 范围校验：越界的坐标会让 haversine 算出天文数字，把路线与时薪全带崩。
+    // 而且静默接受一个明显写错的经度，比报错难查得多。
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
+        return ApiError::bad_request(format!(
+            "坐标越界：lat={lat} lng={lng}（纬度 -90..90，经度 -180..180）"
+        ))
+        .into_response();
+    }
+    api.call(
+        &headers,
+        RpcRequest::SetRiderPosition {
+            rider_id: id,
+            lat,
+            lng,
         },
     )
     .await

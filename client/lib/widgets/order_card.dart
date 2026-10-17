@@ -5,6 +5,7 @@ import '../game_client.dart';
 import '../game_state.dart';
 import '../protocol.dart';
 import '../screens/order_detail_page.dart';
+import 'chat_sheet.dart';
 import 'delivery_map.dart';
 import 'slide_confirm.dart';
 
@@ -419,6 +420,23 @@ class _Actions extends StatelessWidget {
   final VoidCallback? onAccept;
   final VoidCallback? onReject;
 
+  /// 「联系顾客」按钮上的字。
+  ///
+  /// 顾客开口是稀罕事（大约 5% 的单子），一来消息就值得在按钮上报一声，
+  /// 免得骑手错过——尤其是带赔付的那种。
+  String get _chatLabel {
+    final has = (state.chatLines[order.id] ?? const <ChatLine>[])
+        .any((l) => l.from == 'customer');
+    return has ? '联系顾客 · 新消息' : '联系顾客';
+  }
+
+  void _openChat(BuildContext context) => showChatSheet(
+        context,
+        order: order,
+        state: state,
+        client: client,
+      );
+
   @override
   Widget build(BuildContext context) {
     switch (mode) {
@@ -433,9 +451,13 @@ class _Actions extends StatelessWidget {
         return Wrap(
           spacing: 8,
           children: [
-            OutlinedButton(
-              onPressed: () => client.urge(order.id),
-              child: const Text('催单'),
+            // 末端交付沟通就放在原「催单」的位置：取货路上最常做的事是
+            // 跟顾客说一声「到楼下了」，而不是催商家。
+            // 催单挪去了订单详情页（见 OrderDetailPage）。
+            OutlinedButton.icon(
+              onPressed: () => _openChat(context),
+              icon: const Icon(Icons.support_agent, size: 18),
+              label: Text(_chatLabel),
             ),
             FilledButton(
               onPressed: () => client.arriveShop(order.id),
@@ -445,10 +467,11 @@ class _Actions extends StatelessWidget {
         );
 
       case OrderCardMode.delivery:
-        // 「送达」是整条滑动确认，这里只留催单。
-        return OutlinedButton(
-          onPressed: () => client.urge(order.id),
-          child: const Text('催单'),
+        // 「送达」是整条滑动确认，这里只留联系顾客。
+        return OutlinedButton.icon(
+          onPressed: () => _openChat(context),
+          icon: const Icon(Icons.support_agent, size: 18),
+          label: Text(_chatLabel),
         );
 
       case OrderCardMode.assign:

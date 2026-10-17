@@ -482,6 +482,16 @@ class GameState extends ChangeNotifier {
     if (cur != null) riders[id] = update(cur);
   }
 
+  /// 把「我」的位置挪到手机刚拿到的定位处（世界坐标 GCJ-02）。
+  ///
+  /// 服务端的 tick 帧**不带骑手坐标**，只有 snapshot 才带——不在这里补一下，
+  /// 地图上的「我」和订单距离会一直停在连接那一刻（这就是「定位不刷新」）。
+  /// 先动本地，下一次 snapshot 会用同一个值覆盖回来，不会来回跳。
+  void applyLocalFix(double lat, double lng) {
+    _patchMe((r) => _copyRider(r, lat: lat, lng: lng));
+    notifyListeners();
+  }
+
   void _applyWeather(Map<String, dynamic> p) {
     weather = reqStr(p['weather'], weather);
     weatherLabel = reqStr(p['label'], weatherLabel);
@@ -586,7 +596,13 @@ class GameState extends ChangeNotifier {
         task: o.task,
       );
 
-  static RiderView _copyRider(RiderView r, {int? takehomeCents}) => RiderView(
+  static RiderView _copyRider(
+    RiderView r, {
+    int? takehomeCents,
+    double? lat,
+    double? lng,
+  }) =>
+      RiderView(
         id: r.id,
         key: r.key,
         name: r.name,
@@ -601,8 +617,8 @@ class GameState extends ChangeNotifier {
         rejectsToday: r.rejectsToday,
         held: r.held,
         phase: r.phase,
-        lat: r.lat,
-        lng: r.lng,
+        lat: lat ?? r.lat,
+        lng: lng ?? r.lng,
         hourlyWageCents: r.hourlyWageCents,
         takehomeCents: takehomeCents ?? r.takehomeCents,
         cashCents: r.cashCents,
