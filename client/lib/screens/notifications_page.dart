@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../game_state.dart';
 import '../protocol.dart';
+import '../widgets/empty_state_art.dart';
 
 /// 通知和活动中心：一页两签。
 ///
@@ -82,11 +83,11 @@ class _ActivitiesTab extends StatelessWidget {
   Widget build(BuildContext context) {
     final running = state.runningActivities;
     if (running.isEmpty) {
-      return const Center(
-        child: Text(
-          '当前没有进行中的活动。',
-          style: TextStyle(color: Colors.grey),
-        ),
+      // 空态给张「拆开的空纸箱」——活动没开张，比一行灰字直观。
+      return const EmptyStateArt(
+        asset: 'assets/illustrations/box.png',
+        message: '当前没有进行中的活动。',
+        size: 160,
       );
     }
     return ListView.separated(

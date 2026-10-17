@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../game_client.dart';
 import '../game_state.dart';
 import '../protocol.dart';
+import 'empty_state_art.dart';
 
 /// 「在线对话」面板：末端会话 + 附加任务对话，混成一条时间线。
 ///
@@ -130,18 +131,15 @@ class _ChatSheetState extends State<_ChatSheet> {
                 const Divider(height: 1),
                 Expanded(
                   child: lines.isEmpty
-                      ? Center(
-                          child: Padding(
-                            padding: const EdgeInsets.all(24),
-                            child: Text(
-                              task != null
-                                  ? '还没开始聊。\n说一句试试，例如「给你放门口行吗」——'
-                                      '这句话会直接判定任务。'
-                                  : '顾客还没开口。\n说一句试试——不过大多数单子不会有人回。',
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(color: Colors.grey),
-                            ),
-                          ),
+                      // 空箱子配原话术：对话框多数时候就是没人说话，别让人
+                      // 以为界面没加载出来。插画小一点，省下地方给输入框。
+                      ? EmptyStateArt(
+                          asset: 'assets/illustrations/box.png',
+                          size: 96,
+                          message: task != null
+                              ? '还没开始聊。\n说一句试试，例如「给你放门口行吗」——'
+                                  '这句话会直接判定任务。'
+                              : '顾客还没开口。\n说一句试试——不过大多数单子不会有人回。',
                         )
                       : ListView.builder(
                           padding: const EdgeInsets.all(12),

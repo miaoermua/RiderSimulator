@@ -556,11 +556,24 @@ class _OrderList extends StatelessWidget {
         itemCount: orders.isEmpty ? 1 : orders.length,
         itemBuilder: (context, i) => orders.isEmpty
             ? Padding(
-                padding: const EdgeInsets.only(top: 140),
+                padding: const EdgeInsets.only(top: 80, left: 24, right: 24),
                 child: Center(
-                  child: Text(
-                    empty,
-                    style: const TextStyle(color: Colors.grey),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // 插画是透明底的线稿，跟着主题走不会突兀。
+                      Image.asset(
+                        'assets/illustrations/empty_orders.png',
+                        width: 200,
+                        filterQuality: FilterQuality.medium,
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        empty,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.grey),
+                      ),
+                    ],
                   ),
                 ),
               )
