@@ -24,8 +24,62 @@ body {
 
 /* ---------------- 骨架 ---------------- */
 
+/* 侧栏本体不再自带左边框——那条分界已经由 `.sider-grip` 承担了。
+   两者都在同一条线上，留着会叠成 2px，hover 时手柄的高亮也被边框压住。 */
 .console-sider {
-  border-left: 1px solid var(--rs-border-secondary);
+  border-left: none;
+}
+
+/* 侧栏拖拽手柄：3px 的命中区，视觉上就是一条弱分界。
+ *
+ * 宽度不写死的原因见 App.tsx：7 个标签一行放不下（需要 ~571px），
+ * 默认 420px 只能靠横向滚动兜着。给了可调宽，用户就能自己拉到位。
+ * 命中区做到 3px（视觉 1px）是刻意的——桌面端拖拽热区低于 8px 很难命中，
+ * 但视觉太宽又会像一条粗分割线。用 padding 把热区撑开、边框只留 1px。 */
+.sider-grip {
+  position: relative;
+  flex: 0 0 auto;
+  width: 3px;
+  margin-left: -1px;
+  background: var(--rs-border-secondary);
+  cursor: col-resize;
+  transition: background 120ms ease;
+}
+
+.sider-grip:hover,
+.sider-grip:focus-visible {
+  background: var(--rs-accent, var(--rs-text-tertiary));
+  outline: none;
+}
+
+/* 拖拽中：整条变宽一点，给出「正在拖」的视觉反馈。 */
+.sider-grip:active {
+  background: var(--rs-accent, var(--rs-text-tertiary));
+}
+
+/* 宽度不够时的箭头提示。位置贴左边缘（靠地图那一侧），
+ * 因为用户想「拉宽侧栏」的动作方向就是往左拖。 */
+.sider-grip-nudge {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 13px;
+  height: 28px;
+  border-radius: 3px;
+  background: var(--rs-bg-elevated);
+  border: 1px solid var(--rs-border-secondary);
+  color: var(--rs-text-tertiary);
+  font-size: 10px;
+  line-height: 26px;
+  text-align: center;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.sider-grip:hover .sider-grip-nudge {
+  opacity: 1;
 }
 
 /* Tabs 占满侧栏：头部钉住，内容区吃剩下高度，滚动交给面板自己。 */
@@ -40,9 +94,34 @@ body {
   padding: 0 16px;
 }
 
+/* 标签**不能均分宽度**，必须按内容自适应 + 放不下时横向滚动。
+ *
+ * 之前这里是 `flex: 1`，看着整齐，实则是这个布局最大的坑：
+ * 侧栏固定 420px，扣掉 32px 内边距只剩 388px，却要放 7 个标签
+ * （骑手 / 订单 / 会话 / AI / 骑手接入 / 设置 / 日志）。
+ * 按中文 14px + antd 默认左右各 12px padding + 32px tabBarGutter 算，
+ * 实际需要 571px——差 183px。`flex: 1` 把缺口摊给每个标签后，
+ * 每个只剩 55px，而「骑手接入」四个字就要 56px，于是被挤成**一字一行**，
+ * 「日志」最后只剩一个「日」露在外面。
+ *
+ * `flex: 0 0 auto` 让标签回到内容宽度，多出来的由antd 的
+ * `.ant-tabs-nav-wrap` 自动接管成左右滚动（还有 hover 箭头），
+ * 不再出现「一个字一列」。
+ *
+ * `flex-shrink: 0` 配 `white-space: nowrap` 双保险：任何情况下
+ * 都不允许标签内部换行——那才是真正难看的形态。 */
 .console-sider .ant-tabs-tab {
-  flex: 1;
+  flex: 0 0 auto;
   justify-content: center;
+  white-space: nowrap;
+  /* 收紧 padding：滚动条形态下少一点固定开销，标签就少几个像素宽。 */
+  padding-inline: 8px;
+}
+
+/* tabBarGutter 同样收一收。antd 默认 32 是一行放得下时的宽间距，
+ * 放不下时纯属浪费横向空间，14px 已足够区分相邻标签。 */
+.console-sider .ant-tabs-nav .ant-tabs-tab + .ant-tabs-tab {
+  margin-inline-start: 14px;
 }
 
 .console-sider .ant-tabs-content-holder {
