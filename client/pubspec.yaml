@@ -24,6 +24,10 @@ dependencies:
   mobile_scanner: ^7.4.2
   flutter_map: ^8.3.2
   latlong2: ^0.10.1
+  # 系统原生 Toast：Android 上是真 Toast、iOS 是浮条、Web 走 toastify。
+  # SnackBar 是页面内横幅，会压住底栏、还会顶掉上一条，
+  # 不适合「按完按钮立刻给反馈」这种场景。
+  fluttertoast: ^10.0.2
 
 dev_dependencies:
   flutter_test:

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../game_client.dart';
 import '../game_state.dart';
 import '../protocol.dart';
+import '../widgets/app_toast.dart';
 import '../widgets/delivery_map.dart';
 import '../widgets/order_card.dart';
 
@@ -98,6 +99,7 @@ class _AssignOrderPageState extends State<AssignOrderPage> {
     if (state.rejectQuotaExhausted) {
       // 服务端一定会挡回来，就地提示比让骑手以为拒成功了强。
       state.note('你今天拒绝已超出上限', kind: LogKind.bad);
+      showAppToast('你今天拒绝已超出上限', bad: true);
       return;
     }
     final order = state.assignOrder;

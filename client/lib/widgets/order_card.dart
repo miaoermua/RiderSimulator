@@ -1,8 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:latlong2/latlong.dart';
 
 import '../game_client.dart';
 import '../game_state.dart';
 import '../protocol.dart';
+import '../screens/order_detail_page.dart';
+import 'delivery_map.dart';
+import 'slide_confirm.dart';
 
 /// 订单卡的形态：决定底部操作区画什么。
 enum OrderCardMode {
@@ -24,7 +28,7 @@ enum OrderCardMode {
 /// 四个形态共用同一套信息区（报酬、距离、时限、备注、地址），
 /// 只有底部操作区不同——这是众包骑手端订单卡的通行做法：
 /// 卡片是决策信息面板，按钮才是状态机。
-class OrderCard extends StatelessWidget {
+class OrderCard extends StatefulWidget {
   const OrderCard({
     super.key,
     required this.order,
@@ -33,6 +37,8 @@ class OrderCard extends StatelessWidget {
     this.mode = OrderCardMode.hall,
     this.onAccept,
     this.onReject,
+    this.showRouteRail = true,
+    this.showActions = true,
   });
 
   final OrderView order;
@@ -44,8 +50,28 @@ class OrderCard extends StatelessWidget {
   final VoidCallback? onAccept;
   final VoidCallback? onReject;
 
+  /// 左侧的「取 / 送」步进条。订单详情页已经有大图，不必再来一个。
+  final bool showRouteRail;
+
+  /// 底部操作区。已结束的订单在详情页里只看不操作。
+  final bool showActions;
+
+  @override
+  State<OrderCard> createState() => _OrderCardState();
+}
+
+class _OrderCardState extends State<OrderCard> {
+  /// 当前聚焦的点：0 = 取（商家），1 = 送（顾客）。
+  int _focus = 0;
+
+  /// 卡片上方展开的地图。
+  bool _mapOpen = false;
+
   @override
   Widget build(BuildContext context) {
+    final order = widget.order;
+    final state = widget.state;
+    final mode = widget.mode;
     final theme = Theme.of(context);
     final expired =
         mode == OrderCardMode.hall && state.claimRemainingMs(order) <= 0;
@@ -53,105 +79,325 @@ class OrderCard extends StatelessWidget {
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
       clipBehavior: Clip.antiAlias,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _mapPane(),
+          IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
+                if (widget.showRouteRail) _rail(context),
                 Expanded(
-                  child: Text(
-                    order.merchantName,
-                    style: theme.textTheme.titleMedium
-                        ?.copyWith(fontWeight: FontWeight.w600),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                order.merchantName,
+                                style: theme.textTheme.titleMedium
+                                    ?.copyWith(fontWeight: FontWeight.w600),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (mode == OrderCardMode.assign ||
+                                order.forced) ...[
+                              const _Chip(
+                                  text: '平台指派', color: Colors.redAccent),
+                              const SizedBox(width: 6),
+                            ],
+                            _TierChip(tier: order.tier),
+                            if (order.backOrder) ...[
+                              const SizedBox(width: 6),
+                              const _Chip(text: '背单', color: Colors.teal),
+                            ],
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          children: [
+                            _Stat(icon: Icons.route, text: order.distanceLabel),
+                            const SizedBox(width: 14),
+                            _Stat(
+                                icon: Icons.schedule,
+                                text: '${order.promisedMinutes} 分钟'),
+                            const SizedBox(width: 14),
+                            _Stat(
+                              icon: Icons.local_shipping_outlined,
+                              text: order.status.label,
+                            ),
+                          ],
+                        ),
+                        if (order.remark.isNotEmpty) ...[
+                          const SizedBox(height: 6),
+                          Text(
+                            '备注：${order.remark}',
+                            style: theme.textTheme.bodySmall
+                                ?.copyWith(color: Colors.orange),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                        const SizedBox(height: 6),
+                        _Leg(
+                          icon: Icons.location_on_outlined,
+                          label: '送',
+                          text: order.customerAddress.isEmpty
+                              ? order.customerName
+                              : '${order.customerName} · ${order.customerAddress}',
+                        ),
+                        const Divider(height: 20),
+                        Text(
+                          '到手 ¥${yuan(order.effectiveTakehomeCents)}',
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            color: Colors.green.shade700,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        if (order.fee.rainBonusCents > 0)
+                          Text(
+                            '含雨补 ¥${yuan(order.fee.rainBonusCents)}',
+                            style: theme.textTheme.labelSmall,
+                          ),
+                        // 操作区单独一行靠右：左侧多了 58 宽的步进条之后，
+                        // 「报酬 + 两个按钮」并排在 360 宽的小屏上会溢出。
+                        if (widget.showActions &&
+                            mode != OrderCardMode.hall) ...[
+                          const SizedBox(height: 6),
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: _Actions(
+                              order: order,
+                              state: state,
+                              client: widget.client,
+                              mode: mode,
+                              expired: expired,
+                              onAccept: widget.onAccept,
+                              onReject: widget.onReject,
+                            ),
+                          ),
+                        ],
+                        if (mode == OrderCardMode.hall)
+                          _CountdownBar(
+                              order: order, state: state, expired: expired),
+                        if (widget.showActions &&
+                            mode == OrderCardMode.hall &&
+                            state.isRider) ...[
+                          const SizedBox(height: 8),
+                          SizedBox(
+                            width: double.infinity,
+                            height: 44,
+                            child: SlideToConfirm(
+                              label: expired ? '已截止，无法抢单' : '滑动抢单',
+                              icon: Icons.pan_tool_alt,
+                              enabled: !expired,
+                              onConfirm: () => widget.client.claim(order.id),
+                            ),
+                          ),
+                        ],
+                        if (widget.showActions &&
+                            mode == OrderCardMode.delivery) ...[
+                          const SizedBox(height: 8),
+                          SizedBox(
+                            width: double.infinity,
+                            height: 44,
+                            child: SlideToConfirm(
+                              label: '滑动确认送达',
+                              icon: Icons.done_all,
+                              color: Colors.green.shade600,
+                              onConfirm: () => widget.client.deliver(order.id),
+                            ),
+                          ),
+                        ],
+                        if (mode == OrderCardMode.assign)
+                          _AssignBar(state: state),
+                      ],
+                    ),
                   ),
                 ),
-                if (mode == OrderCardMode.assign || order.forced) ...[
-                  const _Chip(text: '平台指派', color: Colors.redAccent),
-                  const SizedBox(width: 6),
-                ],
-                _TierChip(tier: order.tier),
-                if (order.backOrder) ...[
-                  const SizedBox(width: 6),
-                  const _Chip(text: '背单', color: Colors.teal),
-                ],
               ],
             ),
-            const SizedBox(height: 6),
-            Row(
-              children: [
-                _Stat(icon: Icons.route, text: order.distanceLabel),
-                const SizedBox(width: 14),
-                _Stat(icon: Icons.schedule, text: '${order.promisedMinutes} 分钟'),
-                const SizedBox(width: 14),
-                _Stat(
-                  icon: Icons.local_shipping_outlined,
-                  text: order.status.label,
-                ),
-              ],
-            ),
-            if (order.remark.isNotEmpty) ...[
-              const SizedBox(height: 6),
-              Text(
-                '备注：${order.remark}',
-                style: theme.textTheme.bodySmall?.copyWith(color: Colors.orange),
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ],
-            const SizedBox(height: 6),
-            _Leg(
-              icon: Icons.location_on_outlined,
-              label: '送',
-              text: order.customerAddress.isEmpty
-                  ? order.customerName
-                  : '${order.customerName} · ${order.customerAddress}',
-            ),
-            const Divider(height: 20),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '到手 ¥${yuan(order.effectiveTakehomeCents)}',
-                      style: theme.textTheme.titleMedium?.copyWith(
-                        color: Colors.green.shade700,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    if (order.fee.rainBonusCents > 0)
-                      Text(
-                        '含雨补 ¥${yuan(order.fee.rainBonusCents)}',
-                        style: theme.textTheme.labelSmall,
-                      ),
-                  ],
-                ),
-                const Spacer(),
-                _Actions(
-                  order: order,
-                  state: state,
-                  client: client,
-                  mode: mode,
-                  expired: expired,
-                  onAccept: onAccept,
-                  onReject: onReject,
-                ),
-              ],
-            ),
-            if (mode == OrderCardMode.hall)
-              _CountdownBar(order: order, state: state, expired: expired),
-            if (mode == OrderCardMode.assign)
-              _AssignBar(state: state),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
+
+  // ---------------------------------------------------------------------
+  // 路线：左侧步进条 + 上方展开的地图
+  // ---------------------------------------------------------------------
+
+  /// 当前聚焦的点。
+  LatLng get _focusPoint {
+    final o = widget.order;
+    return _focus == 0
+        ? LatLng(o.merchantLat, o.merchantLng)
+        : LatLng(o.customerLat, o.customerLng);
+  }
+
+  /// 中间那行距离：优先「我 → 当前点」的直线距离（骑手最关心的那个数），
+  /// 没定位时退回订单本身的取送里程。
+  String get _distanceLabel {
+    final o = widget.order;
+    final me = widget.state.me;
+    if (me == null) return o.distanceLabel;
+    final m = const Distance()
+        .as(LengthUnit.Meter, LatLng(me.lat, me.lng), _focusPoint);
+    return m >= 1000 ? '${(m / 1000).toStringAsFixed(1)}km' : '${m.round()}m';
+  }
+
+  /// 左侧竖条：上箭头（上一个点）→ 距离 → 下箭头（下一个点）。
+  ///
+  /// 点中间展开地图，点箭头只切点；地图开着时会跟着平移过去。
+  Widget _rail(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final atFirst = _focus == 0;
+    return Container(
+      width: 58,
+      decoration: BoxDecoration(
+        color: scheme.primary.withValues(alpha: 0.05),
+        border: const Border(right: BorderSide(color: Colors.black12)),
+      ),
+      child: Column(
+        children: [
+          _railArrow(
+            icon: Icons.keyboard_arrow_up,
+            tip: '上一个点',
+            enabled: !atFirst,
+            onTap: () => setState(() => _focus = 0),
+          ),
+          Expanded(
+            child: InkWell(
+              onTap: () => setState(() => _mapOpen = !_mapOpen),
+              child: Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      atFirst ? '取' : '送',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Colors.grey.shade700,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    Text(
+                      _distanceLabel,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Icon(
+                      _mapOpen ? Icons.map : Icons.map_outlined,
+                      size: 14,
+                      color: scheme.primary,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          _railArrow(
+            icon: Icons.keyboard_arrow_down,
+            tip: '下一个点',
+            enabled: atFirst,
+            onTap: () => setState(() => _focus = 1),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _railArrow({
+    required IconData icon,
+    required String tip,
+    required bool enabled,
+    required VoidCallback onTap,
+  }) =>
+      SizedBox(
+        height: 24,
+        child: Tooltip(
+          message: tip,
+          child: InkWell(
+            onTap: enabled ? onTap : null,
+            child: Icon(
+              icon,
+              size: 18,
+              color: enabled ? Colors.black54 : Colors.black12,
+            ),
+          ),
+        ),
+      );
+
+  /// 订单卡上沿伸出的地图。再点一下地图进订单详情。
+  Widget _mapPane() => AnimatedSize(
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+        alignment: Alignment.topCenter,
+        child: !_mapOpen
+            ? const SizedBox(width: double.infinity)
+            : SizedBox(
+                height: 170,
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: DeliveryMap(
+                        state: widget.state,
+                        orders: [widget.order],
+                        showMerchants: false,
+                        showMe: true,
+                        showBasemapPicker: false,
+                        focus: _focusPoint,
+                      ),
+                    ),
+                    // 只吃「点一下」，拖动 / 缩放仍然归地图。
+                    Positioned.fill(
+                      child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(onTap: _openDetail),
+                      ),
+                    ),
+                    Positioned(
+                      right: 8,
+                      bottom: 8,
+                      child: IgnorePointer(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.92),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text('订单详情', style: TextStyle(fontSize: 11)),
+                              Icon(Icons.chevron_right, size: 14),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+      );
+
+  void _openDetail() => showOrderDetail(
+        context,
+        order: widget.order,
+        state: widget.state,
+        client: widget.client,
+      );
 }
 
 class _Actions extends StatelessWidget {
@@ -180,11 +426,8 @@ class _Actions extends StatelessWidget {
         if (!state.isRider) {
           return const Text('观战', style: TextStyle(color: Colors.grey));
         }
-        return FilledButton.icon(
-          onPressed: expired ? null : () => client.claim(order.id),
-          icon: const Icon(Icons.pan_tool_alt, size: 18),
-          label: const Text('抢单'),
-        );
+        // 抢单是整条滑动确认，不在这里占位（见 _OrderCardState.build）。
+        return const SizedBox.shrink();
 
       case OrderCardMode.pickup:
         return Wrap(
@@ -202,19 +445,10 @@ class _Actions extends StatelessWidget {
         );
 
       case OrderCardMode.delivery:
-        return Wrap(
-          spacing: 8,
-          children: [
-            OutlinedButton(
-              onPressed: () => client.urge(order.id),
-              child: const Text('催单'),
-            ),
-            FilledButton.icon(
-              onPressed: () => client.deliver(order.id),
-              icon: const Icon(Icons.done_all, size: 18),
-              label: const Text('送达'),
-            ),
-          ],
+        // 「送达」是整条滑动确认，这里只留催单。
+        return OutlinedButton(
+          onPressed: () => client.urge(order.id),
+          child: const Text('催单'),
         );
 
       case OrderCardMode.assign:
@@ -287,7 +521,8 @@ class _CountdownBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final total = (order.claimDeadlineMin - order.createdAtMin).clamp(1, 1 << 30);
+    final total =
+        (order.claimDeadlineMin - order.createdAtMin).clamp(1, 1 << 30);
     final remainMs = state.claimRemainingMs(order);
     final remainSec = ((remainMs + 999) ~/ 1000).clamp(0, 1 << 30);
     final frac = ((remainMs / 1000) / total).clamp(0.0, 1.0);
@@ -321,7 +556,8 @@ class _AssignBar extends StatelessWidget {
     final exhausted = state.rejectQuotaExhausted;
     // 30 秒的窗口，最后 5 秒才转红。额度用尽时整条也不该再是「橙色的催促」，
     // 因为到点之后的归宿已经变了：不是自动拒单，是自动收下。
-    final color = exhausted ? Colors.red : (sec <= 5 ? Colors.red : Colors.deepOrange);
+    final color =
+        exhausted ? Colors.red : (sec <= 5 ? Colors.red : Colors.deepOrange);
 
     return _Bar(
       frac: frac,
@@ -405,7 +641,8 @@ class _Chip extends StatelessWidget {
       ),
       child: Text(
         text,
-        style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600),
+        style:
+            TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600),
       ),
     );
   }

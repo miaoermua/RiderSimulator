@@ -35,6 +35,7 @@ class DeliveryMap extends StatefulWidget {
     this.showMe = false,
     this.showBasemapPicker = true,
     this.fitPadding = 56,
+    this.focus,
   });
 
   final GameState state;
@@ -46,6 +47,12 @@ class DeliveryMap extends StatefulWidget {
   final bool showBasemapPicker;
   final double fitPadding;
 
+  /// 直接聚焦到某个点（例如订单卡上切到「取」或「送」）。
+  ///
+  /// 非空时首帧不做框选，后续变化会平移过去——切点的预期就是「镜头跟过去」，
+  /// 而不是每切一次都重新框一遍整单。
+  final LatLng? focus;
+
   @override
   State<DeliveryMap> createState() => _DeliveryMapState();
 }
@@ -56,6 +63,16 @@ class _DeliveryMapState extends State<DeliveryMap> {
   /// 首屏框选只做一次：之后不再抢用户拖出来的视角。
   /// 订单是后来才同步到的，所以失败的（点位为空）不算数。
   bool _fitted = false;
+
+  @override
+  void didUpdateWidget(covariant DeliveryMap old) {
+    super.didUpdateWidget(old);
+    final f = widget.focus;
+    if (f == null || f == old.focus) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _map.move(f, 16);
+    });
+  }
 
   @override
   void dispose() {
@@ -239,7 +256,16 @@ class _DeliveryMapState extends State<DeliveryMap> {
   // ---------------------------------------------------------------------
 
   void _scheduleFit(List<LatLng> points) {
-    if (_fitted || points.isEmpty) return;
+    if (_fitted) return;
+    final focus = widget.focus;
+    if (focus != null) {
+      _fitted = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _map.move(focus, 16);
+      });
+      return;
+    }
+    if (points.isEmpty) return;
     _fitted = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;

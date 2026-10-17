@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../game_client.dart';
 import '../game_state.dart';
 import '../protocol.dart';
+import '../widgets/app_toast.dart';
 import '../widgets/order_card.dart';
 import '../widgets/rider_drawer.dart';
 import '../widgets/chat_sheet.dart';
@@ -33,7 +34,7 @@ class _RiderHomePageState extends State<RiderHomePage> {
   /// 已经为哪一张指派单弹过确认界面——同一张不重复弹。
   int? _poppedFor;
 
-  /// 已经提示过第几条错误，避免同一条 SnackBar 连着弹。
+  /// 已经提示过第几条错误，避免同一条提示连着弹。
   int _seenErrorSeq = 0;
 
   @override
@@ -62,11 +63,7 @@ class _RiderHomePageState extends State<RiderHomePage> {
     _seenErrorSeq = widget.state.errorSeq;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(
-          SnackBar(content: Text(err), duration: const Duration(seconds: 2)),
-        );
+      showAppToast(err, bad: true);
     });
   }
 
