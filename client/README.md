@@ -11,7 +11,7 @@ cd ../server && RIDER_SIM_ALLOW_CONTROL=true cargo run
 
 # 2. 再起客户端
 flutter pub get
-flutter run            # 桌面 / 模拟器 / Chrome 均可
+flutter run            # Android / iOS（真机或模拟器）或 Chrome；没有桌面平台目录
 ```
 
 ## 登录
@@ -37,9 +37,10 @@ cd ../server/console && npm run dev     # 或者直接开 server 起的控制台
 | `new:张三` | 现场建一个真人骑手（绕过账号表，不查重） |
 | 留空 | 观战 |
 
-> 扫码用的是 `mobile_scanner`（相机是原生能力）。`client/android` 还没生成之前
-> ——也就是还没跑上面那条 `flutter create` 之前——**扫码页在真机上跑不起来**，
-> 用登录页的「粘贴」把手填走通即可。
+> 扫码用的是 `mobile_scanner`（相机是原生能力）。`client/android/`、`client/ios/`、
+> `client/web/` **都已生成**，真机 / 模拟器可以直接 `flutter run`；但**没有**
+> `macos/` 目录，跑不了 macOS 桌面，而 web 又不给相机——那种场合用登录页的
+> 「粘贴」把手填走通即可。
 
 ## 目录
 
@@ -52,12 +53,15 @@ lib/
   screens/
     login_page.dart      # 扫码 + 手填地址/名字/密码（令牌后门折在「高级」里）
     scan_login_page.dart # 扫码页（mobile_scanner，需要原生工程）
-    rider_home.dart      # 主界面：大厅 / 我的单 / 战报
+    rider_home.dart      # 主界面：待抢 / 待取 / 待送 三个 Tab
   widgets/
     order_card.dart      # 订单卡片（含抢单倒计时）
 test/
   login_link_test.dart   # 连接串解析，含与服务端逐字对齐的用例
 ```
+
+上面只列了主线上的几个文件。实际规模：`lib/` 顶层 7 个 dart 文件、`screens/` 11 个页面、
+`widgets/` 8 个组件、`map/` 2 个文件，完整清单见 [`../docs/实现现状.md`](../docs/实现现状.md) §六。
 
 ## 登录被拒时会发生什么
 
@@ -74,37 +78,40 @@ test/
 `applicationId` 一旦上架就**永久不可改**（改名等于换一个应用，安装量与评论都不跟随），
 所以这个值先钉在这里，别在 `flutter create` 的时候随手生成一个。
 
-`client/android/` 目前还没生成（仓库里只有 `lib/`）。装了 Flutter 之后这样生成、并把包名改到位：
+三个平台目录**都已生成**，包名也已按上面的值改到位（2026-10-18 逐处核对）：
+
+| 文件 | 现值 |
+|---|---|
+| `android/app/build.gradle.kts:8` 与 `:19` | `namespace` 和 `defaultConfig.applicationId` 都是 `net.miaoer.game.crowdsource` |
+| `android/app/src/main/kotlin/net/miaoer/game/crowdsource/MainActivity.kt:1` | `package net.miaoer.game.crowdsource` |
+| `ios/Runner.xcodeproj/project.pbxproj:386` 与 `:402` | `PRODUCT_BUNDLE_IDENTIFIER` 两处：`net.miaoer.game.crowdsource`、`net.miaoer.game.crowdsource.RunnerTests` |
+| `android/app/src/main/AndroidManifest.xml:14` | `android:label="骑手端"`，这是**应用显示名**（中文不受包名影响），跟包名两回事 |
+
+`namespace` 必须和 `MainActivity.kt` 的 `package` 一致，否则清单里的 `.MainActivity` 解析不到。
+
+当年生成用的命令（留作备查；`--org` 只是前缀，模板给出的是
+`net.miaoer.game.rider_client`，包名仍需按上表手改）：
 
 ```bash
 cd client
-# --org 只是前缀，模板给出的会是 net.miaoer.game.rider_client，包名按下面手动改
 flutter create --org net.miaoer.game --project-name rider_client \
-  --platforms=android,ios,macos,web .
+  --platforms=android,ios,web .
 ```
 
-`--project-name` 保持 `rider_client`，Dart 包名不变；`macos` / `web` 是给本地调试用的
-（`flutter run` 要有平台目录），打包只关心 `android` / `ios`。
-
-生成后改这四处：
-
-| 文件 | 改什么 |
-|---|---|
-| `android/app/build.gradle.kts`（旧版模板是 `.gradle`） | `namespace` 和 `defaultConfig.applicationId` 都设成 `net.miaoer.game.crowdsource` |
-| `android/app/src/main/kotlin/…/MainActivity.kt` | 挪到 `kotlin/net/miaoer/game/crowdsource/`，首行改成 `package net.miaoer.game.crowdsource` |
-| `ios/Runner.xcodeproj/project.pbxproj` | `PRODUCT_BUNDLE_IDENTIFIER` 两处：`net.miaoer.game.crowdsource` 与 `net.miaoer.game.crowdsource.RunnerTests` |
-| `android/app/src/main/AndroidManifest.xml` | `android:label` 是**应用显示名**（中文不受包名影响），跟包名两回事 |
-
-`namespace` 必须和 `MainActivity.kt` 的 `package` 一致，否则清单里的 `.MainActivity` 解析不到。
+`--project-name` 保持 `rider_client`，Dart 包名不变。原方案里还带了 `macos`，
+但**没有生成**，所以现在跑不了 macOS 桌面。
 
 ## 还没做的
 
 这是**骨架**，联调通了「登录 → 看大厅 → 抢单 → 到店/送达 → 任务对话 → 看战报」这条主线：
 
-- **相机扫码没在真机上验过**：`mobile_scanner` 要原生工程（`client/android` 还没生成），
-  本机也没有 Flutter。桌面 / web 上不开扫码页，用「粘贴」走手填。
+- **相机扫码没在真机上验过**：原生工程已生成，但本机只跑过静态检查
+  （`flutter analyze` 干净、`flutter test` 13 个通过），没上过设备。
+  桌面 / web 开不了扫码页，用「粘贴」走手填。
 - 没有「改密码」的界面。协议（`change_password`）与 `GameClient.changePassword`
   都通了，缺的只是一个入口——但这是把二维码里明文密码作废的唯一手段，应该尽快补。
-- 地图：目前只有列表，没有高德图层与轨迹回放。
+- 地图：`widgets/delivery_map.dart`（`flutter_map` + 高德 / OSM 瓦片、取送连线）
+  已用在订单详情、路线规划、指派页和订单卡上；**轨迹回放没有**——客户端完全不读
+  `trajectory`。
 - 抢单窗口倒计时用的是服务端下发的时间戳插值，未做本地校时。
 - 离线缓存、推送、埋点都没做。

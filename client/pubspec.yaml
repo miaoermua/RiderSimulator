@@ -14,9 +14,9 @@ dependencies:
   web_socket_channel: ^3.0.1
   # 扫码登录：扫烽火台生成的 `ridersim://login?...` 二维码。
   #
-  # 相机是原生能力，所以 **必须先 `flutter create . --platforms=android,ios`
-  # 生成原生工程**，否则 Android Studio / 真机上跑不起来（本机没有 Flutter，
-  # 这一步还没做，见 client/README.md）。
+  # 相机是原生能力，所以**必须有原生工程**才能跑扫码页。
+  # `android/` 与 `ios/` 已生成（包名见 README 的「打包标识」一节），
+  # web 平台拿不到相机，那边只能用手填 + 「粘贴」。
   #
   # 6.x 在 Android 15/16 上相机起不来（报 "An unexpected error occurred."，
   # 是插件的 generic 错误码，底层是 CameraX 初始化失败）。7.x 换了新的
