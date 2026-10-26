@@ -30,6 +30,10 @@ dependencies:
   fluttertoast: ^10.0.2
   geolocator: ^14.1.1
   shared_preferences: ^2.5.6
+  flutter_local_notifications: ^22.3.3
+  audioplayers: ^6.8.1
+  file_picker: ^13.2.0
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:

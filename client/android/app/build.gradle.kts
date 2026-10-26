@@ -10,6 +10,9 @@ android {
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
+        // flutter_local_notifications 22.x 用了 java.time，Android 的
+        // desugar 不开会在 26 以下的 minSdk 上编译失败。
+        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
@@ -36,6 +39,11 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+}
+
+dependencies {
+    // 与上面的 isCoreLibraryDesugaringEnabled 配套，版本由插件 README 指定下限。
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }
 
 kotlin {

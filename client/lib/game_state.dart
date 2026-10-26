@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 
+import 'alert_event.dart';
 import 'protocol.dart';
 
 /// 连接状态。UI 用它决定顶栏圆点颜色与重连提示。
@@ -49,6 +50,9 @@ class GameState extends ChangeNotifier {
   String role = 'spectator';
   int? riderId;
   String? riderKey;
+
+  /// 上一次看到的出勤状态。null = 还没见过——首帧与重连不补一条提醒。
+  bool? _lastOnline;
 
   // ---------------------------------------------------------------------
   // 世界
@@ -270,6 +274,13 @@ class GameState extends ChangeNotifier {
   String? lastError;
   int errorSeq = 0;
 
+  /// 需要惊动骑手的事件（指派单、新活动）从这里出去。
+  ///
+  /// [GameState] 只管"发生了什么"，不 import 任何原生插件——
+  /// 真正的弹通知 / 播音效由 `main.dart` 接到 [AlertCenter] 上，
+  /// 单测里这个回调是 null，什么都不会发生。
+  void Function(RiderAlert alert)? onAlert;
+
   void markLogsRead() {
     if (unreadLogs == 0) return;
     unreadLogs = 0;
@@ -333,7 +344,9 @@ class GameState extends ChangeNotifier {
         );
       case Ev.activitiesChanged:
         // 快照只在连接时来一次，烽火台改活动靠这条事件推过来。
+        final before = activities.map((a) => a.id).toSet();
         activities = listOf(frame.payload['activities'], ActivityView.fromJson);
+        _announceNewActivities(before);
       case Ev.noticeChanged:
         // 烽火台改文字 / 清空。快照只在连接时来一次，不接这条就得重连。
         notice = frame.payload['notice'] is Map
@@ -382,6 +395,7 @@ class GameState extends ChangeNotifier {
       default:
         break; // 未知事件：忽略，向前兼容
     }
+    _watchOnline();
     notifyListeners();
   }
 
@@ -393,6 +407,8 @@ class GameState extends ChangeNotifier {
     role = w.role;
     riderId = w.riderId;
     riderKey = w.riderKey;
+    // 换号 / 重连后重新认一次出勤状态，别拿上一个骑手的 online 去比。
+    _lastOnline = null;
     tickIntervalMs = w.tickIntervalMs;
     _applySnapshot(w.snapshot, announce: false);
     note(
@@ -499,6 +515,7 @@ class GameState extends ChangeNotifier {
       assignOrderId = id;
       _assignMode = mode ?? 'offer';
       _assignAt = DateTime.now();
+      _alertAssign(id, forced: forced);
     }
     note(
       mine
@@ -509,6 +526,45 @@ class GameState extends ChangeNotifier {
             }
           : '单 ${reqStr(p['rider_name'], '他人')} 抢走了',
       kind: mine ? LogKind.good : LogKind.info,
+    );
+  }
+
+  /// 指派单 / 强制派单的提醒。
+  ///
+  /// 正文要包含骑手**决定要不要接**所需的三样东西：哪儿、多远、多少钱。
+  /// 窗口 30 秒（[assignWindow]），锁屏上看到就得能判断。
+  void _alertAssign(int id, {required bool forced}) {
+    final order = orderById(id);
+    if (order == null) return;
+    onAlert?.call(
+      RiderAlert(
+        kind: forced ? AlertKind.forcedAssign : AlertKind.assignOrder,
+        title: forced ? '强制派单（只能接受）' : '新的指派单',
+        body: '${order.merchantName} · ${order.distanceLabel} · '
+            '到手 ${yuan(order.effectiveTakehomeCents)} 元 · '
+            '${assignWindow.inSeconds} 秒内确认',
+      ),
+    );
+  }
+
+  /// 新上架的活动提醒。
+  ///
+  /// 只比 id：烽火台改标题 / 下架重上也算同一条，不重复扰人。
+  /// 连接时的快照不走这里（见 [applyFrame] 的 snapshot 分支），
+  /// 否则每次断线重连都会把现有活动再提醒一遍。
+  void _announceNewActivities(Set<int> before) {
+    final fresh =
+        activities.where((a) => a.active && !before.contains(a.id)).toList();
+    if (fresh.isEmpty) return;
+    final first = fresh.first;
+    final tail = fresh.length == 1 ? '' : ' 等 ${fresh.length} 个活动';
+    onAlert?.call(
+      RiderAlert(
+        kind: AlertKind.activity,
+        title: '新平台活动',
+        body: '${first.title}$tail：跑 ${first.targetOrders} 单，'
+            '奖 ${yuan(first.rewardCents)} 元',
+      ),
     );
   }
 
@@ -585,6 +641,25 @@ class GameState extends ChangeNotifier {
   // ---------------------------------------------------------------------
   // 骑手 / 财务
   // ---------------------------------------------------------------------
+
+  /// 自己上线 / 下线时响一声。
+  ///
+  /// 以服务端回来的 `online` 为准，而不是按钮按下的那一刻——被强制下线、
+  /// 拒单额度用尽这类情况服务端会改状态，跟着它走才不会报错消息。
+  void _watchOnline() {
+    final now = me?.online;
+    if (now == null) return;
+    final before = _lastOnline;
+    _lastOnline = now;
+    if (before == null || before == now) return;
+    onAlert?.call(
+      RiderAlert(
+        kind: now ? AlertKind.online : AlertKind.offline,
+        title: now ? '已上线' : '已下线',
+        body: now ? '开始接单' : '注意休息',
+      ),
+    );
+  }
 
   void _applyRiderState(Map<String, dynamic> p) {
     final r = RiderView.fromJson(asMap(p['rider']));

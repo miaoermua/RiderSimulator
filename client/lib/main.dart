@@ -1,12 +1,18 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
+import 'alert_center.dart';
 import 'game_client.dart';
 import 'game_state.dart';
 import 'location_service.dart';
 import 'screens/login_page.dart';
 import 'screens/rider_home.dart';
 
-void main() => runApp(const RiderApp());
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const RiderApp());
+}
 
 /// 应用根：先登录，进主界面后保持同一条连接。
 class RiderApp extends StatefulWidget {
@@ -23,6 +29,11 @@ class _RiderAppState extends State<RiderApp> {
   @override
   void initState() {
     super.initState();
+    // 状态层只发事件，弹通知 / 播音效在这里接上。
+    _state.onAlert = AlertCenter.instance.show;
+    // 通知插件要等 Flutter 引擎起来才可用，所以放在 runApp 之后，
+    // 而且不 await：权限弹窗不该挡首帧。
+    unawaited(AlertCenter.instance.init());
     // 定位频率是本地偏好，跟账号无关，先读出来再决定要不要开流。
     LocationService.instance.loadSaved();
   }

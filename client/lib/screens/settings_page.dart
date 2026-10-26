@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../alert_center.dart';
+import '../alert_event.dart';
 import '../game_client.dart';
 import '../game_state.dart';
 import '../protocol.dart';
@@ -20,7 +22,8 @@ class SettingsPage extends StatelessWidget {
     return Scaffold(
       appBar: AppBar(title: const Text('设置')),
       body: AnimatedBuilder(
-        animation: state,
+        // 提示音开关存在 AlertCenter 里，跟游戏状态不是同一个源。
+        animation: Listenable.merge([state, AlertCenter.instance]),
         builder: (context, _) {
           final me = state.me;
           final cfg = state.config;
@@ -46,6 +49,21 @@ class SettingsPage extends StatelessWidget {
                   ),
                 ],
               ),
+              const Divider(height: 28),
+              const _Label('提醒'),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                value: AlertCenter.instance.soundEnabled,
+                title: const Text('提示音', style: TextStyle(fontSize: 13)),
+                subtitle: const Text(
+                  '默认用系统自带的通知铃声；也可以给每类提醒换成手机里的音频。',
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+                onChanged: AlertCenter.instance.setSoundEnabled,
+              ),
+              if (AlertCenter.canPickCustomSound)
+                for (final slot in AlertSoundSlot.values) _SoundTile(slot: slot),
               const Divider(height: 28),
               const _Label('骑行模式'),
               const SizedBox(height: 6),
@@ -115,6 +133,67 @@ class _Label extends StatelessWidget {
           .textTheme
           .titleSmall
           ?.copyWith(fontWeight: FontWeight.bold),
+    );
+  }
+}
+
+/// 一类提醒的音效：显示当前音源，可试听 / 换文件 / 恢复系统默认。
+class _SoundTile extends StatelessWidget {
+  const _SoundTile({required this.slot});
+
+  final AlertSoundSlot slot;
+
+  static String _title(AlertSoundSlot slot) {
+    switch (slot) {
+      case AlertSoundSlot.assign:
+        return '指派单';
+      case AlertSoundSlot.online:
+        return '上线';
+      case AlertSoundSlot.offline:
+        return '下线';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final center = AlertCenter.instance;
+    final custom = center.customPath(slot) != null;
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      dense: true,
+      visualDensity: VisualDensity.compact,
+      title: Text(_title(slot), style: const TextStyle(fontSize: 13)),
+      subtitle: Text(
+        center.soundLabel(slot),
+        style: const TextStyle(fontSize: 12, color: Colors.grey),
+        overflow: TextOverflow.ellipsis,
+      ),
+      // 点整行就是试听：改完不用再去找试听按钮。
+      onTap: () => center.preview(slot),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            tooltip: '试听',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.play_arrow, size: 20),
+            onPressed: () => center.preview(slot),
+          ),
+          IconButton(
+            tooltip: '选择音频',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.folder_open, size: 20),
+            onPressed: () => center.pickSound(slot),
+          ),
+          if (custom)
+            IconButton(
+              tooltip: '恢复系统默认',
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.restart_alt, size: 20),
+              onPressed: () => center.resetSound(slot),
+            ),
+        ],
+      ),
     );
   }
 }
