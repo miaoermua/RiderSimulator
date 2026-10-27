@@ -57,7 +57,7 @@ RIDER_SIM_ALLOW_CONTROL=true cargo run
 | [`docs/API.md`](docs/API.md) | HTTP 路由全表、WS 入口、鉴权、环境变量 |
 | [`docs/开发指南.md`](docs/开发指南.md) | 环境、跑起来、验证命令 |
 | [`AGENTS.md`](AGENTS.md) | 给 AI 编码代理的约定与陷阱 |
-| [`DISCLAIMER.md`](DISCLAIMER.md) | 独立实现声明与免责 |
+| [`DISCLAIMER.md`](DISCLAIMER.md) | 独立实现声明、人身安全与保险边界、免责 |
 
 `docs/cache/` 是设计过程稿与调研，已在 `.gitignore` 中，不随仓库分发。
 
@@ -67,3 +67,9 @@ GPL-3.0，见 [`LICENSE`](LICENSE)。本项目仅供技术演示、玩法探索�
 **不具备生产环境价值**（无生产级安全、无资金能力、无真实调度数据），
 且全部为独立实现、未对任何现有平台做逆向工程 ——
 详见 [`DISCLAIMER.md`](DISCLAIMER.md)。
+
+> ⚠️ **不要边骑车边看屏幕，也不要照着它去现实里跑单。**
+> 本项目是纯软件仿真，**不具备任何保险能力**：不代购、不承保、不垫付任何
+> 人身意外险、雇主责任险或第三者责任险。现实骑行与配送过程中产生的一切问题
+> （含交通意外、人身伤害、财产损失与第三方索赔），由行为人自行承担，
+> 与作者无关。详见 [`DISCLAIMER.md` §八](DISCLAIMER.md#八人身安全与保险)。

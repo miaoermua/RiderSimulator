@@ -1,4 +1,6 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../alert_center.dart';
 import '../alert_event.dart';
@@ -64,6 +66,7 @@ class SettingsPage extends StatelessWidget {
               ),
               if (AlertCenter.canPickCustomSound)
                 for (final slot in AlertSoundSlot.values) _SoundTile(slot: slot),
+              const _PermissionBlock(),
               const Divider(height: 28),
               const _Label('骑行模式'),
               const SizedBox(height: 6),
@@ -102,7 +105,7 @@ class SettingsPage extends StatelessWidget {
               _Rule('取送半径', '${cfg.arriveRadiusM} 米'),
               const Divider(height: 28),
               const _Label('关于'),
-              const _Rule('版本', '0.2.3'),
+              const _Rule('版本', '0.2.5'),
               const _Rule('客户端', '骑手端 · arm64-v8a'),
             ],
           );
@@ -118,6 +121,115 @@ class SettingsPage extends StatelessWidget {
         ConnStatus.retrying => '重连中',
         ConnStatus.closed => '已断开',
       };
+}
+
+/// 系统权限状态：能看、能跳过去开，**不在这里申请**。
+///
+/// 为什么需要这一块：Android / iOS 的权限弹窗**只会出现一两次**。
+/// 用户点过「拒绝」之后（iOS 一次、Android 两次），系统就永久静默，
+/// 代码再调 `requestPermission()` 也不会弹——只能由用户自己去系统设置里改。
+///
+/// 申请逻辑仍然散在原来的地方（启动时的 `AlertCenter.init`、进主界面的
+/// `LocationService.attach`），因为那里各自知道上下文。这里只补上缺的那半截：
+/// **拒绝之后去哪儿改**。没有这一块，用户看到的现象就是「没反应」。
+class _PermissionBlock extends StatefulWidget {
+  const _PermissionBlock();
+
+  @override
+  State<_PermissionBlock> createState() => _PermissionBlockState();
+}
+
+class _PermissionBlockState extends State<_PermissionBlock>
+    with WidgetsBindingObserver {
+  /// null = 还没查出来（首帧）。Web 上一直保持 null，整块不渲染。
+  PermissionStatus? _location;
+  PermissionStatus? _notification;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _refresh();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  /// 从系统设置切回来时重查一次——否则用户开完权限回来，
+  /// 这一块还停在「未允许」，看着像没生效。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _refresh();
+  }
+
+  Future<void> _refresh() async {
+    // 浏览器没有这两项权限概念，`Permission.*.status` 在 Web 上也不可用。
+    if (kIsWeb) return;
+    try {
+      final loc = await Permission.location.status;
+      final notif = await Permission.notification.status;
+      if (!mounted) return;
+      setState(() {
+        _location = loc;
+        _notification = notif;
+      });
+    } catch (e) {
+      debugPrint('settings: 读权限状态失败 $e');
+    }
+  }
+
+  /// 真正需要用户动手的状态。`limited` / `provisional` 已经够用，不算缺。
+  static bool _needsAction(PermissionStatus? s) =>
+      s != null &&
+      (s.isDenied || s.isPermanentlyDenied || s.isRestricted);
+
+  static String _text(PermissionStatus? s) {
+    if (s == null) return '—';
+    if (s.isGranted) return '已允许';
+    if (s.isLimited) return '仅允许部分';
+    if (s.isProvisional) return '临时允许';
+    if (s.isPermanentlyDenied) return '已拒绝 · 系统不再询问';
+    if (s.isRestricted) return '受系统限制';
+    return '未允许';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (kIsWeb || (_location == null && _notification == null)) {
+      return const SizedBox.shrink();
+    }
+    final need = _needsAction(_location) || _needsAction(_notification);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Divider(height: 28),
+        const _Label('系统权限'),
+        _Rule('位置', _text(_location)),
+        _Rule('通知', _text(_notification)),
+        if (need) ...[
+          const SizedBox(height: 6),
+          const Text(
+            '提示过的权限如果被拒绝，系统不会再弹窗，需要在这里去设置里打开。',
+            style: TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: () async {
+              await openAppSettings();
+              // 回来时 didChangeAppLifecycleState 会再查一次；
+              // 这里也查一次，防止某些机型不触发 resumed。
+              await _refresh();
+            },
+            icon: const Icon(Icons.settings_outlined, size: 18),
+            label: const Text('去系统设置'),
+          ),
+        ],
+      ],
+    );
+  }
 }
 
 class _Label extends StatelessWidget {

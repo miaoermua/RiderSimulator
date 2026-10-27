@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -50,8 +52,8 @@ class DeliveryMap extends StatefulWidget {
 
   /// 直接聚焦到某个点（例如订单卡上切到「取」或「送」）。
   ///
-  /// 非空时首帧不做框选，后续变化会平移过去——切点的预期就是「镜头跟过去」，
-  /// 而不是每切一次都重新框一遍整单。
+  /// 非空时首帧不做框选，相机直接落在它上面，后续变化再平移过去——
+  /// 切点的预期就是「镜头跟过去」，而不是每切一次都重新框一遍整单。
   final LatLng? focus;
 
   /// 取送之间画圆弧而不是直线。
@@ -71,6 +73,19 @@ class _DeliveryMapState extends State<DeliveryMap> {
   /// 订单是后来才同步到的，所以失败的（点位为空）不算数。
   bool _fitted = false;
 
+  /// 瓦片重载通道：flutter_map 里唯一「不动地图也能重算瓦片」的入口。
+  /// 往里推一下，`TileLayer` 会丢掉现有瓦片并按当前相机重新请求。
+  final _reload = StreamController<void>.broadcast();
+
+  /// 有瓦片拉挂了 —— 图上亮起手动重载按钮。
+  bool _tilesBroken = false;
+
+  /// 自动重载的次数。封顶是刻意的：网络真不通时不能一直烧流量。
+  int _attempts = 0;
+  static const _maxAutoReloads = 3;
+  Timer? _autoReload;
+  Timer? _settle;
+
   @override
   void didUpdateWidget(covariant DeliveryMap old) {
     super.didUpdateWidget(old);
@@ -83,8 +98,46 @@ class _DeliveryMapState extends State<DeliveryMap> {
 
   @override
   void dispose() {
+    _autoReload?.cancel();
+    _settle?.cancel();
+    _reload.close();
     _map.dispose();
     super.dispose();
+  }
+
+  // ---------------------------------------------------------------------
+  // 瓦片拉不动时的补救
+  // ---------------------------------------------------------------------
+
+  /// 瓦片请求失败。flutter_map 不会自己重试，失败的图还留在 `ImageCache` 里，
+  /// 结果就是一片空白，直到用户拖动地图重算可见范围。
+  /// 这里把「拖动一下」变成自动的：退避着重载几轮，仍不行就留按钮给人点。
+  void _onTileError(Object error) {
+    if (!mounted) return;
+    // 相机动一次会同时挂一批瓦片，回调很多次，只当一次事故。
+    if (!_tilesBroken) setState(() => _tilesBroken = true);
+    // 重载之后又报错说明还没通，把「算恢复了」的判定往后推。
+    _armSettle();
+    if (_attempts >= _maxAutoReloads || _autoReload?.isActive == true) return;
+    _attempts++;
+    _autoReload = Timer(
+      Duration(milliseconds: 1200 * _attempts),
+      _reloadTiles,
+    );
+  }
+
+  void _reloadTiles() {
+    _reload.sink.add(null);
+    _armSettle();
+  }
+
+  /// `TileLayer` 没有「瓦片加载成功」的回调，只能反向判断：
+  /// 一段时间内不再报错就当作恢复了，按钮收起。
+  void _armSettle() {
+    _settle?.cancel();
+    _settle = Timer(const Duration(seconds: 4), () {
+      if (mounted && _tilesBroken) setState(() => _tilesBroken = false);
+    });
   }
 
   @override
@@ -115,8 +168,10 @@ class _DeliveryMapState extends State<DeliveryMap> {
         FlutterMap(
           mapController: _map,
           options: MapOptions(
-            initialCenter:
-                fitPoints.isEmpty ? _fallbackCenter : fitPoints.first,
+            // 首帧就落在目标点。按「我的位置」算一遍瓦片再挪去订单点，
+            // 在弱网下等于白跑一批请求，还会让人以为地图是坏的。
+            initialCenter: widget.focus ??
+                (fitPoints.isEmpty ? _fallbackCenter : fitPoints.first),
             initialZoom: 14,
             minZoom: 3,
             maxZoom: 19,
@@ -133,6 +188,11 @@ class _DeliveryMapState extends State<DeliveryMap> {
               subdomains: bm.subdomains,
               maxZoom: bm.maxZoom.toDouble(),
               userAgentPackageName: 'net.miaoer.game.crowdsource',
+              // 失败的瓦片要从图片缓存里踢掉，否则重载还是命中那张错误图。
+              evictErrorTileStrategy: EvictErrorTileStrategy.notVisible,
+              errorTileCallback: (tile, error, stackTrace) =>
+                  _onTileError(error),
+              reset: _reload.stream,
             ),
             if (widget.showMerchants) _merchantLayer(state),
             if (widget.orders.isNotEmpty) _orderLineLayer(),
@@ -153,6 +213,17 @@ class _DeliveryMapState extends State<DeliveryMap> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              if (_tilesBroken) ...[
+                _MapButton(
+                  icon: Icons.refresh,
+                  tooltip: '重新加载地图',
+                  onTap: () {
+                    _attempts = 0;
+                    _reloadTiles();
+                  },
+                ),
+                const SizedBox(height: 8),
+              ],
               _MapButton(
                 icon: Icons.center_focus_strong,
                 tooltip: '回到我的单',

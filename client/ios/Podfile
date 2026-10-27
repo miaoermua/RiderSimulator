@@ -39,5 +39,21 @@ end
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
+
+    # permission_handler 的 iOS 实现把每个权限编译在宏后面：
+    # 不开宏，`Permission.location.status` 这类查询会恒定返回 denied，
+    # 设置页那块就会一直显示「未允许」，即使系统里其实已经给了。
+    #
+    # 只开我们真正用到的两项——每多开一个，App Store 审核就问一句
+    # 「你要这个权限干什么」。定位对应 Info.plist 的
+    # NSLocationWhenInUseUsageDescription，通知走 UNUserNotificationCenter，
+    # 不需要额外的用途描述字符串。
+    target.build_configurations.each do |config|
+      config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] ||= [
+        '$(inherited)',
+        'PERMISSION_LOCATION=1',
+        'PERMISSION_NOTIFICATIONS=1',
+      ]
+    end
   end
 end
