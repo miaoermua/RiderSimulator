@@ -1,0 +1,144 @@
+name: release
+
+# 发布 Release 时构建安装包，并挂到同一个 Release 的 assets 上。
+#
+# 为什么用 `release: published` 而不是 `push: tags`：
+# 版本号是**人写的**（pubspec 里的 `version:`），tag 也是人打的，两者本来就该一致。
+# 以 Release 为触发点，构建的代码就是那次发布对应的提交，不会出现
+# 「tag 打了但代码还在改」的错位。手动重跑走 workflow_dispatch。
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要构建的 tag（如 v0.2.5）'
+        required: true
+        type: string
+
+permissions:
+  # 上传 assets 需要写权限。
+  contents: write
+
+env:
+  # 两个 job 共用：release 触发时取 release 的 tag，手动触发时取输入。
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  # 与本地开发环境对齐，避免「我这儿能编 CI 编不过」。
+  FLUTTER_VERSION: '3.47.7'
+
+jobs:
+  apk:
+    name: Android APK (arm64-v8a)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      # AGP 要求 JDK 17（见 client/android/app/build.gradle.kts 的
+      # sourceCompatibility），用更高版本反而可能撞上 Gradle 的兼容性问题。
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 校验版本号一致
+        run: |
+          set -eu
+          pub_ver=$(grep '^version:' client/pubspec.yaml | awk '{print $2}' | cut -d+ -f1)
+          tag_ver=${TAG#v}
+          echo "pubspec=$pub_ver  tag=$TAG"
+          if [ "$pub_ver" != "$tag_ver" ]; then
+            # 只警告不失败：可能就是想用别的 tag 名。但产物文件名会跟 tag 走，
+            # 所以两边对不上时必须在日志里留下痕迹。
+            echo "::warning::tag($TAG) 与 pubspec($pub_ver) 版本不一致，产物将按 tag 命名"
+          fi
+          echo "VERSION=$tag_ver" >> "$GITHUB_ENV"
+
+      - name: 构建
+        working-directory: client
+        run: |
+          set -eu
+          yes | flutter doctor --android-licenses >/dev/null 2>&1 || true
+          flutter pub get
+          # 只出 arm64-v8a：现在的 Android 设备基本都是 64 位，
+          # 分出 v7a/x86_64 只会让产物变成三个文件、下载时选错。
+          flutter build apk --release --split-per-abi
+
+      - name: 改名
+        run: |
+          set -eu
+          src=client/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          dst="rider-${VERSION}-arm64-v8a.apk"
+          cp "$src" "$dst"
+          ls -lh "$dst"
+          echo "ASSET=$dst" >> "$GITHUB_ENV"
+
+      - name: 上传到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: ${{ env.ASSET }}
+          fail_on_unmatched_files: true
+
+  ipa:
+    name: iOS IPA (unsigned)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 校验版本号一致
+        run: |
+          set -eu
+          pub_ver=$(grep '^version:' client/pubspec.yaml | awk '{print $2}' | cut -d+ -f1)
+          tag_ver=${TAG#v}
+          if [ "$pub_ver" != "$tag_ver" ]; then
+            echo "::warning::tag($TAG) 与 pubspec($pub_ver) 版本不一致，产物将按 tag 命名"
+          fi
+          echo "VERSION=$tag_ver" >> "$GITHUB_ENV"
+
+      - name: 构建（不签名）
+        working-directory: client
+        run: |
+          set -eu
+          # CocoaPods 由 macos runner 预装；Flutter 会自己跑 pod install。
+          pod --version
+          flutter pub get
+          # --no-codesign：产物是未签名的 .app，交给用户用 Sideloadly /
+          # AltStore 自签。CI 里没有也不该有开发者的证书。
+          flutter build ios --release --no-codesign
+
+      - name: 打包成 IPA
+        run: |
+          set -eu
+          # IPA 就是「一个装 Payload/Runner.app 的 zip」，没有别的结构。
+          rm -rf /tmp/ipa && mkdir -p /tmp/ipa/Payload
+          cp -R client/build/ios/iphoneos/Runner.app /tmp/ipa/Payload/
+          cd /tmp/ipa
+          dst="$GITHUB_WORKSPACE/rider-${VERSION}-unsigned.ipa"
+          # -y 保留符号链接：Flutter.framework 里有指向 Versions/Current 的链接，
+          # 展开成实体文件会让包体积翻倍，签名工具也可能认不出框架结构。
+          zip -qry "$dst" Payload
+          ls -lh "$dst"
+          echo "ASSET=rider-${VERSION}-unsigned.ipa" >> "$GITHUB_ENV"
+
+      - name: 上传到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: ${{ env.ASSET }}
+          fail_on_unmatched_files: true

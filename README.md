@@ -57,7 +57,7 @@ RIDER_SIM_ALLOW_CONTROL=true cargo run
 | [`docs/API.md`](docs/API.md) | HTTP 路由全表、WS 入口、鉴权、环境变量 |
 | [`docs/开发指南.md`](docs/开发指南.md) | 环境、跑起来、验证命令 |
 | [`AGENTS.md`](AGENTS.md) | 给 AI 编码代理的约定与陷阱 |
-| [`DISCLAIMER.md`](DISCLAIMER.md) | 独立实现声明、人身安全与保险边界、免责 |
+| [`DISCLAIMER.md`](DISCLAIMER.md) | 独立实现声明、人身安全与保险边界、GPL 许可范围、免责 |
 
 `docs/cache/` 是设计过程稿与调研，已在 `.gitignore` 中，不随仓库分发。
 
