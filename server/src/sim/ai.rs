@@ -13,7 +13,7 @@ use super::{
     event::{AiAssignment, DecisionSource},
     geo::{angle_between, bearing_deg, haversine_m},
     order::{Order, OrderTier},
-    rider::{Phase, Rider},
+    rider::{Phase, Rider, RiderKind},
     world::World,
 };
 
@@ -316,10 +316,15 @@ pub fn accepts(world: &World, rider: &Rider, order: &Order) -> bool {
 /// `wait_for_merge_min` 存在的理由。
 ///
 /// 只认「当前腿卡在等餐段」的单：在路上的骑手不在店门口，合并不了。
-pub fn merge_riders(world: &World) -> Vec<(RiderId, u32, u32)> {
+///
+/// 凑单也是**替人做决定**，所以只有 AI 管得着的骑手在名单里：模拟骑手，
+/// 以及 AutoPilot 托管的真人（`hosted`）。在线真人不算——他手上那单是玩家
+/// 自己在跑，要不要顺手再拎一份得他自己点。
+pub fn merge_riders(world: &World, hosted: &[RiderId]) -> Vec<(RiderId, u32, u32)> {
     let mut out = Vec::new();
     for r in &world.riders {
         if !r.online
+            || !ai_may_assign(world, r.id, hosted)
             || r.is_injured(world.elapsed_min)
             || r.is_frozen(world.elapsed_min)
             || r.held.len() as u32 >= r.effective_max_held(&world.cfg)
@@ -339,7 +344,24 @@ pub fn merge_riders(world: &World) -> Vec<(RiderId, u32, u32)> {
     out
 }
 
+/// AI 能不能替这个骑手派单？
+///
+/// 模拟骑手归 AI；真人只有交给 AutoPilot 托管时才算 AI 的人。**不能只看
+/// `RiderKind::Human`**：连着 WS 的玩家也是 Human，AI 替他接单等于抢操作。
+/// 「托没托管」是外圈（`human::host`）算出来的事实，一路用 `hosted` 传进来，
+/// `sim/` 不自己猜。
+fn ai_may_assign(world: &World, rid: RiderId, hosted: &[RiderId]) -> bool {
+    match world.rider(rid) {
+        Some(r) if r.kind == RiderKind::Human => hosted.contains(&rid),
+        Some(_) => true,
+        None => false,
+    }
+}
+
 /// 批量贪心指派：骑手与订单各只能出现一次。
+///
+/// `idle_riders` 是空闲且归 AI 管的骑手，`hosted` 是当前 AutoPilot 托管的真人
+/// （用来判定等餐中的真人能不能代管凑单）。
 ///
 /// 复杂度 O(骑手 × 订单 × log n)。**不用匈牙利算法**——10×5 规模最优解没意义，
 /// 而且贪心的结果玩家能看懂为什么。
@@ -347,10 +369,11 @@ pub fn batch_decide(
     world: &World,
     new_orders: &[OrderId],
     idle_riders: &[RiderId],
+    hosted: &[RiderId],
 ) -> Vec<Assignment> {
     let merge_window = world.cfg.merge.wait_for_merge_min;
     let merging = if merge_window > 0 {
-        merge_riders(world)
+        merge_riders(world, hosted)
     } else {
         Vec::new()
     };
@@ -365,6 +388,10 @@ pub fn batch_decide(
             let Some(r) = world.rider(*rid) else {
                 continue;
             };
+            // 名单本该只含 AI 管得着的骑手；再挡一道，免得调用方塞进在线真人。
+            if !ai_may_assign(world, *rid, hosted) {
+                continue;
+            }
             // 拒单 / 观望记录：TTL 内别再把这一单塞回去。恢复评估靠时间或
             // 订单离开大厅，不是靠下一次贪心「猜」。
             if world.is_refused(*rid, *oid) || world.is_held(*rid) {
@@ -421,14 +448,28 @@ pub fn batch_decide(
     let per_merchant_cap = world.cfg.merge.max_active_orders_per_merchant;
 
     let mut rider_load: HashMap<RiderId, usize> = HashMap::new();
+    // 骑手剩余容量（`effective_max_held - 当前持单数`），按需算一次并缓存。
+    let mut room_left: HashMap<RiderId, usize> = HashMap::new();
     let mut merchant_load: HashMap<u32, u32> = HashMap::new();
     let mut used_orders = HashSet::new();
     let mut out = Vec::new();
-    for c in candidates {
+    for mut c in candidates {
         if used_orders.contains(&c.order) {
             continue;
         }
-        if rider_load.get(&c.rider).copied().unwrap_or(0) >= per_rider_cap {
+        // 本次调用能给他几单 = min(cap, 他此刻还剩多少容量)。
+        //
+        // `accepts` / `merge_riders` 判的是**调用前**的世界状态，`rider_load` 数的是
+        // **本次调用**，两者各管一头：已持 2 单、上限 3、cap 2 时，两条候选本来就都
+        // 过得了前一道校验，只看 `rider_load` 就会派出 4 单。剩余容量在调用期间不会
+        // 变（世界只在 tick 里推进），所以按骑手算一次就够；已经派出去的条数由
+        // `rider_load` 即时累加，后面的候选看到的自然是扣减后的余量。
+        let room = *room_left.entry(c.rider).or_insert_with(|| {
+            world.rider(c.rider).map_or(0, |r| {
+                (r.effective_max_held(&world.cfg) as usize).saturating_sub(r.held.len())
+            })
+        });
+        if rider_load.get(&c.rider).copied().unwrap_or(0) >= per_rider_cap.min(room) {
             continue;
         }
         if per_merchant_cap > 0 {
@@ -441,6 +482,18 @@ pub fn batch_decide(
         }
         *rider_load.entry(c.rider).or_insert(0) += 1;
         used_orders.insert(c.order);
+        // 托管真人（AutoPilot）：这一单是 AI 替他点的，不是他自己接的。
+        // 逐条来源要如实反映这件事，否则控制台分不清「模拟骑手」与「代管真人」。
+        // 判定写成「真人**且**在托管名单里」而不是单看种类：漏传名单时宁可
+        // 记成 `Algorithm`，也不能把在线真人的算法派单谎称成「AI 托管」。
+        // LLM 点名的仍记 `Llm`（见 `validate_llm_plan`），人工记 `Manual`。
+        if world
+            .rider(c.rider)
+            .is_some_and(|r| r.kind == RiderKind::Human)
+            && hosted.contains(&c.rider)
+        {
+            c.source = DecisionSource::AiHosted;
+        }
         out.push(c);
     }
     out
@@ -489,6 +542,136 @@ pub struct LlmRefusal {
     pub reason: String,
 }
 
+/// 被丢掉的是哪一类意图。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntentLayer {
+    /// 接单 / 拒单 / 观望。
+    Act,
+    /// 价格门槛 / 背单上限 / 速度档。
+    Policy,
+    /// 站长指令。
+    StationOp,
+}
+
+impl IntentLayer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Act => "act",
+            Self::Policy => "policy",
+            Self::StationOp => "station_op",
+        }
+    }
+}
+
+/// 一条意图被丢弃的**原因**。
+///
+/// 只记总数是不够的：事后没法区分「模型不守规矩」「骑手这轮不可派」
+/// 「订单已经被抢走」——三种情况该分别改提示词、改调度、改时序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DropReason {
+    /// `r` 不是 `r<数字>` 形式。
+    BadRiderKey,
+    /// 骑手 id 在世界里不存在。
+    UnknownRider,
+    /// 不归 AI 管：模拟骑手已下线 / 未托管给 AutoPilot 的真人。
+    RiderNotManaged,
+    /// 归 AI 管，但本轮不可派单（在途、背满、受伤、日单量上限）。
+    RiderNotEligible,
+    /// 订单 id 不存在。
+    UnknownOrder,
+    /// 订单已经不在大厅（被抢 / 已送达 / 已取消）。
+    OrderNotPending,
+    /// 同一骑手在一轮里给了多条同类意图。
+    DuplicateRider,
+    /// 同一订单被多个骑手认领 / 重复拒单。
+    DuplicateOrder,
+    /// 同一轮里既接单又拒单，语义冲突。
+    ConflictingIntent,
+    /// 该单仍在拒单有效期内。
+    RefusedOrder,
+    /// 骑手正处在观望窗口内。
+    RiderHeld,
+    /// `evaluate` 给不出可行分（例如到店就已经来不及）。
+    NotScorable,
+    /// 站长指令无法解析成四种合法形状之一。
+    BadStationOp,
+}
+
+impl DropReason {
+    /// 稳定的小写码：事件、日志、测试断言都用它，别用 `Debug`。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BadRiderKey => "bad_rider_key",
+            Self::UnknownRider => "unknown_rider",
+            Self::RiderNotManaged => "rider_not_managed",
+            Self::RiderNotEligible => "rider_not_eligible",
+            Self::UnknownOrder => "unknown_order",
+            Self::OrderNotPending => "order_not_pending",
+            Self::DuplicateRider => "duplicate_rider",
+            Self::DuplicateOrder => "duplicate_order",
+            Self::ConflictingIntent => "conflicting_intent",
+            Self::RefusedOrder => "refused_order",
+            Self::RiderHeld => "rider_held",
+            Self::NotScorable => "not_scorable",
+            Self::BadStationOp => "bad_station_op",
+        }
+    }
+}
+
+/// 被丢弃的一条意图。骑手 / 订单可能缺一项：key 本身解析不出来时就没有 id。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedIntent {
+    pub layer: IntentLayer,
+    pub rider: Option<RiderId>,
+    pub order: Option<OrderId>,
+    pub reason: DropReason,
+}
+
+impl DroppedIntent {
+    pub fn new(
+        layer: IntentLayer,
+        rider: Option<RiderId>,
+        order: Option<OrderId>,
+        reason: DropReason,
+    ) -> Self {
+        Self {
+            layer,
+            rider,
+            order,
+            reason,
+        }
+    }
+
+    /// `act r7/o42 refused_order` 形式，给日志和 note 用。
+    pub fn brief(&self) -> String {
+        let rider = self.rider.map(crate::sim::rider_key).unwrap_or_default();
+        let order = self.order.map(|o| format!("o{o}")).unwrap_or_default();
+        format!(
+            "{} {}/{} {}",
+            self.layer.as_str(),
+            if rider.is_empty() { "-" } else { &rider },
+            if order.is_empty() { "-" } else { &order },
+            self.reason.as_str()
+        )
+    }
+}
+
+/// 普通派单是否撞上「短期排除项」。`None` = 可以派。
+///
+/// **只拦普通派单**：`rescue_nearest` 有意不查这个——那是「不允许流单」的
+/// 最后一手，为了不让某一单死在拒单记录里，必须能越过个人意愿。
+pub fn refusal_block(world: &World, rider: RiderId, order: OrderId) -> Option<DropReason> {
+    if world.is_held(rider) {
+        return Some(DropReason::RiderHeld);
+    }
+    match world.was_refused(rider, order) {
+        Some(super::world::RefusalKind::Reject) => Some(DropReason::RefusedOrder),
+        // `Pass` 是骑手级观望，`is_held` 已经覆盖；这里兜防御性分支。
+        Some(super::world::RefusalKind::Pass) => Some(DropReason::RiderHeld),
+        None => None,
+    }
+}
+
 /// LLM 计划校验结果。
 #[derive(Debug, Clone, Default)]
 pub struct LlmVerdict {
@@ -497,16 +680,47 @@ pub struct LlmVerdict {
     pub refusals: Vec<LlmRefusal>,
     /// 本轮**有效决策覆盖到**的骑手（接单 + 拒单/观望）。
     pub covered: Vec<RiderId>,
-    /// 被丢弃的条目数（骑手非法 / 订单不存在 / 重复）。
-    pub dropped: usize,
+    /// 被丢弃的每一条意图及原因。**不再只有计数**。
+    pub drops: Vec<DroppedIntent>,
+}
+
+impl LlmVerdict {
+    pub fn dropped(&self) -> usize {
+        self.drops.len()
+    }
+}
+
+/// 把丢弃原因聚成 `（refused_order×2, rider_held×1）`；没有丢弃时返回空串。
+///
+/// 顺序按码字典序（`BTreeMap`），同输入永远同一句，方便 diff 与断言。
+pub fn summarize_drops(drops: &[DroppedIntent]) -> String {
+    if drops.is_empty() {
+        return String::new();
+    }
+    let mut counts = std::collections::BTreeMap::new();
+    for d in drops {
+        *counts.entry(d.reason.as_str()).or_insert(0usize) += 1;
+    }
+    let detail = counts
+        .iter()
+        .map(|(k, n)| format!("{k}×{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("（{detail}）")
 }
 
 /// 校验 LLM 输出。**不信任 LLM 的任何措辞。**
 ///
-/// 丢弃规则：
-/// - 骑手不在空闲列表 → 丢
-/// - 订单不在待抢列表 → 丢
+/// 丢弃规则（每条都记 [`DroppedIntent`]，不静默丢）：
+/// - 骑手不在本轮名单 → 丢（`rider_not_eligible`）
+/// - 订单不在待抢列表 → 丢（`order_not_pending`）
+/// - 骑手身上已无空位（`held.len() >= effective_max_held`，含 `cap = 0`）
+///   → 丢（`rider_not_eligible`）
 /// - 骑手重复 / 订单重复 → 丢
+/// - 该单仍在拒单 TTL 内、或骑手在观望窗口内 → 丢（`refused_order` / `rider_held`）
+///
+/// 拒单 / 观望约束必须在这里也查一遍——`batch_decide` 里的过滤只管本地补位，
+/// 覆盖不到 LLM 直接点名派单这条路径。
 pub fn validate_llm_plan(
     world: &World,
     plan: &LlmPlan,
@@ -516,23 +730,66 @@ pub fn validate_llm_plan(
     let mut riders = HashSet::new();
     let mut orders = HashSet::new();
     let mut out = Vec::new();
-    let mut dropped = 0usize;
+    let mut drops: Vec<DroppedIntent> = Vec::new();
 
     for a in &plan.assignments {
         let Some(rid) = crate::sim::parse_rider_key(&a.rider_id) else {
-            dropped += 1;
+            drops.push(DroppedIntent::new(
+                IntentLayer::Act,
+                None,
+                Some(a.order_id),
+                DropReason::BadRiderKey,
+            ));
             continue;
         };
-        if !idle.contains(&rid) || !pending.contains(&a.order_id) {
-            dropped += 1;
+        let act = |r: Option<RiderId>, reason: DropReason| {
+            DroppedIntent::new(IntentLayer::Act, r, Some(a.order_id), reason)
+        };
+        if world.rider(rid).is_none() {
+            drops.push(act(Some(rid), DropReason::UnknownRider));
             continue;
         }
-        if !riders.insert(rid) || !orders.insert(a.order_id) {
-            dropped += 1;
+        if !pending.contains(&a.order_id) {
+            drops.push(act(Some(rid), DropReason::OrderNotPending));
+            continue;
+        }
+        if !idle.contains(&rid) {
+            drops.push(act(Some(rid), DropReason::RiderNotEligible));
+            continue;
+        }
+        // 容量：`idle` 只回答「这一轮能不能点他」，不回答「他身上还有没有位置」。
+        // 名单按 `is_free` 收人，而 `is_free` 只看「手上有没有单」——`cap_override = 0`
+        // （站长下的「只把手上的送完，不再接新单」）的骑手只要手上是空的，照样进名单、
+        // 照样被点名。少这一道，LLM 直派就成了能绕开 `cap = 0` 的入口：
+        // `assign_forced` / `reassign` / `claim_extra` / `rescue_nearest` /
+        // `batch_decide` 都按 `effective_max_held` 拦着。
+        //
+        // 复用 `effective_max_held`：策略覆盖、配置上限、二者取小都已经在里面，
+        // 这里不重算。判定放在 `riders.insert` 之前——背满的人每一条 claim 都该报
+        // 同一个原因码，不能被前一条改写成 `duplicate_rider`。
+        let has_room = world
+            .rider(rid)
+            .is_some_and(|r| (r.effective_max_held(&world.cfg) as usize) > r.held.len());
+        if !has_room {
+            drops.push(act(Some(rid), DropReason::RiderNotEligible));
+            continue;
+        }
+        // 短期排除项先查：被挡下的意图不该占掉「这一轮这个骑手已被 LLM 处理」
+        // 的位置，否则后面一条真正可行的单就永远轮不到他。
+        if let Some(reason) = refusal_block(world, rid, a.order_id) {
+            drops.push(act(Some(rid), reason));
+            continue;
+        }
+        if !riders.insert(rid) {
+            drops.push(act(Some(rid), DropReason::DuplicateRider));
+            continue;
+        }
+        if !orders.insert(a.order_id) {
+            drops.push(act(Some(rid), DropReason::DuplicateOrder));
             continue;
         }
         let Some(mut assign) = evaluate(world, rid, a.order_id) else {
-            dropped += 1;
+            drops.push(act(Some(rid), DropReason::NotScorable));
             continue;
         };
         assign.source = DecisionSource::Llm;
@@ -550,12 +807,23 @@ pub fn validate_llm_plan(
     let mut refusals = Vec::new();
     let mut pairs = HashSet::new();
     for rf in &plan.refusals {
-        if riders.contains(&rf.rider) || !idle.contains(&rf.rider) || !pending.contains(&rf.order) {
-            dropped += 1;
+        let refuse = |reason: DropReason| {
+            DroppedIntent::new(IntentLayer::Act, Some(rf.rider), Some(rf.order), reason)
+        };
+        if !idle.contains(&rf.rider) {
+            drops.push(refuse(DropReason::RiderNotEligible));
+            continue;
+        }
+        if riders.contains(&rf.rider) {
+            drops.push(refuse(DropReason::ConflictingIntent));
+            continue;
+        }
+        if !pending.contains(&rf.order) {
+            drops.push(refuse(DropReason::OrderNotPending));
             continue;
         }
         if !pairs.insert((rf.rider, rf.order)) {
-            dropped += 1;
+            drops.push(refuse(DropReason::DuplicateOrder));
             continue;
         }
         refusals.push(rf.clone());
@@ -572,7 +840,7 @@ pub fn validate_llm_plan(
         assignments: out,
         refusals,
         covered,
-        dropped,
+        drops,
     }
 }
 
@@ -682,7 +950,7 @@ mod tests {
             .filter(|r| r.is_idle(w.elapsed_min, &w.cfg))
             .map(|r| r.id)
             .collect();
-        let res = batch_decide(&w, &pending, &idle);
+        let res = batch_decide(&w, &pending, &idle, &[]);
         let riders: HashSet<_> = res.iter().map(|a| a.rider).collect();
         let orders: HashSet<_> = res.iter().map(|a| a.order).collect();
         assert_eq!(riders.len(), res.len());
@@ -734,9 +1002,168 @@ mod tests {
         };
         let v = validate_llm_plan(&w, &plan, &idle, &pending);
         assert_eq!(v.assignments.len(), 1);
-        assert_eq!(v.dropped, 4);
+        assert_eq!(v.dropped(), 4);
         assert_eq!(v.assignments[0].source, DecisionSource::Llm);
         assert!(v.assignments[0].reason.starts_with("[LLM]"));
+    }
+
+    /// 拒单记录必须挡住 **LLM 直接点名**这条路径，不能只挡本地补位。
+    ///
+    /// 修复前：`batch_decide` 里查 `is_refused`，`validate_llm_plan` 不查——
+    /// 于是模型只要再写一次 `r7/o3`，刚被拒掉的单就又回到他手上。
+    #[test]
+    fn a_rejected_order_is_not_handed_back_by_the_plan() {
+        let mut w = world();
+        w.generate_order_batch(2);
+        let pending: Vec<_> = w.orders.iter().map(|o| o.id).collect();
+        let idle: Vec<_> = w.riders.iter().map(|r| r.id).collect();
+        let (rid, oid) = (idle[0], pending[0]);
+
+        w.record_refusals(&[LlmRefusal {
+            rider: rid,
+            order: oid,
+            kind: crate::sim::world::RefusalKind::Reject,
+            reason: "太远".into(),
+        }]);
+
+        let plan = LlmPlan {
+            assignments: vec![LlmAssign {
+                rider_id: format!("r{rid}"),
+                order_id: oid,
+                reason: "又觉得顺路了".into(),
+            }],
+            ..Default::default()
+        };
+        let v = validate_llm_plan(&w, &plan, &idle, &pending);
+        assert!(v.assignments.is_empty(), "拒单还在有效期，不能再派回去");
+        assert_eq!(v.drops.len(), 1);
+        assert_eq!(v.drops[0].reason, DropReason::RefusedOrder);
+        assert_eq!(v.drops[0].layer, IntentLayer::Act);
+        assert_eq!(v.drops[0].rider, Some(rid));
+        assert_eq!(v.drops[0].order, Some(oid));
+        assert!(
+            v.covered.is_empty(),
+            "被挡掉的意图不算覆盖，必须让算法有机会补位"
+        );
+    }
+
+    /// 观望是骑手级窗口：窗口内 LLM 也不能点他，理由要报 `rider_held`。
+    #[test]
+    fn a_held_rider_is_not_handed_an_order_by_the_plan() {
+        let mut w = world();
+        w.generate_order_batch(2);
+        let pending: Vec<_> = w.orders.iter().map(|o| o.id).collect();
+        let idle: Vec<_> = w.riders.iter().map(|r| r.id).collect();
+        let (rid, oid) = (idle[0], pending[1]);
+
+        w.record_refusals(&[LlmRefusal {
+            rider: rid,
+            order: oid,
+            kind: crate::sim::world::RefusalKind::Pass,
+            reason: "等更值的单".into(),
+        }]);
+
+        let plan = LlmPlan {
+            assignments: vec![LlmAssign {
+                rider_id: format!("r{rid}"),
+                order_id: oid,
+                reason: "".into(),
+            }],
+            ..Default::default()
+        };
+        let v = validate_llm_plan(&w, &plan, &idle, &pending);
+        assert!(v.assignments.is_empty(), "观望窗口内不许派单");
+        assert_eq!(v.drops[0].reason, DropReason::RiderHeld);
+    }
+
+    /// 记录失效后必须能重新评估：拒一次不能等于永久黑名单。
+    #[test]
+    fn an_expired_refusal_lets_the_plan_through_again() {
+        let mut w = world();
+        w.generate_order_batch(2);
+        let pending: Vec<_> = w.orders.iter().map(|o| o.id).collect();
+        let idle: Vec<_> = w.riders.iter().map(|r| r.id).collect();
+        let (rid, oid) = (idle[0], pending[0]);
+        let ttl = w.cfg.llm_refusal_ttl_min as u64;
+
+        w.record_refusals(&[LlmRefusal {
+            rider: rid,
+            order: oid,
+            kind: crate::sim::world::RefusalKind::Reject,
+            reason: "太远".into(),
+        }]);
+        w.elapsed_min = ttl;
+
+        let plan = LlmPlan {
+            assignments: vec![LlmAssign {
+                rider_id: format!("r{rid}"),
+                order_id: oid,
+                reason: "窗口过了".into(),
+            }],
+            ..Default::default()
+        };
+        let v = validate_llm_plan(&w, &plan, &idle, &pending);
+        assert_eq!(v.assignments.len(), 1, "TTL 到期后可以重新评估");
+        assert!(v.drops.is_empty());
+        assert_eq!(v.assignments[0].source, DecisionSource::Llm);
+    }
+
+    /// 混合计划：被挡的只丢那一条，同轮其它派单照常生效。
+    #[test]
+    fn a_blocked_claim_does_not_sink_the_rest_of_the_plan() {
+        let mut w = world();
+        w.generate_order_batch(3);
+        let pending: Vec<_> = w.orders.iter().map(|o| o.id).collect();
+        let idle: Vec<_> = w.riders.iter().map(|r| r.id).collect();
+        let (r0, r1) = (idle[0], idle[1]);
+
+        w.record_refusals(&[LlmRefusal {
+            rider: r0,
+            order: pending[0],
+            kind: crate::sim::world::RefusalKind::Reject,
+            reason: "不划算".into(),
+        }]);
+
+        let plan = LlmPlan {
+            assignments: vec![
+                LlmAssign {
+                    rider_id: format!("r{r0}"),
+                    order_id: pending[0],
+                    reason: "".into(),
+                },
+                LlmAssign {
+                    rider_id: format!("r{r1}"),
+                    order_id: pending[1],
+                    reason: "".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let v = validate_llm_plan(&w, &plan, &idle, &pending);
+        assert_eq!(v.assignments.len(), 1, "有效的那条不能被连坐");
+        assert_eq!(v.assignments[0].rider, r1);
+        assert_eq!(v.drops.len(), 1);
+        assert_eq!(v.drops[0].reason, DropReason::RefusedOrder);
+    }
+
+    /// 托管真人的算法补位要标成 `AiHosted`：这单是 AI 替他点的。
+    #[test]
+    fn an_autopilot_human_is_marked_as_ai_hosted() {
+        let mut w = world();
+        w.generate_order_batch(2);
+        let pending = w.pending_orders();
+        let hid = w.spawn_human_rider("小赵");
+        // 掉线被 AutoPilot 接管：身体还在线（算法视角），但没有真人操作。
+        w.rider_mut(hid).expect("在").online = true;
+
+        let res = batch_decide(&w, &pending, &[hid], &[hid]);
+        assert!(!res.is_empty(), "托管真人应该能被兜底派单");
+        assert!(res.iter().all(|a| a.rider == hid));
+        assert_eq!(
+            res[0].source,
+            DecisionSource::AiHosted,
+            "算法替托管真人做的决策必须标成 AI 托管，不能混进模拟骑手的 Algorithm"
+        );
     }
 
     #[test]
@@ -807,7 +1234,7 @@ mod tests {
             fee_cents: Some(20_000),
             prep_seconds: None,
         });
-        let res = batch_decide(&w, &[same], &[]);
+        let res = batch_decide(&w, &[same], &[], &[]);
         assert_eq!(res.len(), 1, "在店等餐的骑手该能顺手接同店单");
         assert_eq!((res[0].rider, res[0].order), (rid, same));
 
@@ -823,8 +1250,381 @@ mod tests {
             fee_cents: Some(20_000),
             prep_seconds: None,
         });
-        let res = batch_decide(&w, &[other], &[]);
+        let res = batch_decide(&w, &[other], &[], &[]);
         assert!(res.is_empty(), "不同商家的单不该塞给在店等餐的骑手");
+    }
+
+    /// 在线真人在店里等餐时，算法**不得**替他凑单。
+    ///
+    /// 凑单通道以前只看 `online`，不看这具身体归谁管：连着 WS 的玩家照样会被
+    /// 塞一单，还会被标成 `AiHosted`（「AI 托管」），两头都错。
+    #[test]
+    fn a_live_human_is_never_handed_a_merge_order() {
+        use crate::sim::order::AssignMode;
+        use crate::sim::{scheduler, world::CustomOrderSpec};
+
+        let mut w = world();
+        w.cfg.merge.wait_for_merge_min = 5;
+        let hid = w.spawn_human_rider("小赵");
+        w.rider_mut(hid).unwrap().online = true;
+
+        w.generate_order_batch(1);
+        let first = w.pending_orders()[0];
+        scheduler::assign_forced(&mut w, first, hid, AssignMode::Offer).expect("强制指派该成功");
+        let shop = w.order(first).unwrap().merchant_pos();
+        let shop_name = w.order(first).unwrap().merchant_name.clone();
+        {
+            let r = w.rider_mut(hid).unwrap();
+            let h = r.held_mut(first).unwrap();
+            h.phase = Phase::WaitingFood;
+            h.remaining_min = 10;
+            h.leg_total_min = 10;
+        }
+
+        let same = w.create_custom_order(CustomOrderSpec {
+            merchant_name: shop_name,
+            merchant_lat: shop.lat,
+            merchant_lng: shop.lng,
+            customer_name: None,
+            customer_address: None,
+            customer_lat: shop.lat + 0.01,
+            customer_lng: shop.lng,
+            fee_cents: Some(20_000),
+            prep_seconds: None,
+        });
+        let res = batch_decide(&w, &[same], &[], &[]);
+        assert!(
+            res.is_empty(),
+            "在线真人的单该由他自己接，算法不能凑单（实际派了 {} 条）",
+            res.len()
+        );
+    }
+
+    /// 反过来：AutoPilot 托管的真人是 AI 的人，凑单照旧，来源记 `AiHosted`。
+    #[test]
+    fn a_hosted_human_still_gets_merge_orders_from_the_ai() {
+        use crate::sim::order::AssignMode;
+        use crate::sim::{scheduler, world::CustomOrderSpec};
+
+        let mut w = world();
+        w.cfg.merge.wait_for_merge_min = 5;
+        let hid = w.spawn_human_rider("小赵");
+        // 托管真人通常还留着掉线前的 online 标记——托管与否不看它，看外圈名单。
+        w.rider_mut(hid).unwrap().online = true;
+
+        w.generate_order_batch(1);
+        let first = w.pending_orders()[0];
+        scheduler::assign_forced(&mut w, first, hid, AssignMode::Offer).expect("强制指派该成功");
+        let shop = w.order(first).unwrap().merchant_pos();
+        let shop_name = w.order(first).unwrap().merchant_name.clone();
+        {
+            let r = w.rider_mut(hid).unwrap();
+            let h = r.held_mut(first).unwrap();
+            h.phase = Phase::WaitingFood;
+            h.remaining_min = 10;
+            h.leg_total_min = 10;
+        }
+
+        let same = w.create_custom_order(CustomOrderSpec {
+            merchant_name: shop_name,
+            merchant_lat: shop.lat,
+            merchant_lng: shop.lng,
+            customer_name: None,
+            customer_address: None,
+            customer_lat: shop.lat + 0.01,
+            customer_lng: shop.lng,
+            fee_cents: Some(20_000),
+            prep_seconds: None,
+        });
+        let res = batch_decide(&w, &[same], &[], &[hid]);
+        assert_eq!(res.len(), 1, "托管真人的凑单该由 AI 代管");
+        assert_eq!((res[0].rider, res[0].order), (hid, same));
+        assert_eq!(res[0].source, DecisionSource::AiHosted);
+    }
+
+    /// 观望是**骑手级**的：窗口内连凑单也不参与，人就站在同店门口也不塞。
+    #[test]
+    fn a_held_rider_is_not_handed_a_merge_order() {
+        use crate::sim::order::AssignMode;
+        use crate::sim::{scheduler, world::CustomOrderSpec};
+
+        let mut w = world();
+        w.cfg.merge.wait_for_merge_min = 5;
+        w.set_sim_rider_count(1);
+        let rid = w.sim_rider_ids()[0];
+
+        w.generate_order_batch(1);
+        let first = w.pending_orders()[0];
+        scheduler::assign_forced(&mut w, first, rid, AssignMode::Offer).expect("强制指派该成功");
+        let shop = w.order(first).unwrap().merchant_pos();
+        let shop_name = w.order(first).unwrap().merchant_name.clone();
+        {
+            let r = w.rider_mut(rid).unwrap();
+            let h = r.held_mut(first).unwrap();
+            h.phase = Phase::WaitingFood;
+            h.remaining_min = 10;
+            h.leg_total_min = 10;
+        }
+
+        let same = w.create_custom_order(CustomOrderSpec {
+            merchant_name: shop_name,
+            merchant_lat: shop.lat,
+            merchant_lng: shop.lng,
+            customer_name: None,
+            customer_address: None,
+            customer_lat: shop.lat + 0.01,
+            customer_lng: shop.lng,
+            fee_cents: Some(20_000),
+            prep_seconds: None,
+        });
+        // 先确认这个场面本来会派出去，再叠加观望——否则「空」说明不了任何事。
+        assert_eq!(batch_decide(&w, &[same], &[], &[]).len(), 1);
+
+        w.record_refusals(&[LlmRefusal {
+            rider: rid,
+            order: first,
+            kind: crate::sim::world::RefusalKind::Pass,
+            reason: "手上有单，先送完".into(),
+        }]);
+        assert!(
+            batch_decide(&w, &[same], &[], &[]).is_empty(),
+            "观望窗口内不该给他凑单"
+        );
+    }
+
+    /// 造一个「手上已有 `held` 单、正卡在同一家店门口等餐」的骑手。
+    ///
+    /// 返回那家店的 `(店名, 坐标)`，方便接着往同一家店下单，制造凑单场面。
+    /// 用 `assign_forced` 塞单：它绕开抢单窗口与意愿评估，且会立刻改世界状态，
+    /// 所以这里拿到的 `held` 和真实跑过一轮之后是一回事。
+    fn rider_waiting_at_shop(w: &mut World, rid: RiderId, held: usize) -> (String, LatLng) {
+        use crate::sim::order::AssignMode;
+        use crate::sim::{scheduler, world::CustomOrderSpec};
+
+        assert!(held >= 1, "至少得先有一单，否则不是「等餐中」");
+        w.generate_order_batch(1);
+        let first = w.pending_orders()[0];
+        scheduler::assign_forced(w, first, rid, AssignMode::Offer).expect("第一单该塞得进");
+        let (name, pos) = {
+            let o = w.order(first).expect("订单在");
+            (o.merchant_name.clone(), o.merchant_pos())
+        };
+
+        let mut mine = vec![first];
+        for i in 1..held {
+            let more = w.create_custom_order(CustomOrderSpec {
+                merchant_name: name.clone(),
+                merchant_lat: pos.lat,
+                merchant_lng: pos.lng,
+                customer_name: None,
+                customer_address: None,
+                customer_lat: pos.lat + 0.001 * (i as f64 + 1.0),
+                customer_lng: pos.lng,
+                fee_cents: Some(20_000),
+                prep_seconds: None,
+            });
+            scheduler::assign_forced(w, more, rid, AssignMode::Offer).expect("同店再塞一单该成功");
+            mine.push(more);
+        }
+
+        // 全部卡在等餐段：这是凑单通道唯一认的状态。
+        for oid in mine {
+            let h = w
+                .rider_mut(rid)
+                .expect("骑手在")
+                .held_mut(oid)
+                .expect("单在他手上");
+            h.phase = Phase::WaitingFood;
+            h.remaining_min = 30;
+            h.leg_total_min = 30;
+        }
+        (name, pos)
+    }
+
+    /// 往同一家店再挂 `n` 单（报价给足，保证越过接单门槛）。
+    fn shop_orders(w: &mut World, shop: &(String, LatLng), n: usize) -> Vec<OrderId> {
+        use crate::sim::world::CustomOrderSpec;
+        (0..n)
+            .map(|i| {
+                w.create_custom_order(CustomOrderSpec {
+                    merchant_name: shop.0.clone(),
+                    merchant_lat: shop.1.lat,
+                    merchant_lng: shop.1.lng,
+                    customer_name: None,
+                    customer_address: None,
+                    customer_lat: shop.1.lat + 0.010 + 0.001 * i as f64,
+                    customer_lng: shop.1.lng,
+                    fee_cents: Some(20_000),
+                    prep_seconds: None,
+                })
+            })
+            .collect()
+    }
+
+    /// 把决定落地，用**真实的**持单数收尾（不是断言内部计数）。
+    fn apply_all(w: &mut World, assignments: &[Assignment]) {
+        for a in assignments {
+            crate::sim::scheduler::apply_assignment(w, a);
+        }
+    }
+
+    /// 剩余容量 1、cap 2：一轮只能再加 1 单，落地后正好顶到 `max_held`。
+    ///
+    /// 修复前这里会派 2 单：`merge_riders` 判的是调用前的「2 < 3」，
+    /// `rider_load` 只数本次调用（2 ≤ cap），谁都没算「只剩 1 个位置」。
+    #[test]
+    fn remaining_room_below_the_cap_limits_the_call() {
+        let mut w = world();
+        w.set_sim_rider_count(1);
+        w.cfg.merge.wait_for_merge_min = 5;
+        w.cfg.merge.algorithm_max_per_rider = 2;
+        // 商家维度不限，免得「单店未完成单量」把候选数量先卡住，掩盖骑手侧的容量。
+        w.cfg.merge.max_active_orders_per_merchant = 0;
+        let rid = w.sim_rider_ids()[0];
+
+        let shop = rider_waiting_at_shop(&mut w, rid, 2);
+        let cands = shop_orders(&mut w, &shop, 3);
+
+        let got = batch_decide(&w, &cands, &[], &[]);
+        assert_eq!(got.len(), 1, "只剩 1 个位置，一轮只能加 1 单：{got:?}");
+        assert_eq!(got[0].rider, rid);
+
+        apply_all(&mut w, &got);
+        assert_eq!(
+            w.rider(rid).expect("骑手在").held.len(),
+            3,
+            "实际持单数不得越过 max_held"
+        );
+    }
+
+    /// 剩余容量（4）大于 cap（2）：cap 仍然是本轮的上限。
+    ///
+    /// 与上一条合起来说明「cap 和剩余容量是两个约束，取小」：不是谁替代谁。
+    #[test]
+    fn the_cap_still_binds_when_there_is_plenty_of_room() {
+        let mut w = world();
+        w.set_sim_rider_count(1);
+        w.cfg.merge.wait_for_merge_min = 5;
+        w.cfg.backorder.max_held = 5;
+        w.cfg.merge.algorithm_max_per_rider = 2;
+        w.cfg.merge.max_active_orders_per_merchant = 0;
+        let rid = w.sim_rider_ids()[0];
+
+        let shop = rider_waiting_at_shop(&mut w, rid, 1);
+        let cands = shop_orders(&mut w, &shop, 4);
+
+        let got = batch_decide(&w, &cands, &[], &[]);
+        assert_eq!(got.len(), 2, "还剩 4 个位置，但 cap 是 2：{got:?}");
+        assert!(got.iter().all(|a| a.rider == rid));
+
+        apply_all(&mut w, &got);
+        assert_eq!(w.rider(rid).expect("骑手在").held.len(), 3);
+    }
+
+    /// 剩余容量 0：一个位置都没有时，哪怕名单把骑手塞进来也不许派。
+    ///
+    /// 真人的 `accepts` 直接返回 true（不看背单上限），凑单又只被 `merge_riders`
+    /// 在调用前挡过一次，所以这里是「调用内再兜一道」的关键路径。
+    #[test]
+    fn a_rider_at_max_held_is_never_handed_another_order() {
+        let mut w = world();
+        w.cfg.merge.wait_for_merge_min = 5;
+        w.cfg.merge.algorithm_max_per_rider = 2;
+        let hid = w.spawn_human_rider("阿甘");
+        w.rider_mut(hid).expect("骑手在").online = true;
+
+        let shop = rider_waiting_at_shop(&mut w, hid, 3);
+        assert_eq!(
+            w.rider(hid).expect("骑手在").held.len(),
+            w.cfg.backorder.max_held as usize,
+            "前提：这个人已经背满"
+        );
+        let cands = shop_orders(&mut w, &shop, 2);
+
+        // 两个名单都故意把他塞进去：容量守卫必须自己挡住。
+        let got = batch_decide(&w, &cands, &[hid], &[hid]);
+        assert!(got.is_empty(), "背满了还派单就是越界：{got:?}");
+        assert_eq!(
+            w.rider(hid).expect("骑手在").held.len(),
+            w.cfg.backorder.max_held as usize,
+            "持单数不变"
+        );
+    }
+
+    /// 多笔候选：前面成功分配吃掉的容量，后面的候选必须立刻看到。
+    ///
+    /// 剩 2 个位置、cap 3、4 笔候选 → 只能出 2 单。若只看 cap（3）就会派出 5 单。
+    #[test]
+    fn later_candidates_see_the_room_taken_by_earlier_ones() {
+        let mut w = world();
+        w.set_sim_rider_count(1);
+        w.cfg.merge.wait_for_merge_min = 5;
+        w.cfg.backorder.max_held = 4;
+        w.cfg.merge.algorithm_max_per_rider = 3;
+        // 商家维度不限：否则默认的单店 2 单会提前挡下第 3 笔，测不到骑手容量。
+        w.cfg.merge.max_active_orders_per_merchant = 0;
+        let rid = w.sim_rider_ids()[0];
+
+        let shop = rider_waiting_at_shop(&mut w, rid, 2);
+        let cands = shop_orders(&mut w, &shop, 4);
+
+        let got = batch_decide(&w, &cands, &[], &[]);
+        assert_eq!(got.len(), 2, "剩 2 个位置，第 3 笔必须被挡下：{got:?}");
+        let mut orders: Vec<OrderId> = got.iter().map(|a| a.order).collect();
+        orders.sort_unstable();
+        orders.dedup();
+        assert_eq!(orders.len(), 2, "同一单不许重复派");
+
+        apply_all(&mut w, &got);
+        assert_eq!(w.rider(rid).expect("骑手在").held.len(), 4);
+    }
+
+    /// 正常凑单不回归：还有位置时，同店订单照旧能并进来。
+    #[test]
+    fn a_merge_still_goes_through_when_there_is_room() {
+        let mut w = world();
+        w.set_sim_rider_count(1);
+        w.cfg.merge.wait_for_merge_min = 5;
+        let rid = w.sim_rider_ids()[0];
+
+        let shop = rider_waiting_at_shop(&mut w, rid, 1);
+        let cands = shop_orders(&mut w, &shop, 2);
+
+        let got = batch_decide(&w, &cands, &[], &[]);
+        assert_eq!(got.len(), 1, "cap 默认 1，凑单照旧成立：{got:?}");
+        assert_eq!(
+            (got[0].rider, got[0].source),
+            (rid, DecisionSource::Algorithm)
+        );
+
+        apply_all(&mut w, &got);
+        assert_eq!(w.rider(rid).expect("骑手在").held.len(), 2);
+    }
+
+    /// 一个人满了不影响别人：容量是按骑手各算各的。
+    #[test]
+    fn a_rider_at_capacity_does_not_block_the_others() {
+        let mut w = world();
+        w.cfg.merge.wait_for_merge_min = 5;
+        w.cfg.merge.max_active_orders_per_merchant = 0;
+        w.set_sim_rider_count(2);
+        let ids = w.sim_rider_ids();
+        let (busy, free) = (ids[0], ids[1]);
+
+        // busy 已持 2 单（剩 1），free 空手（剩 3）。
+        let shop = rider_waiting_at_shop(&mut w, busy, 2);
+        let cands = shop_orders(&mut w, &shop, 3);
+
+        let got = batch_decide(&w, &cands, &[free], &[]);
+        let got_busy: Vec<_> = got.iter().filter(|a| a.rider == busy).collect();
+        let got_free: Vec<_> = got.iter().filter(|a| a.rider == free).collect();
+        assert_eq!(got_busy.len(), 1, "busy 只剩 1 个位置：{got:?}");
+        assert_eq!(got_free.len(), 1, "free 该拿到另一单：{got:?}");
+        assert_ne!(got_busy[0].order, got_free[0].order);
+
+        apply_all(&mut w, &got);
+        assert_eq!(w.rider(busy).expect("骑手在").held.len(), 3);
+        assert_eq!(w.rider(free).expect("骑手在").held.len(), 1);
     }
 
     /// 算法每骑手上限可配：调到 2 时同一个骑手能一次吃下两单。
@@ -837,9 +1637,249 @@ mod tests {
 
         let pending = w.pending_orders();
         let rid = w.sim_rider_ids()[0];
-        let res = batch_decide(&w, &pending, &[rid]);
+        let res = batch_decide(&w, &pending, &[rid], &[]);
         assert_eq!(res.len(), 2, "上限 2 时该给这一个骑手派两单");
         assert!(res.iter().all(|a| a.rider == rid));
+    }
+
+    /// 只带接单意图的 LLM 计划（其余字段留默认）。
+    fn claim_plan(claims: &[(RiderId, OrderId)]) -> LlmPlan {
+        LlmPlan {
+            assignments: claims
+                .iter()
+                .map(|(r, o)| LlmAssign {
+                    rider_id: crate::sim::rider_key(*r),
+                    order_id: *o,
+                    reason: "测试".into(),
+                })
+                .collect(),
+            model: "test".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 生产路径上真实的名册（`tick::ai_roster` 的输出）。
+    ///
+    /// 用它而不是手搓 `vec![rid]`，是为了让测试走**同一条**名单：漏点正在于
+    /// `ai_roster` 只按 `is_free`（手上有单没有）收人，不问「还有没有位置」。
+    fn roster(w: &World) -> Vec<RiderId> {
+        crate::sim::tick::ai_roster(w, &crate::sim::tick::TickInput::default())
+    }
+
+    /// 按 `cap_rider` 的写法下一条背单上限：**必须同时盖时间戳**。
+    ///
+    /// 只写 `cap_override` 不给 `set_at_elapsed`，下一 tick 会被 `expire_policies`
+    /// 当成「缺字段的老存档」清掉（`world.rs:710-716`），测试就会测到另一件事。
+    fn set_cap(w: &mut World, rid: RiderId, cap: u32) {
+        let set_at_min = w.sim_minute as u64;
+        let set_at_elapsed = w.elapsed_min;
+        if let Some(r) = w.rider_mut(rid) {
+            r.policy_override.cap_override = Some(cap);
+            r.policy_override.set_at_min = set_at_min;
+            r.policy_override.set_at_elapsed = Some(set_at_elapsed);
+        }
+    }
+
+    /// 零容量：`cap_rider: 0` = 只把手上的送完、不再接新单。
+    ///
+    /// 这个人手上是空的，所以 `is_free` 为真、会进 `ai_roster`——LLM 直派曾经
+    /// 是唯一能绕开这个语义的入口（`accepts` / `try_claim` 都按容量拦着）。
+    #[test]
+    fn a_zero_cap_rider_cannot_be_claimed_by_the_llm() {
+        let mut w = world();
+        w.set_sim_rider_count(1);
+        let rid = w.sim_rider_ids()[0];
+        w.rider_mut(rid).unwrap().online = true;
+        set_cap(&mut w, rid, 0);
+        w.generate_order_batch(1);
+        let oid = w.pending_orders()[0];
+
+        assert_eq!(
+            w.rider(rid).unwrap().effective_max_held(&w.cfg),
+            0,
+            "前提：站长把上限压到 0"
+        );
+        let idle = roster(&w);
+        assert!(
+            idle.contains(&rid),
+            "前提：手上没单 ⇒ 名单照样收他，这正是漏点"
+        );
+
+        let v = validate_llm_plan(&w, &claim_plan(&[(rid, oid)]), &idle, &w.pending_orders());
+        assert!(
+            v.assignments.is_empty(),
+            "cap = 0 的人不该再接到新单：{:?}",
+            v.assignments
+        );
+        assert!(v.covered.is_empty(), "没落地的意图不能算进 covered");
+        assert_eq!(v.dropped(), 1);
+        assert_eq!(v.drops[0].reason, DropReason::RiderNotEligible);
+        assert_eq!(v.drops[0].reason.as_str(), "rider_not_eligible");
+        assert_eq!((v.drops[0].rider, v.drops[0].order), (Some(rid), Some(oid)));
+        assert_eq!(v.drops[0].layer, IntentLayer::Act);
+        assert_eq!(summarize_drops(&v.drops), "（rider_not_eligible×1）");
+    }
+
+    /// 还有位置时正常放行：容量守卫不是「一律不许 LLM 派单」。
+    #[test]
+    fn an_llm_claim_still_passes_while_there_is_room() {
+        let mut w = world();
+        w.set_sim_rider_count(1);
+        let rid = w.sim_rider_ids()[0];
+        w.rider_mut(rid).unwrap().online = true;
+        w.generate_order_batch(1);
+        let oid = w.pending_orders()[0];
+        assert!(
+            w.rider(rid).unwrap().effective_max_held(&w.cfg) > 0,
+            "前提：默认上限 > 0"
+        );
+
+        let idle = roster(&w);
+        let v = validate_llm_plan(&w, &claim_plan(&[(rid, oid)]), &idle, &w.pending_orders());
+        assert!(v.drops.is_empty(), "有位置不该丢：{:?}", v.drops);
+        assert_eq!(v.assignments.len(), 1);
+        assert_eq!((v.assignments[0].rider, v.assignments[0].order), (rid, oid));
+        assert_eq!(v.assignments[0].source, DecisionSource::Llm);
+        assert_eq!(v.covered, vec![rid]);
+    }
+
+    /// 满载拒绝：持单数已经顶到有效容量，新 claim 不得落地。
+    #[test]
+    fn a_full_rider_cannot_be_topped_up_by_the_llm() {
+        let mut w = world();
+        w.set_sim_rider_count(1);
+        let rid = w.sim_rider_ids()[0];
+        w.rider_mut(rid).unwrap().online = true;
+        let shop = rider_waiting_at_shop(&mut w, rid, 3);
+        let extra = shop_orders(&mut w, &shop, 1)[0];
+
+        let full = w.rider(rid).unwrap().effective_max_held(&w.cfg) as usize;
+        assert_eq!(w.rider(rid).unwrap().held.len(), full, "前提：已背满");
+        assert!(
+            !w.rider(rid).unwrap().is_free(w.elapsed_min, &w.cfg),
+            "背满的人其实进不了名单"
+        );
+
+        // 名单本该不含他；就算被塞进来，容量守卫也得挡住。
+        let v = validate_llm_plan(
+            &w,
+            &claim_plan(&[(rid, extra)]),
+            &[rid],
+            &w.pending_orders(),
+        );
+        assert!(
+            v.assignments.is_empty(),
+            "背满了还派单就是越界：{:?}",
+            v.assignments
+        );
+        assert_eq!(v.drops[0].reason, DropReason::RiderNotEligible);
+        assert_eq!(w.rider(rid).unwrap().held.len(), full, "校验不该动世界");
+    }
+
+    /// 混合计划隔离：一个人因容量被丢，不该连累同一份计划里的其他人。
+    #[test]
+    fn one_capped_rider_does_not_poison_the_rest_of_the_plan() {
+        let mut w = world();
+        w.set_sim_rider_count(2);
+        let ids = w.sim_rider_ids();
+        let (capped, normal) = (ids[0], ids[1]);
+        for r in [capped, normal] {
+            w.rider_mut(r).unwrap().online = true;
+        }
+        set_cap(&mut w, capped, 0);
+        let pending = w.generate_order_batch(2);
+
+        let idle = roster(&w);
+        assert!(idle.contains(&capped), "cap = 0 但手上空 ⇒ 仍在名单里");
+        assert!(idle.contains(&normal));
+
+        let v = validate_llm_plan(
+            &w,
+            &claim_plan(&[(capped, pending[0]), (normal, pending[1])]),
+            &idle,
+            &w.pending_orders(),
+        );
+        assert_eq!(v.assignments.len(), 1, "只该丢超容量那一条：{:?}", v.drops);
+        assert_eq!(
+            (v.assignments[0].rider, v.assignments[0].order),
+            (normal, pending[1])
+        );
+        assert_eq!(v.covered, vec![normal], "被丢的人不该算进 covered");
+        assert_eq!(v.dropped(), 1);
+        assert_eq!(v.drops[0].rider, Some(capped));
+        assert_eq!(v.drops[0].reason, DropReason::RiderNotEligible);
+    }
+
+    /// 覆盖值大于配置上限：配置上限才是天花板（不能因为覆盖写了 9 就有 9 个位置）。
+    #[test]
+    fn the_config_ceiling_caps_what_the_override_can_hand_out() {
+        let mut w = world();
+        w.set_sim_rider_count(1);
+        w.cfg.backorder.max_held = 3;
+        let rid = w.sim_rider_ids()[0];
+        w.rider_mut(rid).unwrap().online = true;
+        set_cap(&mut w, rid, 9);
+        assert_eq!(
+            w.rider(rid).unwrap().effective_max_held(&w.cfg),
+            3,
+            "覆盖不能突破配置上限"
+        );
+
+        let shop = rider_waiting_at_shop(&mut w, rid, 3);
+        let extra = shop_orders(&mut w, &shop, 1)[0];
+        let v = validate_llm_plan(
+            &w,
+            &claim_plan(&[(rid, extra)]),
+            &[rid],
+            &w.pending_orders(),
+        );
+        assert!(
+            v.assignments.is_empty(),
+            "覆盖写着 9，但配置只给 3：{:?}",
+            v.assignments
+        );
+        assert_eq!(v.drops[0].reason, DropReason::RiderNotEligible);
+    }
+
+    /// 覆盖值小于配置上限：覆盖值生效（`cap_override = 1` 时第 2 单就进不来）。
+    #[test]
+    fn the_override_reduces_the_room_the_llm_can_use() {
+        let mut w = world();
+        w.set_sim_rider_count(2);
+        let ids = w.sim_rider_ids();
+        let (full, free) = (ids[0], ids[1]);
+        for r in [full, free] {
+            w.rider_mut(r).unwrap().online = true;
+            set_cap(&mut w, r, 1);
+        }
+        assert_eq!(w.rider(full).unwrap().effective_max_held(&w.cfg), 1);
+
+        let shop = rider_waiting_at_shop(&mut w, full, 1);
+        let extra = shop_orders(&mut w, &shop, 1)[0];
+        let other = w.generate_order_batch(1)[0];
+
+        let mut idle = roster(&w);
+        idle.push(full); // 名单本该不含他（手上有单），故意塞进来
+        let v = validate_llm_plan(
+            &w,
+            &claim_plan(&[(full, extra), (free, other)]),
+            &idle,
+            &w.pending_orders(),
+        );
+        assert_eq!(
+            v.assignments.len(),
+            1,
+            "满了的那条该丢、空手的那条该过：{:?}",
+            v.drops
+        );
+        assert_eq!(
+            (v.assignments[0].rider, v.assignments[0].order),
+            (free, other)
+        );
+        assert_eq!(v.covered, vec![free]);
+        assert_eq!(v.dropped(), 1);
+        assert_eq!(v.drops[0].rider, Some(full));
+        assert_eq!(v.drops[0].reason, DropReason::RiderNotEligible);
     }
 
     /// 普通派单（算法贪心）也要尊重有效拒单记录：只绕开那一对，
@@ -865,7 +1905,7 @@ mod tests {
             reason: "太远".into(),
         }]);
 
-        let got = batch_decide(&w, &ids, &[rid]);
+        let got = batch_decide(&w, &ids, &[rid], &[]);
         assert!(
             !got.iter().any(|a| a.order == refused),
             "拒过的单不能再塞回同一个人：{got:?}"

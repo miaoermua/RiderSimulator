@@ -217,7 +217,7 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
     // 「在店门口等餐」的骑手不算空闲，但同店新单能顺手塞给他们（凑单窗口）。
     // 所以不能只看 `idle`：一屋子人全在等餐时这里要是提前 return，
     // 凑单就永远不会发生——而那正是这套机制要覆盖的场面。
-    let merging = ai::merge_riders(world);
+    let merging = ai::merge_riders(world, &input.hosted_humans);
     if pending.is_empty() || (idle.is_empty() && merging.is_empty()) {
         world.llm_plan = None;
         return;
@@ -242,11 +242,15 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
             if verdict.assignments.is_empty() && verdict.refusals.is_empty() {
                 world.stats.llm_fallbacks += 1;
                 (
-                    ai::batch_decide(world, &pending, &idle),
+                    ai::batch_decide(world, &pending, &idle, &input.hosted_humans),
                     DecisionSource::AlgorithmFallback,
                     "rider",
                     0,
-                    format!("LLM（{}）输出全部被丢弃，算法兜底", p.model),
+                    format!(
+                        "LLM（{}）输出全部被丢弃{}，算法兜底",
+                        p.model,
+                        ai::summarize_drops(&verdict.drops)
+                    ),
                     false,
                 )
             } else {
@@ -269,25 +273,30 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
 
                 let claims = verdict.assignments.len();
                 let refused = verdict.refusals.len();
+                // 丢弃数/原因要在 `assignments` 被移走前取出来。
+                let dropped_n = verdict.dropped();
+                let drop_summary = ai::summarize_drops(&verdict.drops);
                 let mut all = verdict.assignments;
-                let filled = ai::batch_decide(world, &open_orders, &fill_riders);
+                let filled =
+                    ai::batch_decide(world, &open_orders, &fill_riders, &input.hosted_humans);
                 let filled_n = filled.len();
                 all.extend(filled);
                 let note = format!(
-                    "LLM（{}）{}ms：{} 条接单、{} 条拒/观望，算法补位 {} 条（覆盖 {} 人），丢弃 {} 条",
+                    "LLM（{}）{}ms：{} 条接单、{} 条拒/观望，算法补位 {} 条（覆盖 {} 人），丢弃 {} 条{}",
                     p.model,
                     p.latency_ms,
                     claims,
                     refused,
                     filled_n,
                     verdict.covered.len(),
-                    verdict.dropped
+                    dropped_n,
+                    drop_summary
                 );
                 (all, DecisionSource::Llm, "rider", p.decision_id, note, true)
             }
         }
         _ => (
-            ai::batch_decide(world, &pending, &idle),
+            ai::batch_decide(world, &pending, &idle, &input.hosted_humans),
             DecisionSource::Algorithm,
             "algorithm",
             0,
@@ -1437,6 +1446,584 @@ mod tests {
             w.rider(rid).unwrap().held_ids().contains(&oid),
             "LLM 明确接下的单必须归他"
         );
+    }
+
+    /// 在某家店门口再造一单：同店、报价给足，确保凑单窗口与接单门槛都不挡它。
+    fn order_at(w: &mut World, merchant_name: &str, at: LatLng, drop_offset_deg: f64) -> OrderId {
+        use crate::sim::world::CustomOrderSpec;
+        w.create_custom_order(CustomOrderSpec {
+            merchant_name: merchant_name.to_string(),
+            merchant_lat: at.lat,
+            merchant_lng: at.lng,
+            customer_name: None,
+            customer_address: None,
+            customer_lat: at.lat + drop_offset_deg,
+            customer_lng: at.lng,
+            fee_cents: Some(20_000),
+            prep_seconds: None,
+        })
+    }
+
+    /// 把某个骑手手上的订单按到「到店等餐」：这是凑单通道唯一认的状态。
+    fn wait_food(w: &mut World, rid: RiderId, oid: OrderId, remaining_min: u32) {
+        let h = w
+            .rider_mut(rid)
+            .unwrap()
+            .held_mut(oid)
+            .expect("该单在他手上");
+        h.phase = Phase::WaitingFood;
+        h.remaining_min = remaining_min;
+        h.leg_total_min = remaining_min;
+    }
+
+    /// 重复分配的定点验证：A 已经有一单（在店等餐、离 `max_held` 还有余量），
+    /// 同一轮里 LLM 让他接 B，同店还有 C。分别记录三层约束各自管到哪：
+    /// `covered`（LLM 这一轮点过谁）、`per_rider_cap`（一次算法调用给一个人几单）、
+    /// `max_held`（他手上最多压几单）。
+    ///
+    /// 结论按当前实现记录，不预设「一定是 bug」。
+    #[test]
+    fn an_llm_claim_on_a_busy_rider_does_not_stack_a_second_order_in_one_round() {
+        use crate::sim::order::AssignMode;
+
+        let cfg = SimConfig {
+            // 需要一个空闲骑手，否则 `run_ai` 直接跳过 LLM 分支。
+            sim_rider_count: 1,
+            llm_brain_enabled: true,
+            order_spawn_interval_min: 10_000,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 5);
+        w.cfg.merge.wait_for_merge_min = 5;
+        for r in &mut w.riders {
+            r.strategy.accept_threshold_cents_hour = 0;
+        }
+        let idle_sim = w.sim_rider_ids()[0];
+
+        // AutoPilot 托管的真人：掉线被接管，但身体还在线（算法视角）。
+        let a = w.spawn_human_rider("阿甘");
+        w.rider_mut(a).unwrap().online = true;
+
+        w.generate_order_batch(1);
+        let x = w.pending_orders()[0];
+        scheduler::assign_forced(&mut w, x, a, AssignMode::Offer).expect("先塞一单给真人");
+        let (shop_name, shop) = {
+            let o = w.order(x).unwrap();
+            (o.merchant_name.clone(), o.merchant_pos())
+        };
+        wait_food(&mut w, a, x, 30);
+
+        // 同店再来两单：B 是 LLM 想给他的，C 是纯粹的凑单候选。
+        let b = order_at(&mut w, &shop_name, shop, 0.010);
+        let c = order_at(&mut w, &shop_name, shop, 0.012);
+
+        let plan = LlmPlan {
+            assignments: vec![ai::LlmAssign {
+                rider_id: format!("r{a}"),
+                order_id: b,
+                reason: "同店顺手".into(),
+            }],
+            refusals: Vec::new(),
+            covered: Vec::new(),
+            model: "gpt-4o-mini".into(),
+            latency_ms: 80,
+            note: String::new(),
+            decision_id: 9,
+        };
+        let evs = tick(
+            &mut w,
+            TickInput {
+                llm_plan: Some(plan),
+                hosted_humans: vec![a],
+                ..Default::default()
+            },
+        );
+
+        let Some(SimEvent::AiDecision {
+            source,
+            assignments,
+            note,
+            ..
+        }) = evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("这一轮必须有决策");
+        };
+
+        // 1) `max_held` 分层：他手上是 X + 本轮 1 单，没有被两条通道各塞一单。
+        let held = w.rider(a).unwrap().held_ids();
+        assert_eq!(held.len(), 2, "一轮只该加一单，实际手持 {held:?}");
+        assert!(held.contains(&x));
+        assert_eq!(
+            held.iter().filter(|o| **o == b || **o == c).count(),
+            1,
+            "B、C 只能进来一个：{held:?}"
+        );
+
+        // 2) `covered` 分层：A 手上有单 → 不在 LLM 名单里 → 这条计划拿不到入场券。
+        assert_eq!(
+            *source,
+            DecisionSource::AlgorithmFallback,
+            "整份计划被丢弃后走兜底"
+        );
+        assert_eq!(w.stats.llm_fallbacks, 1);
+        assert!(
+            note.contains("rider_not_eligible"),
+            "丢弃原因要说清是「不空闲」，而不是「重复分配」：{note}"
+        );
+        assert!(
+            !assignments.iter().any(|x| x.source == DecisionSource::Llm),
+            "被丢弃的计划不能留下 Llm 来源：{assignments:?}"
+        );
+
+        // 3) `per_rider_cap` 分层：一次算法调用里一个骑手至多一条。
+        let mut riders: Vec<RiderId> = assignments.iter().map(|x| x.rider_id).collect();
+        let n = riders.len();
+        riders.sort_unstable();
+        riders.dedup();
+        assert_eq!(riders.len(), n, "一人只能一条：{assignments:?}");
+
+        // 4) 托管真人被算法补位：来源必须是「AI 代管」，不是「LLM 亲自」。
+        let got_a: Vec<_> = assignments.iter().filter(|x| x.rider_id == a).collect();
+        assert_eq!(got_a.len(), 1, "A 本轮只该有一条：{assignments:?}");
+        assert_eq!(got_a[0].source, DecisionSource::AiHosted);
+
+        // 5) 不连坐：另一单仍有人接——空闲骑手拿走，而不是被 A 顺手吞掉。
+        assert_eq!(assignments.len(), 2, "两单都该落地：{assignments:?}");
+        assert!(
+            assignments.iter().any(|x| x.rider_id == idle_sim),
+            "A 让出来的那一单要能给别人：{assignments:?}"
+        );
+    }
+
+    /// 同一轮里 LLM 亲自点过的人，算法补位不能再碰他；但**单**照旧可以给别人。
+    ///
+    /// 关键是要让「覆盖后仍有余粮」的局面出现：店里挂着两单，凑单只能吃掉一单，
+    /// 另一单如果算法去问被覆盖的人，就是同一轮给他派了两单。
+    #[test]
+    fn a_covered_rider_is_not_topped_up_by_the_same_rounds_fill() {
+        use crate::sim::order::AssignMode;
+
+        let cfg = SimConfig {
+            sim_rider_count: 2,
+            llm_brain_enabled: true,
+            order_spawn_interval_min: 10_000,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 13);
+        w.cfg.merge.wait_for_merge_min = 5;
+        for r in &mut w.riders {
+            r.strategy.accept_threshold_cents_hour = 0;
+        }
+        let ids = w.sim_rider_ids();
+        let (free, waiting) = (ids[0], ids[1]);
+
+        w.generate_order_batch(1);
+        let x = w.pending_orders()[0];
+        scheduler::assign_forced(&mut w, x, waiting, AssignMode::Offer).expect("先塞一单给他");
+        let (shop_name, shop) = {
+            let o = w.order(x).unwrap();
+            (o.merchant_name.clone(), o.merchant_pos())
+        };
+        wait_food(&mut w, waiting, x, 30);
+
+        let b = order_at(&mut w, &shop_name, shop, 0.010);
+        let c1 = order_at(&mut w, &shop_name, shop, 0.012);
+        let c2 = order_at(&mut w, &shop_name, shop, 0.014);
+
+        let plan = LlmPlan {
+            assignments: vec![ai::LlmAssign {
+                rider_id: format!("r{free}"),
+                order_id: b,
+                reason: "他最快".into(),
+            }],
+            refusals: Vec::new(),
+            covered: Vec::new(),
+            model: "gpt-4o-mini".into(),
+            latency_ms: 60,
+            note: String::new(),
+            decision_id: 11,
+        };
+        let evs = tick(
+            &mut w,
+            TickInput {
+                llm_plan: Some(plan),
+                ..Default::default()
+            },
+        );
+
+        let Some(SimEvent::AiDecision {
+            source,
+            assignments,
+            ..
+        }) = evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("应当有决策");
+        };
+        assert_eq!(*source, DecisionSource::Llm);
+
+        let got_free = assignments
+            .iter()
+            .find(|x| x.rider_id == free)
+            .expect("LLM 点的单必须落地");
+        assert_eq!(
+            (got_free.order_id, got_free.source),
+            (b, DecisionSource::Llm)
+        );
+        assert_eq!(
+            w.rider(free).unwrap().held_ids(),
+            vec![b],
+            "被 LLM 覆盖的人这一轮不再加码——哪怕同店还有两单"
+        );
+        assert_eq!(
+            assignments.iter().filter(|x| x.rider_id == free).count(),
+            1,
+            "一人只能一条：{assignments:?}"
+        );
+
+        // 同店等餐的人按 cap=1 只吃一单，剩下一单宁可留在大厅，也不回头塞给被覆盖的人。
+        let got_waiting = assignments
+            .iter()
+            .find(|x| x.rider_id == waiting)
+            .expect("同店等餐的人应该凑到一单");
+        assert_eq!(got_waiting.source, DecisionSource::Algorithm);
+        assert!(
+            got_waiting.order_id == c1 || got_waiting.order_id == c2,
+            "C 走的是算法凑单，不是 LLM"
+        );
+        assert_eq!(assignments.len(), 2, "本轮只该有两条：{assignments:?}");
+        let leftover = if got_waiting.order_id == c1 { c2 } else { c1 };
+        assert_eq!(
+            w.order(leftover).unwrap().status,
+            OrderStatus::Pending,
+            "剩下的那单不能被塞给刚被 LLM 点过的人"
+        );
+    }
+
+    /// 边界对照：不允许**同一轮**叠单，不等于不允许**跨轮**凑单。
+    /// A 拿着 LLM 给的单到店等餐，下一轮同店再来一单，那就是正常凑单，
+    /// 来源仍是 `AiHosted`（不是 `Llm`）。
+    #[test]
+    fn a_later_round_merge_for_a_hosted_rider_is_still_normal() {
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            llm_brain_enabled: true,
+            order_spawn_interval_min: 10_000,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 17);
+        w.cfg.merge.wait_for_merge_min = 5;
+
+        let a = w.spawn_human_rider("阿甘");
+        w.rider_mut(a).unwrap().online = true;
+
+        w.generate_order_batch(1);
+        let reference = w.pending_orders()[0];
+        let (shop_name, shop) = {
+            let o = w.order(reference).unwrap();
+            (o.merchant_name.clone(), o.merchant_pos())
+        };
+        let b = order_at(&mut w, &shop_name, shop, 0.010);
+        let c = order_at(&mut w, &shop_name, shop, 0.012);
+
+        let plan = LlmPlan {
+            assignments: vec![ai::LlmAssign {
+                rider_id: format!("r{a}"),
+                order_id: b,
+                reason: "就他一人在线".into(),
+            }],
+            refusals: Vec::new(),
+            covered: Vec::new(),
+            model: "gpt-4o-mini".into(),
+            latency_ms: 70,
+            note: String::new(),
+            decision_id: 12,
+        };
+        let evs = tick(
+            &mut w,
+            TickInput {
+                llm_plan: Some(plan),
+                hosted_humans: vec![a],
+                ..Default::default()
+            },
+        );
+        let Some(SimEvent::AiDecision {
+            source,
+            assignments,
+            ..
+        }) = evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("第一轮有合法计划，必须有决策");
+        };
+        assert_eq!(*source, DecisionSource::Llm);
+        assert_eq!(assignments.len(), 1, "同一轮里 C 不跟着蹭进来");
+        assert_eq!(
+            w.rider(a).unwrap().held_ids(),
+            vec![b],
+            "第一轮只接 LLM 那一单"
+        );
+
+        // 到店等餐，同店的 C 还挂着（reference 那单换个店，免得抢镜）。
+        w.order_mut(reference).unwrap().status = OrderStatus::Cancelled;
+        wait_food(&mut w, a, b, 30);
+
+        let evs = tick(
+            &mut w,
+            TickInput {
+                hosted_humans: vec![a],
+                ..Default::default()
+            },
+        );
+        let Some(SimEvent::AiDecision {
+            source,
+            assignments,
+            note,
+            ..
+        }) = evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("凑单也是一次决策");
+        };
+        assert_eq!(*source, DecisionSource::Algorithm);
+        let got_a = assignments
+            .iter()
+            .find(|x| x.rider_id == a)
+            .unwrap_or_else(|| panic!("应该并给他：{note}"));
+        assert_eq!(got_a.order_id, c);
+        assert_eq!(
+            got_a.source,
+            DecisionSource::AiHosted,
+            "跨轮凑单是算法补位，来源不能写成 LLM"
+        );
+        assert_eq!(w.rider(a).unwrap().held_ids(), vec![b, c]);
+        let cap = w.rider(a).unwrap().effective_max_held(&w.cfg) as usize;
+        assert!(
+            w.rider(a).unwrap().held.len() <= cap,
+            "总单量仍受 max_held 约束"
+        );
+    }
+
+    /// `per_rider_cap` 管的是**一次算法调用**里给一个人几单，和 `max_held` 不是一回事：
+    /// 调成 2 时同一轮就能给他两单，这是配置允许的，不算重复分配。
+    ///
+    /// 注意这里剩余容量（3-1=2）正好等于 cap，所以三种约束在这一点上重合。
+    /// 两者并不等价：cap 大于剩余容量时当前实现会越过 `max_held`（见 2026-10-28 审查记录，
+    /// 尚未修复），这条测试只钉住「cap 放开不等于重复分配」。
+    #[test]
+    fn per_rider_cap_is_the_single_call_bound_not_max_held() {
+        use crate::sim::order::AssignMode;
+
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            order_spawn_interval_min: 10_000,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 23);
+        w.cfg.merge.wait_for_merge_min = 5;
+        w.cfg.merge.algorithm_max_per_rider = 2;
+
+        let a = w.spawn_human_rider("阿甘");
+        w.rider_mut(a).unwrap().online = true;
+
+        w.generate_order_batch(1);
+        let x = w.pending_orders()[0];
+        scheduler::assign_forced(&mut w, x, a, AssignMode::Offer).expect("先塞一单");
+        let (shop_name, shop) = {
+            let o = w.order(x).unwrap();
+            (o.merchant_name.clone(), o.merchant_pos())
+        };
+        wait_food(&mut w, a, x, 30);
+
+        let c1 = order_at(&mut w, &shop_name, shop, 0.010);
+        let c2 = order_at(&mut w, &shop_name, shop, 0.012);
+
+        let evs = tick(
+            &mut w,
+            TickInput {
+                hosted_humans: vec![a],
+                ..Default::default()
+            },
+        );
+        let Some(SimEvent::AiDecision { assignments, .. }) = evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("凑单也是一次决策");
+        };
+        assert_eq!(
+            assignments.len(),
+            2,
+            "cap=2 时一次调用能给他两单：{assignments:?}"
+        );
+        let mut got: Vec<OrderId> = assignments.iter().map(|x| x.order_id).collect();
+        got.sort_unstable();
+        let mut want = vec![c1, c2];
+        want.sort_unstable();
+        assert_eq!(got, want);
+        assert!(
+            assignments
+                .iter()
+                .all(|x| x.rider_id == a && x.source == DecisionSource::AiHosted)
+        );
+
+        // cap 与 max_held 在这一轮正好重合：1 + 2 = 3。
+        let held = w.rider(a).unwrap().held_ids();
+        assert_eq!(held.len(), 3);
+        let cap = w.rider(a).unwrap().effective_max_held(&w.cfg) as usize;
+        assert_eq!(held.len(), cap, "这一轮正好顶到 max_held");
+    }
+
+    /// 探针原样复现：托管真人已持 2 单（上限 3）、cap 2、同店还挂着两单。
+    ///
+    /// 修复前 `merge_riders` 判的是调用前的「2 < 3」、`rider_load` 只数本次调用的
+    /// 2 ≤ cap，两条候选都过得了，一轮后手持变成 4 单（越过 `max_held`）。
+    /// 现在第一次分配就把剩余容量用光，第二轮候选必须被挡。
+    #[test]
+    fn a_single_round_never_pushes_a_hosted_rider_past_max_held() {
+        use crate::sim::order::AssignMode;
+
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            order_spawn_interval_min: 10_000,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 29);
+        w.cfg.merge.wait_for_merge_min = 5;
+        w.cfg.merge.algorithm_max_per_rider = 2;
+
+        let a = w.spawn_human_rider("阿甘");
+        w.rider_mut(a).unwrap().online = true;
+
+        w.generate_order_batch(1);
+        let x1 = w.pending_orders()[0];
+        scheduler::assign_forced(&mut w, x1, a, AssignMode::Offer).expect("先塞一单");
+        let (shop_name, shop) = {
+            let o = w.order(x1).unwrap();
+            (o.merchant_name.clone(), o.merchant_pos())
+        };
+        wait_food(&mut w, a, x1, 30);
+
+        let x2 = order_at(&mut w, &shop_name, shop, 0.008);
+        scheduler::assign_forced(&mut w, x2, a, AssignMode::Offer).expect("再塞一单");
+        wait_food(&mut w, a, x2, 30);
+        assert_eq!(
+            w.rider(a).unwrap().held.len(),
+            2,
+            "前提：手上两单，还剩 1 个位置"
+        );
+
+        let c1 = order_at(&mut w, &shop_name, shop, 0.010);
+        let c2 = order_at(&mut w, &shop_name, shop, 0.012);
+
+        let evs = tick(
+            &mut w,
+            TickInput {
+                hosted_humans: vec![a],
+                ..Default::default()
+            },
+        );
+        let Some(SimEvent::AiDecision { assignments, .. }) = evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("凑单也是一次决策");
+        };
+        assert_eq!(assignments.len(), 1, "只剩 1 个位置：{assignments:?}");
+        assert_eq!(assignments[0].rider_id, a);
+        assert!(
+            assignments[0].order_id == c1 || assignments[0].order_id == c2,
+            "接的是同店那一单"
+        );
+
+        let held = w.rider(a).unwrap().held_ids();
+        assert_eq!(
+            held.len(),
+            w.rider(a).unwrap().effective_max_held(&w.cfg) as usize,
+            "实际持单数必须停在 max_held 上：{held:?}"
+        );
+    }
+
+    /// 零容量（`cap_rider: 0` = 只把手上的送完）的骑手，LLM 直派也不能再塞新单。
+    ///
+    /// 与 `ai.rs` 里校验层的单测互补：这里跑真实 tick，看的是**最终有没有落地**。
+    /// 这个人手上是空的，所以仍在 `ai_roster` 名单里——名单只按「手上有单没有」收人。
+    #[test]
+    fn a_zero_cap_rider_gets_no_order_from_a_real_round() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            llm_brain_enabled: true,
+            order_spawn_interval_min: 10_000,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 31);
+        for r in &mut w.riders {
+            r.strategy.accept_threshold_cents_hour = 0;
+        }
+        let a = w.spawn_human_rider("阿甘");
+        w.rider_mut(a).unwrap().online = true;
+        // 站长把上限压到 0：只把手上的送完，不再接新单。按 `cap_rider` 的写法
+        // 一起盖时间戳，否则下一 tick 会被 `expire_policies` 当老存档清掉。
+        {
+            let set_at_elapsed = w.elapsed_min;
+            let set_at_min = w.sim_minute as u64;
+            let r = w.rider_mut(a).unwrap();
+            r.policy_override.cap_override = Some(0);
+            r.policy_override.set_at_min = set_at_min;
+            r.policy_override.set_at_elapsed = Some(set_at_elapsed);
+        }
+        assert_eq!(w.rider(a).unwrap().effective_max_held(&w.cfg), 0, "前提");
+
+        w.generate_order_batch(1);
+        let oid = w.pending_orders()[0];
+        let other = w.sim_rider_ids()[0];
+
+        let plan = LlmPlan {
+            assignments: vec![ai::LlmAssign {
+                rider_id: format!("r{a}"),
+                order_id: oid,
+                reason: "就他一人在线".into(),
+            }],
+            model: "gpt-4o-mini".into(),
+            latency_ms: 50,
+            decision_id: 21,
+            ..Default::default()
+        };
+        let evs = tick(
+            &mut w,
+            TickInput {
+                llm_plan: Some(plan),
+                hosted_humans: vec![a],
+                ..Default::default()
+            },
+        );
+
+        let Some(SimEvent::AiDecision {
+            source,
+            assignments,
+            note,
+            ..
+        }) = evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("另一单会有兜底派单，必须有决策事件");
+        };
+        assert_eq!(*source, DecisionSource::AlgorithmFallback);
+        assert!(
+            note.contains("rider_not_eligible"),
+            "丢弃原因要说清是「不可派」而不是别的原因：{note}"
+        );
+        assert!(
+            !assignments.iter().any(|x| x.rider_id == a),
+            "cap = 0 的人一条都不该有：{assignments:?}"
+        );
+        assert!(w.rider(a).unwrap().held.is_empty(), "实际持单数必须是 0");
+        assert_eq!(w.stats.llm_fallbacks, 1);
+
+        // 单没被浪费：给到了还有位置的骑手。
+        let got = assignments
+            .iter()
+            .find(|x| x.order_id == oid)
+            .unwrap_or_else(|| panic!("这一单该由别人接：{assignments:?}"));
+        assert_eq!(got.rider_id, other);
+        assert_eq!(
+            got.source,
+            DecisionSource::Algorithm,
+            "兜底派单的条目来源是「算法」，整轮来源才是「兜底」"
+        );
+        assert_eq!(w.rider(other).unwrap().held_ids(), vec![oid]);
     }
 
     /// LLM 输出全是垃圾：一条都不能落地，来源必须标成「算法兜底」而非 LLM。

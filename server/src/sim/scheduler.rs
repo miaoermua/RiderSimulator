@@ -114,6 +114,12 @@ impl ClaimError {
 }
 
 /// 骑手能不能接这个单（只读检查）。
+///
+/// 这是「骑手主动要一张新单」的公共闸门，调用方只有两个：大厅抢单
+/// [`try_claim`] 与顺路背单 [`claim_extra`]（后者在自己查过一遍容量之后还会
+/// 再调一次，兜住「手上没单、直接走普通抢单」那条分支）。
+/// 人工调度（[`assign_forced`] / [`reassign`]）不走这里——它们的放行规则不同，
+/// 各自在函数内单独判定。
 pub fn check_claimable(
     world: &World,
     order_id: OrderId,
@@ -143,7 +149,21 @@ pub fn check_claimable(
     if !economy::can_claim_tier(&world.cfg, rider.rating, order.tier) {
         return Err(ClaimError::RatingTooLow);
     }
-    if rider.reached_daily_cap(&world.cfg) {
+    // 「背不动了」有两个互不相干的理由，共用同一个错误码：
+    // - `reached_daily_cap` 数的是当天**已完成**的单量（`rider.rs:577`）；
+    // - 这里比的是手上**还没送完**的单量与当前有效背单上限。
+    //   后者曾经只在 `assign_forced` / `reassign` / `claim_extra` / `rescue_nearest`
+    //   和 AI 那两条通道里查，大厅抢单漏了——满员骑手能从大厅再抢一单，
+    //   `cap = 0`（只把手上的送完）的人也照样能抢。
+    //
+    // 复用 `effective_max_held`：策略覆盖（`cap_override`，含 0）与配置硬上限
+    // 取小已在那里算好。`held.len() >= 上限` 就拒，所以上限为 0 时即使手上
+    // 一单没有也接不了新单——这正是 `cap = 0` 的语义。
+    // 放在最后：前面的离线 / 冻结 / 受伤 / 评分错码是调用方已经依赖的既有结果，
+    // 新判定只在这四条都不成立时才可能出现。
+    if rider.reached_daily_cap(&world.cfg)
+        || rider.held.len() as u32 >= rider.effective_max_held(&world.cfg)
+    {
         return Err(ClaimError::HeldLimitReached);
     }
     Ok(())
@@ -1121,6 +1141,172 @@ mod tests {
         let oid = w.generate_order_batch(1)[0];
         assign_forced(&mut w, oid, rid, AssignMode::Offer).expect("能强制指派");
         (w, rid, oid)
+    }
+
+    /// 造一个只有一个模拟骑手、且他没背单的世界。
+    fn one_rider(seed: u64) -> (World, RiderId) {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            ..Default::default()
+        };
+        let w = World::new_for_test(cfg, seed);
+        let rid = w.sim_rider_ids()[0];
+        (w, rid)
+    }
+
+    /// 让骑手先背上 `n` 单：走真实的强制指派入口（它自己也查容量，所以只能塞到上限内）。
+    fn hold_orders(w: &mut World, rid: RiderId, n: usize) -> Vec<OrderId> {
+        (0..n)
+            .map(|_| {
+                let oid = w.generate_order_batch(1)[0];
+                assign_forced(w, oid, rid, AssignMode::Offer).expect("上限以内该塞得进");
+                oid
+            })
+            .collect()
+    }
+
+    /// 按 `cap_rider` 的写法下一条背单上限：**必须同时盖时间戳**。
+    /// 只写 `cap_override` 不给 `set_at_elapsed`，跑过一轮 tick 后会被
+    /// `expire_policies` 当成「缺字段的老存档」清掉（`world.rs:710-716`）。
+    fn set_cap(w: &mut World, rid: RiderId, cap: u32) {
+        let set_at_min = w.sim_minute as u64;
+        let set_at_elapsed = w.elapsed_min;
+        let r = w.rider_mut(rid).expect("骑手在");
+        r.policy_override.cap_override = Some(cap);
+        r.policy_override.set_at_min = set_at_min;
+        r.policy_override.set_at_elapsed = Some(set_at_elapsed);
+    }
+
+    /// 大厅抢单：还有位置就该成功。
+    ///
+    /// 这条是护栏——容量判定不能把正常抢单一起挡掉。
+    #[test]
+    fn a_hall_claim_goes_through_while_there_is_room() {
+        let (mut w, rid) = one_rider(7);
+        hold_orders(&mut w, rid, 2);
+        let oid = w.generate_order_batch(1)[0];
+        assert_eq!(
+            w.rider(rid).expect("骑手在").effective_max_held(&w.cfg),
+            3,
+            "前提：默认上限 3"
+        );
+
+        try_claim(&mut w, oid, rid).expect("第 3 单在容量之内");
+
+        let r = w.rider(rid).expect("骑手在");
+        assert_eq!(r.held.len(), 3);
+        assert!(r.is_holding(oid), "新单要真的挂上去");
+        assert_eq!(
+            w.order(oid).expect("订单在").assigned_to,
+            Some(rid),
+            "订单也要指向这个骑手"
+        );
+    }
+
+    /// 满载：手上已有 `effective_max_held` 单，不能再从大厅抢。
+    ///
+    /// 修复前这条会成功（`check_claimable` 只查日单量），持单数变成 4。
+    /// 这里一并验证「被拒之后世界没有被改了一半」。
+    #[test]
+    fn a_hall_claim_is_refused_when_the_rider_is_full() {
+        let (mut w, rid) = one_rider(11);
+        hold_orders(&mut w, rid, 3);
+        let oid = w.generate_order_batch(1)[0];
+
+        let (held_before, pending_before, claims_before) = {
+            let r = w.rider(rid).expect("骑手在");
+            assert_eq!(r.held.len(), 3, "前提：已背满");
+            (r.held_ids(), r.assign_pending, w.stats.claims)
+        };
+
+        let err = try_claim(&mut w, oid, rid).expect_err("满员不该再抢到单");
+        assert_eq!(err, ClaimError::HeldLimitReached, "要复用既有的容量错误");
+        assert_eq!(err.code(), "HELD_LIMIT_REACHED");
+
+        let r = w.rider(rid).expect("骑手在");
+        assert_eq!(r.held_ids(), held_before, "持单数不能变");
+        assert_eq!(r.assign_pending, pending_before, "不该多挂一个待确认");
+        let o = w.order(oid).expect("订单在");
+        assert_eq!(o.status, OrderStatus::Pending, "单还得留在大厅");
+        assert_eq!(o.assigned_to, None, "不能留下半截归属");
+        assert!(!o.forced, "抢单失败不该带强制标记");
+        assert_eq!(w.stats.claims, claims_before, "统计也不该动");
+    }
+
+    /// `cap = 0` = 只把手上的送完，不再接新单：手上空着也接不了。
+    ///
+    /// 修复前能抢到：`is_free` 为真（只看手上有没有单），日单量也管不着。
+    /// 顺带覆盖共用这道闸门的顺路背单（`claim_extra` 空手分支会转调 `try_claim`）。
+    #[test]
+    fn a_zero_cap_rider_cannot_claim_even_with_empty_hands() {
+        let (mut w, rid) = one_rider(13);
+        set_cap(&mut w, rid, 0);
+        let o1 = w.generate_order_batch(1)[0];
+        let o2 = w.generate_order_batch(1)[0];
+
+        {
+            let r = w.rider(rid).expect("骑手在");
+            assert!(r.held.is_empty(), "前提：手上是空的");
+            assert!(
+                r.is_free(w.elapsed_min, &w.cfg),
+                "前提：`is_free` 为真，正是漏掉的那条判据"
+            );
+            assert_eq!(r.effective_max_held(&w.cfg), 0, "前提：有效容量 0");
+        }
+
+        assert_eq!(
+            try_claim(&mut w, o1, rid).expect_err("零容量不该接新单"),
+            ClaimError::HeldLimitReached
+        );
+        assert_eq!(
+            claim_extra(&mut w, o2, rid).expect_err("顺路背单走同一道闸门"),
+            ClaimError::HeldLimitReached
+        );
+
+        assert!(w.rider(rid).expect("骑手在").held.is_empty());
+        assert_eq!(w.order(o1).expect("订单在").status, OrderStatus::Pending);
+        assert_eq!(w.order(o2).expect("订单在").status, OrderStatus::Pending);
+    }
+
+    /// 覆盖值低于配置上限：以覆盖值为准（`max_held = 3`，背上 1 单就抢不动）。
+    #[test]
+    fn a_lower_override_is_the_binding_limit_for_hall_claims() {
+        let (mut w, rid) = one_rider(17);
+        set_cap(&mut w, rid, 1);
+        hold_orders(&mut w, rid, 1);
+        let oid = w.generate_order_batch(1)[0];
+        assert_eq!(
+            w.rider(rid).expect("骑手在").effective_max_held(&w.cfg),
+            1,
+            "前提：覆盖值压过了配置的 3"
+        );
+
+        assert_eq!(
+            try_claim(&mut w, oid, rid).expect_err("1 单就顶到覆盖值了"),
+            ClaimError::HeldLimitReached
+        );
+        assert_eq!(w.rider(rid).expect("骑手在").held.len(), 1);
+    }
+
+    /// 覆盖值高于配置上限：不得突破硬上限（写 9 也只有 3 个位置）。
+    #[test]
+    fn a_higher_override_cannot_break_the_hard_ceiling() {
+        let (mut w, rid) = one_rider(19);
+        w.cfg.backorder.max_held = 3;
+        set_cap(&mut w, rid, 9);
+        hold_orders(&mut w, rid, 3);
+        let oid = w.generate_order_batch(1)[0];
+        assert_eq!(
+            w.rider(rid).expect("骑手在").effective_max_held(&w.cfg),
+            3,
+            "前提：覆盖不能突破配置上限"
+        );
+
+        assert_eq!(
+            try_claim(&mut w, oid, rid).expect_err("覆盖 9 不等于有 9 个位置"),
+            ClaimError::HeldLimitReached
+        );
+        assert_eq!(w.rider(rid).expect("骑手在").held.len(), 3);
     }
 
     /// 救单可以推翻角色的拒绝，但必须**写明是强制兜底**，不能伪装成普通派单。

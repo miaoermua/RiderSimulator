@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::sim::{
     OrderId, RiderId, ai,
     order::OrderStatus,
-    rider::{PriceTier, SpeedMode},
+    rider::{PriceTier, RiderKind, SpeedMode},
     world::World,
 };
 
@@ -484,9 +484,8 @@ pub struct DecisionVerdict {
     pub policies: Vec<ValidatedPolicy>,
     /// 站长的运营指令（cap / force_assign / force_offline / recall_training）。
     pub station_ops: Vec<ValidatedStationOp>,
-    pub dropped_acts: usize,
-    pub dropped_policies: usize,
-    pub dropped_station_ops: usize,
+    /// 被丢弃的每一条意图及原因（骑手 / 订单 / 为什么）。**不静默丢**。
+    pub drops: Vec<ai::DroppedIntent>,
     /// `Some(原因)` = 整轮放弃（等于没给计划，回退算法）。
     pub rejected: Option<String>,
 }
@@ -498,7 +497,36 @@ impl DecisionVerdict {
     }
 
     pub fn dropped(&self) -> usize {
-        self.dropped_acts + self.dropped_policies + self.dropped_station_ops
+        self.drops.len()
+    }
+
+    pub fn dropped_in(&self, layer: ai::IntentLayer) -> usize {
+        self.drops.iter().filter(|d| d.layer == layer).count()
+    }
+
+    pub fn dropped_acts(&self) -> usize {
+        self.dropped_in(ai::IntentLayer::Act)
+    }
+
+    pub fn dropped_policies(&self) -> usize {
+        self.dropped_in(ai::IntentLayer::Policy)
+    }
+
+    pub fn dropped_station_ops(&self) -> usize {
+        self.dropped_in(ai::IntentLayer::StationOp)
+    }
+}
+
+/// 这个骑手现在归 AI 管吗？（**不看是否空闲**——空闲与否是派单资格，不是管理权）
+///
+/// - 模拟骑手：在线即归 AI；下线 = 不接受新指令。
+/// - 真人：只有外圈明确交出来（AutoPilot 托管）才归 AI。**在线的真人永远
+///   返回 `false`**——玩家自己在操作，AI 必须让位，绝不能替他接单。
+fn managed_by_ai(world: &World, rid: RiderId, hosted: &[RiderId]) -> bool {
+    match world.rider(rid) {
+        Some(r) if r.kind == RiderKind::Simulated => r.online,
+        Some(_) => hosted.contains(&rid),
+        None => false,
     }
 }
 
@@ -513,7 +541,16 @@ impl DecisionVerdict {
 ///
 /// **必须查活的世界状态**：这几秒里订单可能已被抢走，
 /// 只按占坑时的快照校验会让重复抢单漏过去。
-pub fn validate_decision(world: &World, resp: &DecisionResponse) -> DecisionVerdict {
+///
+/// `roster` 是**本轮可接受普通派单**的骑手（`tick::ai_roster` 的输出），
+/// `hosted` 是本轮由 AutoPilot 代管的真人。两者都由调用方按当前控制模式
+/// 算好再传进来——协议层不应该自己猜谁在线、谁托管。
+pub fn validate_decision(
+    world: &World,
+    resp: &DecisionResponse,
+    roster: &[RiderId],
+    hosted: &[RiderId],
+) -> DecisionVerdict {
     let mut out = DecisionVerdict::default();
 
     // ① 结构校验
@@ -536,24 +573,46 @@ pub fn validate_decision(world: &World, resp: &DecisionResponse) -> DecisionVerd
     }
     let mut cands: Vec<Cand> = Vec::new();
     for a in &resp.acts {
+        let mut drop = |r: Option<RiderId>, reason: ai::DropReason| {
+            out.drops.push(ai::DroppedIntent::new(
+                ai::IntentLayer::Act,
+                r,
+                Some(a.o),
+                reason,
+            ));
+        };
         let Some(rid) = crate::sim::parse_rider_key(&a.r) else {
-            out.dropped_acts += 1;
+            drop(None, ai::DropReason::BadRiderKey);
             continue;
         };
-        let Some(rider) = world.rider(rid) else {
-            out.dropped_acts += 1;
+        if world.rider(rid).is_none() {
+            drop(Some(rid), ai::DropReason::UnknownRider);
             continue;
-        };
-        if rider.kind != crate::sim::rider::RiderKind::Simulated || !rider.online {
-            out.dropped_acts += 1;
+        }
+        // 管理权：模拟骑手在线 / 真人已被托管。未托管的真人**不在这里放行**。
+        if !managed_by_ai(world, rid, hosted) {
+            drop(Some(rid), ai::DropReason::RiderNotManaged);
+            continue;
+        }
+        // 派单资格：在途 / 背满 / 受伤 / 日单量上限 / 离线都由名单收紧。
+        if !roster.contains(&rid) {
+            drop(Some(rid), ai::DropReason::RiderNotEligible);
             continue;
         }
         let Some(order) = world.order(a.o) else {
-            out.dropped_acts += 1;
+            drop(Some(rid), ai::DropReason::UnknownOrder);
             continue;
         };
         if order.status != OrderStatus::Pending {
-            out.dropped_acts += 1;
+            drop(Some(rid), ai::DropReason::OrderNotPending);
+            continue;
+        }
+        // 短期排除项：拒单 TTL 内 / 观望窗口内，普通派单不许重复塞回去。
+        // 只管 `claim`——`reject`/`pass` 本身不是派单，重复表达是幂等的。
+        if a.act == ActKind::Claim
+            && let Some(reason) = ai::refusal_block(world, rid, a.o)
+        {
+            drop(Some(rid), reason);
             continue;
         }
         cands.push(Cand {
@@ -574,6 +633,8 @@ pub fn validate_decision(world: &World, resp: &DecisionResponse) -> DecisionVerd
     // 订单维度胜出、又可能在骑手维度落败，两个 keep 都不为真，
     // 结果整单没人接。分两趟，每趟只解一个维度。
     let mut keep = vec![true; cands.len()];
+    // 落选原因：只在第一次落选时写，后面两趟不会互相覆盖。
+    let mut why: Vec<Option<ai::DropReason>> = vec![None; cands.len()];
 
     // ③a 一个骑手一次只能 claim 一单 → 留分最高的
     let mut best_rider: HashMap<RiderId, usize> = HashMap::new();
@@ -582,9 +643,13 @@ pub fn validate_decision(world: &World, resp: &DecisionResponse) -> DecisionVerd
             continue;
         }
         match best_rider.get(&c.rider) {
-            Some(&j) if cands[j].score.total_cmp(&c.score) != Ordering::Less => keep[i] = false,
+            Some(&j) if cands[j].score.total_cmp(&c.score) != Ordering::Less => {
+                keep[i] = false;
+                why[i] = Some(ai::DropReason::DuplicateRider);
+            }
             Some(&j) => {
                 keep[j] = false;
+                why[j] = Some(ai::DropReason::DuplicateRider);
                 best_rider.insert(c.rider, i);
             }
             None => {
@@ -600,9 +665,13 @@ pub fn validate_decision(world: &World, resp: &DecisionResponse) -> DecisionVerd
             continue;
         }
         match best_claim.get(&c.order) {
-            Some(&j) if cands[j].score.total_cmp(&c.score) != Ordering::Less => keep[i] = false,
+            Some(&j) if cands[j].score.total_cmp(&c.score) != Ordering::Less => {
+                keep[i] = false;
+                why[i] = Some(ai::DropReason::DuplicateOrder);
+            }
             Some(&j) => {
                 keep[j] = false;
+                why[j] = Some(ai::DropReason::DuplicateOrder);
                 best_claim.insert(c.order, i);
             }
             None => {
@@ -610,10 +679,17 @@ pub fn validate_decision(world: &World, resp: &DecisionResponse) -> DecisionVerd
             }
         }
     }
-    out.dropped_acts += keep.iter().filter(|k| !**k).count();
 
     for (i, c) in cands.into_iter().enumerate() {
         if !keep[i] {
+            if let Some(reason) = why[i] {
+                out.drops.push(ai::DroppedIntent::new(
+                    ai::IntentLayer::Act,
+                    Some(c.rider),
+                    Some(c.order),
+                    reason,
+                ));
+            }
             continue;
         }
         out.acts.push(ValidatedAct {
@@ -625,13 +701,28 @@ pub fn validate_decision(world: &World, resp: &DecisionResponse) -> DecisionVerd
     }
 
     // ④ 约束钳制
+    //
+    // 策略只管「归 AI 管」的人：在线的真人自己决定速度和背单，AI 无权替他设。
+    // 这里**不看空闲**——背着单的骑手照样可以调 cap / 档位。
     for p in &resp.policies {
+        let mut drop = |r: Option<RiderId>, reason: ai::DropReason| {
+            out.drops.push(ai::DroppedIntent::new(
+                ai::IntentLayer::Policy,
+                r,
+                None,
+                reason,
+            ));
+        };
         let Some(rid) = crate::sim::parse_rider_key(&p.r) else {
-            out.dropped_policies += 1;
+            drop(None, ai::DropReason::BadRiderKey);
             continue;
         };
         if world.rider(rid).is_none() {
-            out.dropped_policies += 1;
+            drop(Some(rid), ai::DropReason::UnknownRider);
+            continue;
+        }
+        if !managed_by_ai(world, rid, hosted) {
+            drop(Some(rid), ai::DropReason::RiderNotManaged);
             continue;
         }
         // cap 超上限一律 clamp（LLM 突不破物理上限，但也不必罚它）
@@ -653,10 +744,22 @@ pub fn validate_decision(world: &World, resp: &DecisionResponse) -> DecisionVerd
     // ⑤ 站长指令：引用要真、一骑手一轮一条、cap 要钳。
     //
     // 顺序：先逐条解析（结构）→ 查骑手/订单（引用）→ 一骑手一条（语义）→ clamp（约束）。
+    //
+    // **只对模拟骑手**：站长指令是「运营动作」，`force_offline` 会一直留到日结，
+    // `cap` 会改写他自己的策略；托管真人的排班属于玩家账户，AI 不该替他决定
+    // 什么时候下线。托管真人要派单走 `claim`（已在 `roster` 里），不需要站长通道。
     let mut seen_rider: HashMap<RiderId, ()> = HashMap::new();
     for raw in &resp.station_ops {
+        let mut drop = |r: Option<RiderId>, o: Option<OrderId>, reason: ai::DropReason| {
+            out.drops.push(ai::DroppedIntent::new(
+                ai::IntentLayer::StationOp,
+                r,
+                o,
+                reason,
+            ));
+        };
         let Ok(op) = serde_json::from_value::<StationOp>(raw.clone()) else {
-            out.dropped_station_ops += 1;
+            drop(None, None, ai::DropReason::BadStationOp);
             continue;
         };
 
@@ -668,20 +771,20 @@ pub fn validate_decision(world: &World, resp: &DecisionResponse) -> DecisionVerd
             | StationOp::RecallTraining { r, .. } => crate::sim::parse_rider_key(r),
         };
         let Some(rid) = target else {
-            out.dropped_station_ops += 1;
+            drop(None, None, ai::DropReason::BadRiderKey);
             continue;
         };
         let Some(rider) = world.rider(rid) else {
-            out.dropped_station_ops += 1;
+            drop(Some(rid), None, ai::DropReason::UnknownRider);
             continue;
         };
-        if rider.kind != crate::sim::rider::RiderKind::Simulated {
-            out.dropped_station_ops += 1;
+        if rider.kind != RiderKind::Simulated {
+            drop(Some(rid), None, ai::DropReason::RiderNotManaged);
             continue;
         }
         // 语义：一个骑手一轮只接受一条站长指令（cap 与 force_offline 打架时以第一条为准）。
         if seen_rider.contains_key(&rid) {
-            out.dropped_station_ops += 1;
+            drop(Some(rid), None, ai::DropReason::DuplicateRider);
             continue;
         }
 
@@ -702,8 +805,12 @@ pub fn validate_decision(world: &World, resp: &DecisionResponse) -> DecisionVerd
                             why: why(&w),
                         }
                     }
-                    _ => {
-                        out.dropped_station_ops += 1;
+                    Some(_) => {
+                        drop(Some(rid), Some(o), ai::DropReason::OrderNotPending);
+                        continue;
+                    }
+                    None => {
+                        drop(Some(rid), Some(o), ai::DropReason::UnknownOrder);
                         continue;
                     }
                 }
@@ -745,7 +852,9 @@ pub fn system_prompt() -> &'static str {
      5. mode 是 0 / 1 / 2，且可能被系统开关否决；\n\
      6. 每个骑手最多 claim 一单，每单最多被一个骑手 claim；\n\
      7. 宁缺毋滥：不划算的不要硬接，acts 允许是空数组；\n\
-     8. why 不超过 20 字，必须引用具体数字。\n\
+     8. why 不超过 20 字，必须引用具体数字；\n\
+     9. 拒过单的骑手短期内再 claim 同一单会被丢弃，观望中的骑手也会被挡住——\n\
+        窗口过了再考虑，别重复试探。\n\
      决策要点：\n\
      - 雨天 / 高峰提高 price 档位：少而精，别让骑手在路上冒险；\n\
      - fat 高的骑手把 cap 压低，避免超时和事故；\n\
@@ -835,6 +944,204 @@ mod tests {
         }
     }
 
+    /// 默认语境：在线的模拟骑手都在名单里，没有托管真人。
+    ///
+    /// 之所以不直接传 `w.idle_riders()`：那是算法侧的旧名单，会把在线真人算进去，
+    /// 与 `tick::ai_roster` 的口径不一致——测试必须跟生产同源。
+    fn check(w: &World, resp: &DecisionResponse) -> DecisionVerdict {
+        let roster: Vec<RiderId> = w
+            .riders
+            .iter()
+            .filter(|r| r.kind == RiderKind::Simulated && r.online)
+            .map(|r| r.id)
+            .collect();
+        validate_decision(w, resp, &roster, &[])
+    }
+
+    /// AutoPilot 托管的真人：名单里有他、托管名单里有他 → 允许接 LLM 的派单。
+    ///
+    /// 这条用的是**生产同源**的 `ai_roster`，两层的口径必须一致：
+    /// `ai_roster` 说谁可以派，协议层就不许再按 `kind` 一刀切掉。
+    #[test]
+    fn an_autopilot_human_can_take_the_llm_order() {
+        let mut w = world_with_orders(2);
+        let hid = w.spawn_human_rider("小赵");
+        let oid = w.pending_orders()[0];
+
+        let roster = crate::sim::tick::ai_roster(
+            &w,
+            &crate::sim::tick::TickInput {
+                hosted_humans: vec![hid],
+                ..Default::default()
+            },
+        );
+        assert!(roster.contains(&hid), "托管的真人应当进决策名单");
+
+        let resp = DecisionResponse {
+            v: PROTOCOL_VERSION,
+            acts: vec![act(hid, oid)],
+            ..Default::default()
+        };
+        let v = validate_decision(&w, &resp, &roster, &[hid]);
+        assert_eq!(v.acts.len(), 1, "修复后托管真人的 claim 必须通过");
+        assert_eq!(v.acts[0].rider, hid);
+        assert_eq!(v.dropped(), 0);
+    }
+
+    /// 在线的真人：**即使有人错误地把他塞进名单**，协议层也必须挡住。
+    ///
+    /// 这是「修复托管过滤」最危险的连带面：一旦改成只按名单放行，
+    /// 名单算错就等于 AI 直接替在线玩家接单。
+    #[test]
+    fn an_online_human_is_never_managed_by_the_ai() {
+        let mut w = world_with_orders(2);
+        let hid = w.spawn_human_rider("小赵");
+        w.rider_mut(hid).expect("在").online = true;
+        let oid = w.pending_orders()[0];
+
+        // 真实名单里不含他（ai_roster 只放托管真人）
+        let real = crate::sim::tick::ai_roster(&w, &crate::sim::tick::TickInput::default());
+        assert!(!real.contains(&hid), "在线真人不可能进名单");
+
+        // 就算名单被算错、他被塞了进来，管理权这道闸门仍然拦住
+        let resp = DecisionResponse {
+            v: PROTOCOL_VERSION,
+            acts: vec![act(hid, oid)],
+            ..Default::default()
+        };
+        let v = validate_decision(&w, &resp, &[hid], &[]);
+        assert!(v.acts.is_empty(), "AI 不许替在线玩家接单");
+        assert_eq!(v.drops.len(), 1);
+        assert_eq!(v.drops[0].reason, ai::DropReason::RiderNotManaged);
+    }
+
+    /// 托管状态是在**校验那一刻**判定的：同一个世界，托管前挡住、托管后放行。
+    #[test]
+    fn hosted_state_is_judged_at_validation_time() {
+        let mut w = world_with_orders(2);
+        let hid = w.spawn_human_rider("小赵");
+        let oid = w.pending_orders()[0];
+        let resp = DecisionResponse {
+            v: PROTOCOL_VERSION,
+            acts: vec![act(hid, oid)],
+            ..Default::default()
+        };
+
+        let before = validate_decision(&w, &resp, &[hid], &[]);
+        assert_eq!(before.drops[0].reason, ai::DropReason::RiderNotManaged);
+
+        let after = validate_decision(&w, &resp, &[hid], &[hid]);
+        assert_eq!(after.acts.len(), 1, "托管名单一变，结论必须跟着变");
+    }
+
+    /// 策略跟随同一套管理权：托管真人可调 cap/档位，在线真人不许。
+    #[test]
+    fn policies_follow_the_same_ownership_rule() {
+        let mut w = world_with_orders(1);
+        let hid = w.spawn_human_rider("小赵");
+        let resp = DecisionResponse {
+            v: PROTOCOL_VERSION,
+            policies: vec![PolicyPatch {
+                r: rider_key(hid),
+                price: PriceTier::High,
+                cap: Some(2),
+                mode: Some(2),
+                why: "跑快点".into(),
+            }],
+            ..Default::default()
+        };
+
+        let hosted = validate_decision(&w, &resp, &[], &[hid]);
+        assert_eq!(hosted.policies.len(), 1, "托管中由 AI 代管策略");
+        assert_eq!(hosted.dropped(), 0);
+
+        let online = validate_decision(&w, &resp, &[], &[]);
+        assert!(online.policies.is_empty(), "在线真人的档位由他自己决定");
+        assert_eq!(online.drops[0].reason, ai::DropReason::RiderNotManaged);
+    }
+
+    /// 协议层也要认拒单记录，且丢弃要带全「谁 / 哪单 / 为什么」。
+    #[test]
+    fn a_refused_order_is_dropped_with_a_reason_at_the_protocol_layer() {
+        let mut w = world_with_orders(2);
+        let rid = w.riders[0].id;
+        let oid = w.pending_orders()[0];
+        w.record_refusals(&[crate::sim::ai::LlmRefusal {
+            rider: rid,
+            order: oid,
+            kind: crate::sim::world::RefusalKind::Reject,
+            reason: "太远".into(),
+        }]);
+
+        let resp = DecisionResponse {
+            v: PROTOCOL_VERSION,
+            acts: vec![act(rid, oid)],
+            ..Default::default()
+        };
+        let v = check(&w, &resp);
+        assert!(v.acts.is_empty());
+        assert_eq!(v.dropped_acts(), 1);
+        assert_eq!(v.drops[0].reason, ai::DropReason::RefusedOrder);
+        assert_eq!(v.drops[0].rider, Some(rid));
+        assert_eq!(v.drops[0].order, Some(oid));
+        assert_eq!(v.drops[0].layer, ai::IntentLayer::Act);
+        assert_eq!(
+            v.drops[0].brief(),
+            format!("act r{rid}/o{oid} refused_order")
+        );
+    }
+
+    /// 拒单只能挡住拒过这一单的那个骑手；别的骑手认领同一单照常通过。
+    #[test]
+    fn a_refusal_only_blocks_the_rider_who_refused() {
+        let mut w = world_with_orders(2);
+        let (r0, r1) = (w.riders[0].id, w.riders[1].id);
+        let oid = w.pending_orders()[0];
+        w.record_refusals(&[crate::sim::ai::LlmRefusal {
+            rider: r0,
+            order: oid,
+            kind: crate::sim::world::RefusalKind::Reject,
+            reason: "太远".into(),
+        }]);
+
+        let resp = DecisionResponse {
+            v: PROTOCOL_VERSION,
+            acts: vec![act(r0, oid), act(r1, oid)],
+            ..Default::default()
+        };
+        let v = check(&w, &resp);
+        assert_eq!(v.acts.len(), 1, "只该丢拒过单的那一条");
+        assert_eq!((v.acts[0].rider, v.acts[0].order), (r1, oid));
+        assert_eq!(v.dropped_acts(), 1);
+        assert_eq!(v.drops[0].reason, ai::DropReason::RefusedOrder);
+        assert_eq!(v.drops[0].rider, Some(r0));
+    }
+
+    /// 拒单 TTL 过了，协议层也要放行——否则「过期」在两层里说法不一致。
+    #[test]
+    fn an_expired_refusal_does_not_block_the_protocol_layer() {
+        let mut w = world_with_orders(2);
+        let rid = w.riders[0].id;
+        let oid = w.pending_orders()[0];
+        w.record_refusals(&[crate::sim::ai::LlmRefusal {
+            rider: rid,
+            order: oid,
+            kind: crate::sim::world::RefusalKind::Reject,
+            reason: "太远".into(),
+        }]);
+        w.elapsed_min = w.cfg.llm_refusal_ttl_min as u64;
+
+        let resp = DecisionResponse {
+            v: PROTOCOL_VERSION,
+            acts: vec![act(rid, oid)],
+            ..Default::default()
+        };
+        let v = check(&w, &resp);
+        assert_eq!(v.acts.len(), 1, "TTL 到期后可以重新评估");
+        assert_eq!((v.acts[0].rider, v.acts[0].order), (rid, oid));
+        assert!(v.drops.is_empty());
+    }
+
     #[test]
     fn request_is_deterministic_and_quantized() {
         let w = world_with_orders(4);
@@ -891,9 +1198,9 @@ mod tests {
             policies: vec![],
             station_ops: vec![],
         };
-        let v = validate_decision(&w, &resp);
+        let v = check(&w, &resp);
         assert_eq!(v.acts.len(), 1, "编造的引用必须被丢掉");
-        assert_eq!(v.dropped_acts, 2);
+        assert_eq!(v.dropped_acts(), 2);
         assert!(v.rejected.is_none(), "有一条合法就不算整轮失败");
     }
 
@@ -907,9 +1214,9 @@ mod tests {
             policies: vec![],
             station_ops: vec![],
         };
-        let v = validate_decision(&w, &resp);
+        let v = check(&w, &resp);
         assert_eq!(v.acts.len(), 2, "一单只能被一个骑手抢");
-        assert_eq!(v.dropped_acts, 1);
+        assert_eq!(v.dropped_acts(), 1);
         assert_eq!(v.acts.iter().filter(|a| a.order == pending[0]).count(), 1);
     }
 
@@ -923,9 +1230,9 @@ mod tests {
             policies: vec![],
             station_ops: vec![],
         };
-        let v = validate_decision(&w, &resp);
+        let v = check(&w, &resp);
         assert_eq!(v.acts.len(), 1, "一个骑手一次只能接一单");
-        assert_eq!(v.dropped_acts, 1);
+        assert_eq!(v.dropped_acts(), 1);
     }
 
     #[test]
@@ -953,12 +1260,12 @@ mod tests {
             ],
             station_ops: vec![],
         };
-        let v = validate_decision(&w, &resp);
+        let v = check(&w, &resp);
         assert_eq!(v.policies.len(), 1);
         assert_eq!(v.policies[0].cap, Some(max_held), "cap 必须被钳到上限");
         assert_eq!(v.policies[0].mode, None, "非法档位降级为不覆盖");
         assert_eq!(v.policies[0].price, PriceTier::Premium);
-        assert_eq!(v.dropped_policies, 1);
+        assert_eq!(v.dropped_policies(), 1);
     }
 
     #[test]
@@ -977,7 +1284,7 @@ mod tests {
             }],
             station_ops: vec![],
         };
-        let v = validate_decision(&w, &resp);
+        let v = check(&w, &resp);
         assert_eq!(
             v.policies[0].mode, None,
             "开关关着的时候，LLM 说 2 也不许解限速"
@@ -993,7 +1300,7 @@ mod tests {
             policies: vec![],
             station_ops: vec![],
         };
-        let v = validate_decision(&w, &empty);
+        let v = check(&w, &empty);
         assert!(v.rejected.is_some(), "空响应等于没给计划");
 
         let bad = DecisionResponse {
@@ -1002,7 +1309,7 @@ mod tests {
             policies: vec![],
             station_ops: vec![],
         };
-        let v = validate_decision(&w, &bad);
+        let v = check(&w, &bad);
         assert!(v.rejected.is_some(), "版本不匹配必须整轮放弃");
         assert!(v.acts.is_empty());
     }
@@ -1022,7 +1329,7 @@ mod tests {
             policies: vec![],
             station_ops: vec![],
         };
-        let v = validate_decision(&w, &resp);
+        let v = check(&w, &resp);
         assert_eq!(v.acts.len(), 1);
         assert!(v.acts[0].why.chars().count() <= MAX_WHY_CHARS);
     }
@@ -1058,7 +1365,7 @@ mod tests {
         let resp = ops_resp(vec![serde_json::json!({
             "op": "cap_rider", "r": rider_key(1), "cap": 99, "why": "暴雨+连续超时"
         })]);
-        let v = validate_decision(&w, &resp);
+        let v = check(&w, &resp);
         assert!(v.rejected.is_none(), "只有站长指令也算有效一轮");
         assert!(v.acts.is_empty() && v.policies.is_empty());
         assert_eq!(v.station_ops.len(), 1);
@@ -1078,8 +1385,8 @@ mod tests {
             serde_json::json!({"op": "force_offline", "r": "r999", "why": "不存在"}),
             serde_json::json!({"op": "recall_training", "r": rider_key(1), "why": "准时率68%"}),
         ]);
-        let v = validate_decision(&w, &resp);
-        assert_eq!(v.dropped_station_ops, 1);
+        let v = check(&w, &resp);
+        assert_eq!(v.dropped_station_ops(), 1);
         assert_eq!(v.station_ops.len(), 1);
         assert!(matches!(
             v.station_ops[0],
@@ -1095,8 +1402,8 @@ mod tests {
             serde_json::json!({"op": "force_assign", "r": rider_key(1), "o": 999999, "why": "编的"}),
             serde_json::json!({"op": "force_assign", "r": rider_key(2), "o": good, "why": "积压18分钟"}),
         ]);
-        let v = validate_decision(&w, &bad);
-        assert_eq!(v.dropped_station_ops, 1, "指向不存在的单必须丢");
+        let v = check(&w, &bad);
+        assert_eq!(v.dropped_station_ops(), 1, "指向不存在的单必须丢");
         assert_eq!(v.station_ops.len(), 1);
         assert!(matches!(
             v.station_ops[0],
@@ -1111,9 +1418,9 @@ mod tests {
             serde_json::json!({"op": "cap_rider", "r": rider_key(1), "cap": 1, "why": "先限"}),
             serde_json::json!({"op": "force_offline", "r": rider_key(1), "why": "后又下线"}),
         ]);
-        let v = validate_decision(&w, &resp);
+        let v = check(&w, &resp);
         assert_eq!(v.station_ops.len(), 1, "一个骑手一轮只认第一条");
-        assert_eq!(v.dropped_station_ops, 1);
+        assert_eq!(v.dropped_station_ops(), 1);
         assert_eq!(v.station_ops[0].op_name(), "cap_rider");
     }
 
@@ -1124,8 +1431,8 @@ mod tests {
             serde_json::json!({"op": "explode", "r": rider_key(1)}),
             serde_json::json!({"op": "force_offline", "r": rider_key(1), "why": "疲劳"}),
         ]);
-        let v = validate_decision(&w, &resp);
-        assert_eq!(v.dropped_station_ops, 1);
+        let v = check(&w, &resp);
+        assert_eq!(v.dropped_station_ops(), 1);
         assert_eq!(v.station_ops.len(), 1);
     }
 }

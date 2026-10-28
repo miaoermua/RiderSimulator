@@ -97,6 +97,11 @@ pub struct BrainOutcome {
     pub prompt_riders: usize,
     pub prompt_orders: usize,
     pub prompt_bytes: usize,
+    /// 这一轮被丢掉的所有意图及原因（协议层 + tick 复核）。
+    ///
+    /// 合并成一个列表是为了让「模型说了什么、为什么没执行」能在一处查完；
+    /// 计数已经包含在 `stats.dropped` 里，别再累加一次。
+    pub dropped: Vec<ai::DroppedIntent>,
 }
 
 impl BrainOutcome {
@@ -564,6 +569,7 @@ impl TacticalBrain {
         world: &mut World,
         idle: &[RiderId],
         pending: &[OrderId],
+        hosted: &[RiderId],
     ) -> (BrainOutcome, Option<LlmPlan>) {
         let latency_ms = prepared.started.elapsed().as_millis() as u64;
         let model = prepared.client.model().to_string();
@@ -578,7 +584,10 @@ impl TacticalBrain {
 
         // 统一的「这轮没计划」出口：把请求侧的元信息补齐，控制端照样能看到喂了什么。
         macro_rules! skip {
-            ($source:expr, $note:expr) => {{
+            ($source:expr, $note:expr) => {
+                skip!($source, $note, Vec::new())
+            };
+            ($source:expr, $note:expr, $drops:expr) => {{
                 let note: String = $note;
                 return (
                     BrainOutcome {
@@ -594,6 +603,7 @@ impl TacticalBrain {
                         prompt_riders,
                         prompt_orders,
                         prompt_bytes,
+                        dropped: $drops,
                     },
                     None,
                 );
@@ -623,14 +633,22 @@ impl TacticalBrain {
         };
 
         // ②③④ 引用 / 语义 / 钳制：全在协议层，查的是**当下**的世界。
-        let verdict = protocol::validate_decision(world, &resp);
+        //
+        // `hosted` 是本轮 AutoPilot 代管的真人：托管中的真人允许被 AI 派单，
+        // 在线的真人**不在这里放行**（`roster` 也压根不含他们）。
+        let verdict = protocol::validate_decision(world, &resp, idle, hosted);
         self.stats.dropped += verdict.dropped() as u64;
 
         if verdict.is_empty() {
             let why = verdict.rejected.unwrap_or_else(|| "无有效条目".into());
             self.stats.failures += 1;
             self.last_error = why.clone();
-            skip!(BrainSource::Fallback, format!("{why}，回退算法"));
+            // 丢弃明细要带出去：否则「模型说了 5 条、平台一条没执行」查不到原因。
+            skip!(
+                BrainSource::Fallback,
+                format!("{why}，回退算法"),
+                verdict.drops.clone()
+            );
         }
 
         // 策略层落地（唯一一处写回世界的地方）。
@@ -698,7 +716,11 @@ impl TacticalBrain {
         // 对应骑手回到「可被本地补位」。
         plan.covered = verdict_final.covered.clone();
         self.stats.applied += verdict_final.assignments.len() as u64;
-        self.stats.dropped += verdict_final.dropped as u64;
+        self.stats.dropped += verdict_final.dropped() as u64;
+
+        // 两层丢弃合并成一份：协议层挡掉的 + tick 复核挡掉的。
+        let mut dropped = verdict.drops.clone();
+        dropped.extend(verdict_final.drops.iter().cloned());
 
         // 缓存这一轮的响应（无论有没有 claim——策略也是一样可复用的）。
         self.cache_store(fingerprint, day, sim_minute, &resp);
@@ -710,7 +732,7 @@ impl TacticalBrain {
             BrainSource::Llm
         };
         let note = format!(
-            "{}：{} 条动作（{} 条接单、{} 条拒/观望）、{} 条策略（{} 条落地）、{} 条站长指令、丢弃 {} 条",
+            "{}：{} 条动作（{} 条接单、{} 条拒/观望）、{} 条策略（{} 条落地）、{} 条站长指令、丢弃 {} 条{}",
             if was_cached {
                 "指纹命中缓存"
             } else {
@@ -722,7 +744,8 @@ impl TacticalBrain {
             verdict.policies.len(),
             policies.len(),
             station_ops.len(),
-            verdict.dropped() + verdict_final.dropped
+            verdict.dropped() + verdict_final.dropped(),
+            ai::summarize_drops(&dropped)
         );
 
         plan.note = note.clone();
@@ -743,6 +766,7 @@ impl TacticalBrain {
                 prompt_riders,
                 prompt_orders,
                 prompt_bytes,
+                dropped,
             },
             if has_decision { Some(plan) } else { None },
         )
@@ -757,13 +781,15 @@ impl TacticalBrain {
         world: &mut World,
         idle: &[RiderId],
         pending: &[OrderId],
+        hosted: &[RiderId],
     ) -> BrainOutcome {
         let prepared = match self.prepare(world, idle, pending) {
             Ok(p) => p,
             Err(outcome) => return outcome,
         };
         let fetched = prepared.request().await;
-        self.finish(prepared, fetched, world, idle, pending).0
+        self.finish(prepared, fetched, world, idle, pending, hosted)
+            .0
     }
 }
 
@@ -958,7 +984,7 @@ mod tests {
         let mut brain = TacticalBrain::disabled();
         assert!(!brain.is_enabled());
         let (idle, pending) = (w.idle_riders(), w.pending_orders());
-        let out = brain.plan(&mut w, &idle, &pending).await;
+        let out = brain.plan(&mut w, &idle, &pending, &[]).await;
         assert_eq!(out.source, BrainSource::Disabled);
         assert!(out.assignments().is_empty());
         assert_eq!(brain.stats().calls, 0);
@@ -971,7 +997,7 @@ mod tests {
         brain.throttle.begin(w.day, w.sim_minute);
         assert!(brain.slot_used(w.day, w.sim_minute));
         let (idle, pending) = (w.idle_riders(), w.pending_orders());
-        let out = brain.plan(&mut w, &idle, &pending).await;
+        let out = brain.plan(&mut w, &idle, &pending, &[]).await;
         // 没有客户端时优先级是 Disabled —— 连「节流」都轮不到
         assert_eq!(out.source, BrainSource::Disabled);
     }

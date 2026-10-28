@@ -972,19 +972,24 @@ impl App {
         // 也可能刚掉线（AutoPilot 下该接手）。
         let idle = self.ai_roster();
         let pending = self.world.pending_orders();
+        // 托管名单同样要**现算**：这一轮里真人可能刚掉线（AutoPilot 接手）
+        // 或刚重连（AI 必须让位），用上一次 tick 的名单会替在线玩家做决定。
+        let hosted = self.hosted_humans();
         let (outcome, plan) =
             self.brain
-                .finish(prepared, fetched, &mut self.world, &idle, &pending);
+                .finish(prepared, fetched, &mut self.world, &idle, &pending, &hosted);
         self.last_brain_note = format!("[{}] {}", outcome.source.as_str(), outcome.note);
 
         // 编排器统一记账：回退、采纳、丢弃。
         if outcome.source == crate::llm::BrainSource::Fallback {
             self.orchestrator.record_fallback(AiLayer::Rider);
         }
+        // 丢弃数用 `outcome.dropped`（协议层 + tick 层合并后的条数）：
+        // 只数 tick 层会和下面 `dropped_why` 的条数对不上，等于又造一个黑洞。
         self.orchestrator.record_verdict(
             AiLayer::Rider,
             outcome.verdict.assignments.len() as u64,
-            outcome.verdict.dropped as u64,
+            outcome.dropped.len() as u64,
         );
 
         if outcome.source != crate::llm::BrainSource::Disabled {
@@ -1040,7 +1045,22 @@ impl App {
                             })
                         })
                         .collect::<Vec<_>>(),
-                    "dropped": outcome.verdict.dropped,
+                    // 与 `dropped_why` 同口径（两层合并后的条数），不能只数 tick 层。
+                    "dropped": outcome.dropped.len(),
+                    // 每一条被丢弃的意图都要能追到「谁 / 哪单 / 为什么」，
+                    // 只给一个总数等于让「模型说了、平台没做」变成黑洞。
+                    "dropped_why": outcome
+                        .dropped
+                        .iter()
+                        .map(|d| {
+                            json!({
+                                "layer": d.layer.as_str(),
+                                "rider": d.rider.map(crate::sim::rider_key),
+                                "order": d.order,
+                                "reason": d.reason.as_str(),
+                            })
+                        })
+                        .collect::<Vec<_>>(),
                     "policies": policies,
                     "station_ops": station_ops,
                     "fingerprint": format!("{:016x}", outcome.fingerprint),
