@@ -39,7 +39,7 @@ class RiderDrawer extends StatelessWidget {
                     );
                   },
                 ),
-                _Counters(me: me),
+                _Counters(state: state, me: me),
               ],
               const Divider(height: 1),
               ListTile(
@@ -237,28 +237,48 @@ class _Wallet extends StatelessWidget {
 }
 
 class _Counters extends StatelessWidget {
-  const _Counters({required this.me});
+  const _Counters({required this.state, required this.me});
 
+  final GameState state;
   final RiderView me;
 
   @override
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
-      child: Row(
+      child: Column(
         children: [
-          _Metric(
-            icon: Icons.check_circle_outline,
-            label: '已完成',
-            value: '${me.completed}',
-            unit: '单',
+          Row(
+            children: [
+              _Metric(
+                icon: Icons.check_circle_outline,
+                label: '已完成',
+                value: '${me.completed}',
+                unit: '单',
+              ),
+              _Metric(
+                icon: Icons.shopping_bag_outlined,
+                label: '手上/上限',
+                value: state.myHeldLabel,
+                unit: '单',
+              ),
+            ],
           ),
-          _Metric(
-            icon: Icons.shopping_bag_outlined,
-            label: '手上',
-            value: '${me.held.length}',
-            unit: '单',
-          ),
+          if (state.myAtCapacity)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.block, size: 14, color: Colors.red.shade400),
+                  const SizedBox(width: 4),
+                  Text(
+                    '已满载 · 送完才能再接新单',
+                    style: TextStyle(fontSize: 12, color: Colors.red.shade400),
+                  ),
+                ],
+              ),
+            ),
         ],
       ),
     );

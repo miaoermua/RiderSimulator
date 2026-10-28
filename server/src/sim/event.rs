@@ -69,6 +69,13 @@ pub struct RiderBrief {
     /// 今天是否因拒单额度用尽被强制下线（不能自己再上线）。
     pub forced_offline: bool,
     pub held: Vec<OrderId>,
+    /// 当前生效的背单上限（`held.len() >= held_cap` 就接不了新单）。
+    ///
+    /// 下发的是 [`Rider::effective_max_held`] 的**结果值**，不是配置里的
+    /// `cfg.backorder.max_held`：策略覆盖（LLM / 站长 `cap_override`，含 0）
+    /// 可能把人压到比配置更低。让客户端自己拿配置比会显示错，
+    /// 所以由服务端算好、跟着快照走。
+    pub held_cap: u32,
     /// 路线任务：队首是当前腿，走完出队（见 [`RouteLegBrief`]）。
     pub route: Vec<RouteLegBrief>,
     pub phase: Option<Phase>,
@@ -113,6 +120,7 @@ impl RiderBrief {
             rejects_today: r.rejected,
             forced_offline: r.forced_offline,
             held: r.held_ids(),
+            held_cap: r.effective_max_held(cfg),
             route: route_brief(r),
             phase,
             lat: r.lat,

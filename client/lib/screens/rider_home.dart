@@ -199,6 +199,7 @@ class _RiderHomePageState extends State<RiderHomePage> {
             body: Column(
               children: [
                 _NoticeStrip(state: state),
+                _CapacityStrip(state: state),
                 TabBar(
                   dividerColor: Colors.black12,
                   tabs: [
@@ -496,6 +497,44 @@ class _NoticeStrip extends StatelessWidget {
 
     if (rows.isEmpty) return const SizedBox.shrink();
     return Column(children: rows);
+  }
+}
+
+/// 满载提示条。只在**已接不了新单**时出现，常驻显示反而会变成噪音。
+///
+/// 「满」由服务端快照里的 `held_cap`（已含策略覆盖）判定；上限为 0 也算满载。
+/// 这里只是提示，抢单能不能成仍由服务端 `check_claimable` 裁决。
+class _CapacityStrip extends StatelessWidget {
+  const _CapacityStrip({required this.state});
+
+  final GameState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final me = state.me;
+    if (me == null || !state.myAtCapacity) return const SizedBox.shrink();
+    final cap = state.myHeldCap ?? 0;
+    final text = cap == 0
+        ? '当前接单上限为 0：先把手上 ${me.held.length} 单送完'
+        : '已满载（${me.held.length}/$cap）：送完一单才能再接';
+    return Container(
+      width: double.infinity,
+      color: Colors.orange.withValues(alpha: 0.14),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      child: Row(
+        children: [
+          Icon(Icons.shopping_bag_outlined,
+              size: 16, color: Colors.orange.shade900),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              text,
+              style: TextStyle(fontSize: 12, color: Colors.orange.shade900),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 

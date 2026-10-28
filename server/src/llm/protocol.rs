@@ -1933,4 +1933,54 @@ mod tests {
         assert!(kept < ids.len() * 5, "前提：确实超预算、确实砍了经历");
         assert!(kept > 0, "省下的预算要留给经历，不能全砍光");
     }
+
+    /// 极端裁剪：光骑手本身就超预算时，经历会被砍光，但函数必须收手，
+    /// 且留下的请求仍然可以序列化 / 反序列化——不能为了省字节把载荷啃坏。
+    #[test]
+    fn extreme_episode_trim_still_leaves_a_valid_request() {
+        let mut w = World::new_for_test(SimConfig::default(), 7);
+        w.generate_order_batch(4);
+        let rid = w.riders[0].id;
+        for k in 0..crate::sim::rider::MAX_EPISODES {
+            push(
+                &mut w,
+                rid,
+                k as u64,
+                EpisodeKind::Fined,
+                None,
+                -100,
+                "极端裁剪也要能收手",
+            );
+        }
+        let mut req = request(&w);
+
+        // 把同一个骑手复制成一屋子人：光骑手本体就超过预算，
+        // 怎么砍经历都进不去——这正是「砍不动了必须收手」的极端路径。
+        let base = req.riders[0].clone();
+        req.riders = (0..200)
+            .map(|i| {
+                let mut r = base.clone();
+                r.id = format!("r{}", i + 1);
+                r
+            })
+            .collect();
+        assert!(
+            req.body_bytes() > MAX_PROMPT_BYTES,
+            "前提：基础部分就超预算"
+        );
+
+        trim_episodes(&mut req);
+        assert!(
+            req.body_bytes() > MAX_PROMPT_BYTES,
+            "光骑手仍超预算，经历已无可砍"
+        );
+        assert!(
+            req.riders.iter().all(|r| r.eps.is_empty()),
+            "砍光经历仍超预算时必须停止，而不是空转"
+        );
+
+        let bytes = serde_json::to_vec(&req).expect("裁剪后仍能序列化");
+        let back: BrainRequest = serde_json::from_slice(&bytes).expect("裁剪后仍是合法载荷");
+        assert_eq!(back, req, "往返不能丢字段");
+    }
 }

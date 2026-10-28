@@ -242,6 +242,21 @@ class GameState extends ChangeNotifier {
   bool get rejectQuotaExhausted => rejectQuotaLeft == 0;
 
   // ---------------------------------------------------------------------
+  // 背单容量（只用于展示；接单是否成功由服务端裁决）
+  // ---------------------------------------------------------------------
+
+  /// 自己的**生效**背单上限：快照里的 `held_cap`（已含策略覆盖）优先，
+  /// 老服务端没下发时退回配置值。`null` = 还不知道自己是谁。
+  int? get myHeldCap => effectiveHeldCap(me, config.backorderMax);
+
+  /// 自己是否已满载（手上单量 >= 生效上限）。上限为 0 也算满载：
+  /// 那种状态只能把手上的送完，不能再接新单。
+  bool get myAtCapacity => riderAtCapacity(me, config.backorderMax);
+
+  /// 「手上/上限」的展示串，例如 `2/3`。
+  String get myHeldLabel => heldCapacityLabel(me, config.backorderMax);
+
+  // ---------------------------------------------------------------------
   // 拒单结果弹窗
   // ---------------------------------------------------------------------
 
@@ -841,6 +856,7 @@ class GameState extends ChangeNotifier {
         rejectsToday: r.rejectsToday,
         forcedOffline: r.forcedOffline,
         held: r.held,
+        heldCap: r.heldCap,
         phase: r.phase,
         lat: lat ?? r.lat,
         lng: lng ?? r.lng,

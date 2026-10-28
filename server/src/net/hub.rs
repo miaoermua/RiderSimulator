@@ -608,6 +608,34 @@ mod tests {
         assert!(v["last_day_ledgers"].as_array().unwrap().is_empty());
     }
 
+    /// 快照里的 `held_cap` 必须是**生效值**：策略覆盖压低（含 0）之后，
+    /// 不能再给客户端看配置里的硬上限，否则手机端会显示「还能接」。
+    #[test]
+    fn snapshot_reports_the_effective_held_cap() {
+        let mut w = world();
+        let cfg_cap = w.cfg.backorder.max_held;
+        assert!(cfg_cap > 1, "前提：配置上限留出被覆盖压低的余地");
+
+        let cap_of = |w: &World| -> Value {
+            let v = render_snapshot(w, Role::Rider(1), w.elapsed_min);
+            v["riders"]
+                .as_array()
+                .expect("riders 是数组")
+                .iter()
+                .find(|r| r["id"] == 1)
+                .expect("自己在快照里")["held_cap"]
+                .clone()
+        };
+
+        assert_eq!(cap_of(&w), json!(cfg_cap), "没有覆盖时等于配置上限");
+
+        w.rider_mut(1).expect("骑手在").policy_override.cap_override = Some(1);
+        assert_eq!(cap_of(&w), json!(1), "覆盖更低时以覆盖值为准");
+
+        w.rider_mut(1).expect("骑手在").policy_override.cap_override = Some(0);
+        assert_eq!(cap_of(&w), json!(0), "0 是合法覆盖：只送完手上的");
+    }
+
     #[test]
     fn snapshot_only_carries_own_ledger_for_a_rider() {
         let mut w = world();

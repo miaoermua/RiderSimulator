@@ -172,10 +172,10 @@
     }
   },
   "rider_brief": {
-    "public": ["id", "key", "name", "kind", "online", "injured", "frozen", "speed_mode", "level", "rating", "completed", "held", "phase", "lat", "lng"],
+    "public": ["id", "key", "name", "kind", "online", "injured", "frozen", "speed_mode", "level", "rating", "completed", "held", "held_cap", "phase", "lat", "lng"],
     "own_adds": ["hourly_wage_cents", "takehome_cents", "cash_cents", "fines_cents"],
     "control_adds": ["fatigue", "expected_value_cents"],
-    "comment": "收入相关字段对其他角色一律为 null，由服务端在 hub::render 里过滤。"
+    "comment": "收入相关字段对其他角色一律为 null，由服务端在 hub::render 里过滤。held = 手上订单 id 列表；held_cap 是服务端算好的**生效**背单上限（min(配置上限, 策略覆盖)，可能为 0），held.len() >= held_cap 即接不了新单。"
   },
   "login_uri": {
     "_note": "二维码内容，也是骑手端手填表单要的三样东西。权威实现在 server/src/net/join.rs 的 JoinInfo::login_uri，客户端解析在 client/lib/login_link.dart，两边必须一致。",

@@ -109,7 +109,7 @@ class _TodayCard extends StatelessWidget {
               Row(
                 children: [
                   _Cell(label: '已完成', value: '${me.completed} 单'),
-                  _Cell(label: '手上', value: '${me.held.length} 单'),
+                  _Cell(label: '手上/上限', value: '${state.myHeldLabel} 单'),
                   _Cell(label: '罚款', value: '¥${yuan(me.finesCents ?? 0)}'),
                 ],
               ),

@@ -86,6 +86,11 @@ export interface RiderBrief {
   /** 今日因拒单额度用尽被强制下线：不能自己再上线，次日日结才解封。 */
   forced_offline: boolean;
   held: number[];
+  /**
+   * 当前**生效**的背单上限（已含策略覆盖，可能是 0）。
+   * `held.length >= held_cap` 就接不了新单；不是配置里的 `backorder_max`。
+   */
+  held_cap: number;
   /** 路线任务：队首是当前腿，走完出队。旧存档 / 没接单的骑手是空数组。 */
   route: RouteLegBrief[];
   phase: Phase | null;

@@ -65,6 +65,11 @@ WS 侧的控制端令牌写在 `hello` 消息里：`hello.token = "control:<令�
 也不同（`ALREADY_CLAIMED` vs `WRONG_PHASE`），合成一个调用方就分不清自己错在哪。
 详见 `api.rs:43–48` 的注释。
 
+两条接口的**每一条**都单独过骑手容量校验（`scheduler.rs:215` / `:348`）：满员返回
+`HELD_LIMIT_REACHED`，该条失败、后面继续，所以整批不会把任何人塞超上限。
+强制派单（`assign_mode=forced`）同样受上限约束——`forced` 只决定骑手能否拒绝。
+容量语义与生效上限的计算见 `docs/实现现状.md` §六「背单容量」。
+
 `riders/{id}/position` 的坐标范围在 HTTP 层校验，业务层再兜底一次（HTTP 层可被绕过）。
 
 ### AI

@@ -637,6 +637,7 @@ class RiderView {
     required this.rejectsToday,
     required this.forcedOffline,
     required this.held,
+    required this.heldCap,
     required this.phase,
     required this.lat,
     required this.lng,
@@ -663,6 +664,13 @@ class RiderView {
   /// 今天因拒单额度用尽被强制下线：不能自己再上线，日结才解封。
   final bool forcedOffline;
   final List<int> held;
+
+  /// 服务端算好的**生效**背单上限（已含策略覆盖，可能是 0）。
+  ///
+  /// `null` = 对端没下发这个字段（老版本服务端），此时界面回退到
+  /// `ConfigView.backorderMax`。
+  final int? heldCap;
+
   final RiderPhase? phase;
   final double lat;
   final double lng;
@@ -702,6 +710,7 @@ class RiderView {
         held: j['held'] is List
             ? (j['held'] as List).whereType<num>().map((e) => e.toInt()).toList()
             : const [],
+        heldCap: optInt(j['held_cap']),
         phase: RiderPhase.parse(j['phase']),
         lat: reqDouble(j['lat']),
         lng: reqDouble(j['lng']),
@@ -711,6 +720,26 @@ class RiderView {
         finesCents: optInt(j['fines_cents']),
         activities: listOf(j['activities'], ActivityProgressView.fromJson),
       );
+}
+
+/// 生效背单上限：快照里的 `held_cap`（服务端已算入策略覆盖）优先，
+/// 老服务端没这个字段时退回配置值。`me == null` 时返回 `null`。
+int? effectiveHeldCap(RiderView? me, int configMax) =>
+    me == null ? null : (me.heldCap ?? configMax);
+
+/// 手上单量是否已达生效上限。**只是展示判定**，能不能接单由服务端说了算。
+/// 上限为 0 也算满载（只能把手上的送完）。
+bool riderAtCapacity(RiderView? me, int configMax) {
+  final cap = effectiveHeldCap(me, configMax);
+  if (me == null || cap == null) return false;
+  return me.held.length >= cap;
+}
+
+/// 「手上/上限」展示串，例如 `2/3`；上限未知时只显示手上有几单。
+String heldCapacityLabel(RiderView? me, int configMax) {
+  if (me == null) return '--';
+  final cap = effectiveHeldCap(me, configMax);
+  return cap == null ? '${me.held.length}' : '${me.held.length}/$cap';
 }
 
 class MerchantView {
