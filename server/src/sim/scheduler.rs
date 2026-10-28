@@ -546,6 +546,17 @@ pub fn rescue_nearest(world: &mut World, order_id: OrderId) -> Option<Assignment
         "超时救单：重投已用尽，强制塞给最近的骑手（距商家约 {:.0}m）",
         dist_m
     );
+    // 兜底也不能悄悄推翻角色表态：如果这单正是他刚拒/观望过的，
+    // 必须在事件里写明「强制兜底」，不能伪装成普通派单。
+    if let Some(kind) = world.was_refused(rider_id, order_id) {
+        assignment.reason.push_str(&format!(
+            "；该骑手此前{}过此单，记作强制兜底",
+            match kind {
+                crate::sim::world::RefusalKind::Reject => "拒绝",
+                crate::sim::world::RefusalKind::Pass => "观望",
+            }
+        ));
+    }
     attach(world, &assignment);
     world.stats.orders_rescued += 1;
     Some(assignment)
@@ -1110,6 +1121,35 @@ mod tests {
         let oid = w.generate_order_batch(1)[0];
         assign_forced(&mut w, oid, rid, AssignMode::Offer).expect("能强制指派");
         (w, rid, oid)
+    }
+
+    /// 救单可以推翻角色的拒绝，但必须**写明是强制兜底**，不能伪装成普通派单。
+    #[test]
+    fn rescue_records_a_previous_refusal_as_a_forced_fallback() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 42);
+        let rid = w.sim_rider_ids()[0];
+        let oid = w.generate_order_batch(1)[0];
+        w.record_refusals(&[crate::sim::ai::LlmRefusal {
+            rider: rid,
+            order: oid,
+            kind: crate::sim::world::RefusalKind::Reject,
+            reason: "不想接".into(),
+        }]);
+
+        let a = rescue_nearest(&mut w, oid).expect("能救");
+        assert_eq!(a.source, DecisionSource::AlgorithmRescue);
+        // 控制台读的是事件里的逐条来源，落盘的那一份也得是救单来源。
+        assert_eq!(a.to_event().source, DecisionSource::AlgorithmRescue);
+        assert!(
+            a.reason.contains("强制兜底"),
+            "救单理由必须标明例外：{}",
+            a.reason
+        );
+        assert!(!w.rider(rid).unwrap().held.is_empty(), "单最终还是要落地");
     }
 
     #[test]

@@ -335,8 +335,15 @@ pub struct StrategyOverride {
     pub cap_override: Option<u32>,
     /// 速度档位覆盖。`None` = 用骑手自己设的；仍需过 `allow_speeding` 等开关。
     pub mode_override: Option<SpeedMode>,
-    /// 这一轮策略的生效时间（模拟分钟），用于过期检查与审计。
+    /// 这一轮策略的生效时间（当日分钟），仅用于控制端展示与审计。
     pub set_at_min: u64,
+    /// 这一轮策略的生效时间（**开局以来的绝对分钟**），用于过期检查。
+    ///
+    /// 不能用 `set_at_min` 做过期：那是当日分钟，跨天会归零。
+    /// `None` = 不知道这轮策略何时下的（缺字段的老存档），**不是**「0 分钟」；
+    /// 用 `Option` 而不是拿 0 当哨兵，是因为 0 是合法的开局时间戳。
+    #[serde(default)]
+    pub set_at_elapsed: Option<u64>,
     /// 下达这轮策略的说明（≤24 字），仅用于控制端展示。
     #[serde(default)]
     pub note: String,
@@ -654,9 +661,12 @@ impl Rider {
         self.held.iter_mut().find(|h| h.order_id == order_id)
     }
 
-    /// 当前速度 km/h：档位限速 × 天气 × 疲劳削减 × 情绪折扣。
+    /// 当前速度 km/h：**生效档位**限速 × 天气 × 疲劳削减 × 情绪折扣。
+    ///
+    /// 读 `effective_speed_mode` 而不是 `speed_mode`：LLM 的速度覆盖必须真的
+    /// 改变腿时长与风险，而不只是提示词里好看。
     pub fn speed_kmh(&self, cfg: &SimConfig, weather: Weather) -> f32 {
-        let limit = cfg.speed.complaint_speed_kmh[self.speed_mode.index()];
+        let limit = cfg.speed.complaint_speed_kmh[self.effective_speed_mode(cfg).index()];
         let fatigue_penalty = 1.0 - self.fatigue.clamp(0.0, 1.0) * cfg.fatigue.speed_penalty_max;
         let lazy_penalty = self.lazy_speed_factor(cfg);
         (limit * weather.speed_factor() * fatigue_penalty * lazy_penalty).max(3.0)
@@ -813,6 +823,38 @@ mod tests {
         assert!(clear > storm * 1.5, "clear={clear} storm={storm}");
         // 45 km/h = 12.5 m/s
         assert!((clear - 12.5).abs() < 0.01);
+    }
+
+    /// 速度覆盖必须真的改变实际速度，且**不能写穿个人档位**；
+    /// 覆盖一撤，速度立刻回到个人基线。
+    #[test]
+    fn speed_policy_override_changes_actual_speed_and_restores_the_baseline() {
+        let cfg = SimConfig {
+            allow_speeding: true,
+            allow_unrestricted: true,
+            ..Default::default()
+        };
+        let mut r = rider(&cfg);
+        r.speed_mode = SpeedMode::Compliant;
+
+        let base = r.speed_kmh(&cfg, Weather::Clear);
+        r.policy_override.mode_override = Some(SpeedMode::Unrestricted);
+        let fast = r.speed_kmh(&cfg, Weather::Clear);
+        assert!(fast > base * 2.0, "base={base} fast={fast}");
+        assert_eq!(r.speed_mode, SpeedMode::Compliant, "覆盖不得改写个人档位");
+
+        r.policy_override = Default::default();
+        assert!((r.speed_kmh(&cfg, Weather::Clear) - base).abs() < 0.01);
+    }
+
+    /// 系统开关仍然是一票否决：没放开解限速，LLM 说 2 也没用。
+    #[test]
+    fn speed_policy_override_still_respects_the_system_switches() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        r.speed_mode = SpeedMode::Compliant;
+        r.policy_override.mode_override = Some(SpeedMode::Unrestricted);
+        assert_eq!(r.effective_speed_mode(&cfg), SpeedMode::Compliant);
     }
 
     #[test]

@@ -57,11 +57,21 @@ pub struct WorldRequest {
     pub goal: String,
 }
 
+/// 剧本里的下一场天气变化。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WxNext {
+    /// 生效时刻（当日模拟分钟）。
+    pub at: u32,
+    /// 天气短码。
+    pub to: String,
+}
+
 /// 喂给烽火台的世界快照（省 token 版）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldSnap {
     pub day: u32,
     pub min: u32,
+    /// 当前**对外可见**的天气（可能是烽火台的覆盖）。
     pub weather: String,
     pub commission: f32,
     pub orders: usize,
@@ -70,10 +80,24 @@ pub struct WorldSnap {
     pub late: u64,
     pub backlog: usize,
     pub active_riders: usize,
+    /// `weather` 的来源：`script` = 剧本，`director` = 烽火台下的限时覆盖。
+    #[serde(default = "default_wx_src")]
+    pub wx_src: String,
+    /// 覆盖还剩多少分钟。`null` = 没有覆盖，或这条覆盖不过期。
+    #[serde(default)]
+    pub wx_left: Option<u64>,
+    /// 剧本的下一场变化。`null` = 今天不会再变。
+    #[serde(default)]
+    pub wx_next: Option<WxNext>,
+}
+
+fn default_wx_src() -> String {
+    "script".to_string()
 }
 
 impl WorldSnap {
     fn of(world: &World) -> Self {
+        let ov = world.weather_override.as_ref();
         WorldSnap {
             day: world.day,
             min: world.sim_minute,
@@ -85,6 +109,18 @@ impl WorldSnap {
             late: world.stats.orders_late,
             backlog: world.pending_orders().len(),
             active_riders: world.riders.iter().filter(|r| r.online).count(),
+            wx_src: if ov.is_some() { "director" } else { "script" }.to_string(),
+            // `u64::MAX` = 不过期，报 null 而不是一个天文数字。
+            wx_left: ov.and_then(|o| {
+                (o.expires_at != u64::MAX).then(|| o.expires_at.saturating_sub(world.elapsed_min))
+            }),
+            wx_next: world
+                .weather_script
+                .get(world.script_cursor)
+                .map(|e| WxNext {
+                    at: e.at,
+                    to: e.to.code().to_string(),
+                }),
         }
     }
 }
@@ -292,7 +328,10 @@ pub fn system_prompt() -> &'static str {
 - 天气码：c 晴 / o 阴 / f 雾 / r 小雨 / hr 暴雨 / w 大风 / s 雪。
 - set_weather/set_commission 每轮各最多一次；佣金 ≤ 0.30。
 - narrate 是一句人话（≤60 字），像直播间的旁白，不要数字堆砌。
-- 不要重复 history 里刚做过的调整。"#
+- 不要重复 history 里刚做过的调整。
+- weather 是当前对外生效的天气；wx_src 说明它来自剧本还是你此前的覆盖，
+  wx_left 是你这条覆盖还剩几分钟（null = 没覆盖或不过期），wx_next 是剧本下一场变化。
+  覆盖到期会自动交还剧本，wx_left 快见底时别反复重下同一场天气。"#
 }
 
 pub fn user_prompt(req: &WorldRequest) -> String {
@@ -556,6 +595,48 @@ mod tests {
         assert_eq!(req.world.min, 750);
         assert_eq!(req.world.weather, "c");
         assert_eq!(req.v, crate::llm::protocol::PROTOCOL_VERSION);
+    }
+
+    /// 烽火台必须知道「现在这场天气是谁定的、还剩多久、剧本下一步是什么」，
+    /// 否则它会和自己刚下的覆盖打架。
+    #[test]
+    fn world_snap_reports_weather_override_state() {
+        use crate::sim::weather::WeatherEvent;
+
+        let mut w = world();
+        w.weather_script = vec![WeatherEvent {
+            at: 600,
+            to: Weather::HeavyRain,
+        }];
+        w.elapsed_min = 100;
+        w.sim_minute = 100;
+
+        let plain = WorldRequest::build(&w, &[]);
+        assert_eq!(plain.world.wx_src, "script", "没覆盖时天气来自剧本");
+        assert!(plain.world.wx_left.is_none());
+        assert_eq!(
+            plain.world.wx_next,
+            Some(WxNext {
+                at: 600,
+                to: "hr".into()
+            }),
+            "下一场剧本变化要告诉它"
+        );
+
+        w.set_weather_override(Weather::Fog, "测试");
+        let req = WorldRequest::build(&w, &[]);
+        assert_eq!(req.world.wx_src, "director");
+        assert_eq!(req.world.weather, "f", "对外生效的是覆盖");
+        assert_eq!(
+            req.world.wx_left,
+            Some(w.cfg.director_weather_ttl_min as u64),
+            "剩余分钟按 TTL 算"
+        );
+
+        // TTL = 0 表示不过期：报 null，而不是一个天文数字。
+        w.cfg.director_weather_ttl_min = 0;
+        w.set_weather_override(Weather::Snow, "测试");
+        assert!(WorldRequest::build(&w, &[]).world.wx_left.is_none());
     }
 
     #[test]

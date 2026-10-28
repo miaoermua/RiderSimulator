@@ -1026,6 +1026,20 @@ impl App {
                     "model": outcome.model,
                     "latency_ms": outcome.latency_ms,
                     "assignments": outcome.verdict.assignments.len(),
+                    // 拒单/观望是**有效决策**，必须和控制端看清，不能只报「0 条分配」。
+                    "refusals": outcome
+                        .verdict
+                        .refusals
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "rider": crate::sim::rider_key(r.rider),
+                                "order": r.order,
+                                "kind": r.kind.as_str(),
+                                "why": r.reason,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
                     "dropped": outcome.verdict.dropped,
                     "policies": policies,
                     "station_ops": station_ops,
@@ -1173,7 +1187,9 @@ impl App {
         for op in ops {
             match op {
                 ValidatedWorldOp::SetWeather { weather, why } => {
-                    if self.world.set_weather(weather) {
+                    // 烽火台下的天气是有期限的覆盖，到期交还剧本；
+                    // 控制端手动改天气走 `set_weather`，不纳入这套机制。
+                    if self.world.set_weather_override(weather, why.clone()) {
                         events.push(SimEvent::WeatherChanged {
                             weather,
                             label: weather.label(),

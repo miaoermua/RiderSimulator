@@ -5,7 +5,7 @@
 
 use super::{
     OrderId, RiderId,
-    ai::{self, LlmPlan},
+    ai::{self, Assignment, LlmPlan},
     chat, economy,
     event::{DayLedger, DecisionSource, SimEvent},
     geo::LatLng,
@@ -57,6 +57,16 @@ pub fn tick(world: &mut World, mut input: TickInput) -> Vec<SimEvent> {
     // 1. 时钟 + 疲劳
     let day_rolled = world.advance_clock();
     world.accrue_online();
+
+    // 策略覆盖是**当日临时安排**：跨天一律清空（即使 TTL 配成「不过期」），
+    // 然后再按 TTL 清理当日过期的。
+    if day_rolled {
+        world.clear_policies();
+        world.clear_short_term();
+    }
+    world.expire_policies();
+    // 拒单记录只管「还在大厅的单」；订单被接走 / 过期就提前作废。
+    world.prune_refusals();
     events.push(SimEvent::Tick {
         day: world.day,
         sim_minute: world.sim_minute,
@@ -65,7 +75,18 @@ pub fn tick(world: &mut World, mut input: TickInput) -> Vec<SimEvent> {
     });
 
     // 2. 天气剧本
-    if let Some(w) = world.advance_weather_script() {
+    //
+    // Director 覆盖到期 / 跨天时先交还给剧本，再让剧本推进到当前分钟。
+    // 交还取的是 `script_weather`（剧本此刻该有的天气），覆盖期间错过的事件
+    // 不会补演一遍——这正是「不重放」的含义。
+    let handed_back = if day_rolled {
+        world.clear_weather_override()
+    } else {
+        world.expire_weather_override()
+    };
+    let scripted = world.advance_weather_script();
+    // 同一 tick 里交还与剧本推进都发生的话，只对外报最终值。
+    if let Some(w) = scripted.or_else(|| handed_back.then_some(world.weather)) {
         events.push(SimEvent::WeatherChanged {
             weather: w,
             label: w.label(),
@@ -95,17 +116,14 @@ pub fn tick(world: &mut World, mut input: TickInput) -> Vec<SimEvent> {
         if let Some(a) = scheduler::rescue_nearest(world, id) {
             events.push(scheduler::claimed_event(world, &a));
             // 救单也要进决策流：它不是 LLM 决策，控制台必须能一眼分清。
-            let rider_name = world
-                .rider(a.rider)
-                .map(|r| r.name.clone())
-                .unwrap_or_default();
             events.push(SimEvent::AiDecision {
                 source: DecisionSource::AlgorithmRescue,
                 layer: "algorithm",
                 assignments: vec![a.to_event()],
                 ops: Vec::new(),
                 decision_id: 0,
-                note: format!("超时救单：#{id} 重投用尽，强制塞给 {rider_name}"),
+                // 直接用执行时写下的理由：里面可能带「此前拒绝过，强制兜底」。
+                note: a.reason.clone(),
             });
         }
     }
@@ -160,12 +178,13 @@ fn spawn_orders(world: &mut World, events: &mut Vec<SimEvent>) {
 ///
 /// 判定顺序：
 /// - [`TickInput::ai_off`] → 一个都不给（纯手动）。
-/// - 模拟骑手 → 天生归 AI。
+/// - 模拟骑手 → 必须在线才归 AI；被 `force_offline` / 缩编下线后不再派新单。
 /// - 真人 → 只有外圈在 [`TickInput::hosted_humans`] 里明确交出来的才算；在线的真人
 ///   一律让位（§6.3「骑手 AI 停止输出决策」）。
 ///
-/// 「能不能接单」用 `is_free` 而不是 `is_idle`：后者含在线判定，会把 AutoPilot 下
-/// 该被接管的掉线真人挡在外面。
+/// 「手上没活」用 `is_free` 而不是 `is_idle`：后者含在线判定，会把 AutoPilot 下
+/// 该被接管的掉线真人挡在外面。所以**在线的判定要按骑手类型分开做**，不能直接
+/// 把 `is_idle` 套上来。
 ///
 /// `pub` 是给 app 拼 LLM 提示词用的——**控制端看到的名单和 tick 实际派的名单
 /// 必须同源**，否则「LLM 推荐的人」和「校验时合法的人」会对不上。
@@ -178,8 +197,11 @@ pub fn ai_roster(world: &World, input: &TickInput) -> Vec<RiderId> {
         .iter()
         .filter(|r| r.is_free(world.elapsed_min, &world.cfg))
         .filter(|r| match r.kind {
+            // 模拟骑手的「下线」只有一个来源：force_offline / 缩编。
+            // 下线 = 不再接受新单，在途单仍由 `advance_riders` 走完。
+            RiderKind::Simulated => r.online,
+            // AutoPilot 托管的真人天然是离线的，交给外圈决定。
             RiderKind::Human => input.hosts(r.id),
-            RiderKind::Simulated => true,
         })
         .map(|r| r.id)
         .collect()
@@ -202,14 +224,22 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
     }
 
     let plan = world.llm_plan.take();
-    // (分配、来源、层、决策 id、说明)
-    let (assignments, source, layer, decision_id, note) = match plan {
+    // (分配、来源、层、决策 id、说明、这轮是否由 LLM 作出有效决策)
+    let (assignments, source, layer, decision_id, note, llm_round): (
+        Vec<Assignment>,
+        DecisionSource,
+        &'static str,
+        u64,
+        String,
+        bool,
+    ) = match plan {
         // 凑单是算法自己的事：LLM 拿到的名单里没有「等餐中」的人，
         // 硬走它的计划只会把兜底说明写成「输出全被丢弃」，误导人。
         Some(p) if world.cfg.llm_brain_enabled && !idle.is_empty() => {
             let verdict = ai::validate_llm_plan(world, &p, &idle, &pending);
-            if verdict.assignments.is_empty() {
-                // LLM 一条都没通过校验 → 算法兜底
+            // 有**校验通过的**接单或拒/观望，才算 LLM 真的做了决策。
+            // 只要有一条，就不能走「全量贪心」——那会把明确拒掉的单塞回去。
+            if verdict.assignments.is_empty() && verdict.refusals.is_empty() {
                 world.stats.llm_fallbacks += 1;
                 (
                     ai::batch_decide(world, &pending, &idle),
@@ -217,23 +247,43 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
                     "rider",
                     0,
                     format!("LLM（{}）输出全部被丢弃，算法兜底", p.model),
+                    false,
                 )
             } else {
                 world.stats.llm_calls += 1;
+                // 拒单 / 观望先落地成短期排除项，本地补位才看得见。
+                world.record_refusals(&verdict.refusals);
+
+                // 只补 **未被 LLM 覆盖** 的骑手；观望窗口内的人也跳过。
+                let fill_riders: Vec<RiderId> = idle
+                    .iter()
+                    .copied()
+                    .filter(|r| !verdict.covered.contains(r) && !world.is_held(*r))
+                    .collect();
+                // 已被 LLM 接下的单不再参与补位。
+                let open_orders: Vec<OrderId> = pending
+                    .iter()
+                    .copied()
+                    .filter(|o| !verdict.assignments.iter().any(|a| a.order == *o))
+                    .collect();
+
+                let claims = verdict.assignments.len();
+                let refused = verdict.refusals.len();
+                let mut all = verdict.assignments;
+                let filled = ai::batch_decide(world, &open_orders, &fill_riders);
+                let filled_n = filled.len();
+                all.extend(filled);
                 let note = format!(
-                    "LLM（{}）{}ms 给出 {} 条，丢弃 {} 条",
+                    "LLM（{}）{}ms：{} 条接单、{} 条拒/观望，算法补位 {} 条（覆盖 {} 人），丢弃 {} 条",
                     p.model,
                     p.latency_ms,
-                    verdict.assignments.len(),
+                    claims,
+                    refused,
+                    filled_n,
+                    verdict.covered.len(),
                     verdict.dropped
                 );
-                (
-                    verdict.assignments,
-                    DecisionSource::Llm,
-                    "rider",
-                    p.decision_id,
-                    note,
-                )
+                (all, DecisionSource::Llm, "rider", p.decision_id, note, true)
             }
         }
         _ => (
@@ -251,10 +301,13 @@ fn run_ai(world: &mut World, events: &mut Vec<SimEvent>, input: &TickInput) {
                     format!("，另有 {} 人在店等餐可凑单", merging.len())
                 }
             ),
+            false,
         ),
     };
 
-    if assignments.is_empty() {
+    // 没有分配，也没有有效 LLM 决策（例如只有拒绝/观望）时就不发事件；
+    // 但「拒了几单」本身是决策，必须留下可观测的记录。
+    if assignments.is_empty() && !llm_round {
         return;
     }
     for a in &assignments {
@@ -800,7 +853,9 @@ fn roll_leg_risk(world: &mut World, rid: RiderId, oid: OrderId, events: &mut Vec
 
     let (mode, fatigue) = {
         let Some(r) = world.rider(rid) else { return };
-        (r.speed_mode, r.fatigue)
+        // 上路这一刻按**生效档位**掷风险：LLM 的速度覆盖若已过期/被撤销，
+        // 这里读到的就是个人基线。
+        (r.effective_speed_mode(&cfg), r.fatigue)
     };
 
     // 1. 超速被拍
@@ -915,7 +970,7 @@ fn close_day(world: &mut World, events: &mut Vec<SimEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::config::SimConfig;
+    use crate::sim::{config::SimConfig, world::RefusalKind};
 
     fn is_ai_decision(e: &SimEvent) -> bool {
         matches!(e, SimEvent::AiDecision { .. })
@@ -1004,6 +1059,36 @@ mod tests {
             panic!("AutoPilot：AI 该接过他的单");
         };
         assert!(!assignments.is_empty());
+    }
+
+    /// 模拟骑手被下线（force_offline / 缩编）后不再被派新单；
+    /// 重新上线后立刻回到名单——「下线」只是停新单，不是销毁骑手。
+    #[test]
+    fn an_offline_simulated_rider_is_not_dispatched() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 7);
+        let sim = w.riders[0].id;
+        w.rider_mut(sim).unwrap().online = false;
+
+        assert!(
+            !ai_roster(&w, &TickInput::default()).contains(&sim),
+            "下线骑手不能进派单名单"
+        );
+
+        w.generate_order_batch(2);
+        let ev = tick(&mut w, TickInput::default());
+        assert!(!ev.iter().any(is_ai_decision), "下线骑手不能被派新单");
+        assert!(w.rider(sim).unwrap().held.is_empty());
+        assert_eq!(w.pending_orders().len(), 2, "单要原样留在大厅");
+
+        w.rider_mut(sim).unwrap().online = true;
+        assert!(
+            ai_roster(&w, &TickInput::default()).contains(&sim),
+            "重新上线后应当回到名单"
+        );
     }
 
     /// AutoPilot 的离线真人：取餐 / 送达这些「要真人点按钮」的关口由 AI 代按，
@@ -1174,6 +1259,8 @@ mod tests {
                 order_id,
                 reason: "这条最顺路".into(),
             }],
+            refusals: Vec::new(),
+            covered: Vec::new(),
             model: "gpt-4o-mini".into(),
             latency_ms: 120,
             note: String::new(),
@@ -1214,6 +1301,142 @@ mod tests {
         assert!(note.contains("gpt-4o-mini"), "理由里要带上用的模型：{note}");
         assert_eq!(w.stats.llm_calls, 1);
         assert_eq!(w.stats.llm_fallbacks, 0);
+    }
+
+    /// 只有拒单、没有接单的计划**不是空计划**：不能被当成「没决策」而让贪心
+    /// 把同一单塞回给刚拒掉它的人。
+    #[test]
+    fn a_reject_only_plan_is_not_treated_as_an_empty_plan() {
+        let (mut w, mut plan) = llm_world(42);
+        let rid = w.riders[0].id;
+        let oid = plan.assignments[0].order_id;
+        plan.assignments.clear();
+        plan.refusals = vec![ai::LlmRefusal {
+            rider: rid,
+            order: oid,
+            kind: RefusalKind::Reject,
+            reason: "太远不顺路".into(),
+        }];
+
+        let evs = tick(
+            &mut w,
+            TickInput {
+                llm_plan: Some(plan),
+                ..Default::default()
+            },
+        );
+
+        let Some(SimEvent::AiDecision { source, note, .. }) =
+            evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("拒单是有效决策，必须留下 AiDecision");
+        };
+        assert_eq!(*source, DecisionSource::Llm, "拒单轮次应算 LLM 决策");
+        assert!(note.contains("拒/观望"), "说明里要能看见拒了几单：{note}");
+        assert!(w.refusals.contains_key(&(rid, oid)), "拒单要落成短期排除项");
+        assert_eq!(
+            w.rider(rid).unwrap().rejected,
+            0,
+            "AI 拒单只是本轮表态，不占真人当天的拒单额度"
+        );
+        assert!(
+            w.rider(rid).unwrap().held.is_empty(),
+            "刚拒掉的单不能在同一 tick 里塞回去"
+        );
+        assert_eq!(w.stats.llm_calls, 1);
+        assert_eq!(w.stats.llm_fallbacks, 0, "拒单不是兜底");
+    }
+
+    /// 观望 = 骑手级短时窗口：本人不进补位名单，但单可以给别人。
+    #[test]
+    fn a_pass_holds_the_rider_out_of_fill_without_blocking_the_order() {
+        let (mut w, mut plan) = llm_world(42);
+        let rid = w.riders[0].id;
+        let oid = plan.assignments[0].order_id;
+        plan.assignments.clear();
+        plan.refusals = vec![ai::LlmRefusal {
+            rider: rid,
+            order: oid,
+            kind: RefusalKind::Pass,
+            reason: "想等更值的".into(),
+        }];
+
+        let _ = tick(
+            &mut w,
+            TickInput {
+                llm_plan: Some(plan),
+                ..Default::default()
+            },
+        );
+
+        assert!(w.is_held(rid), "观望窗口要生效");
+        assert_eq!(
+            w.was_refused(rid, oid),
+            Some(RefusalKind::Pass),
+            "同一单上也要留痕，救单时才能说是强制兜底"
+        );
+        assert!(
+            w.rider(rid).unwrap().held.is_empty(),
+            "观望期间不参与补位，所以手上不该有新单"
+        );
+    }
+
+    /// 部分计划：LLM 接了 1 单，剩下没被覆盖的骑手由本地算法在**同一 tick** 补位。
+    #[test]
+    fn an_llm_partial_plan_leaves_uncovered_riders_to_the_algorithm() {
+        let (mut w, plan) = llm_world(42);
+        // 把门槛压到 0，确保「能不能接」不干扰本测试的观察点。
+        for r in &mut w.riders {
+            r.strategy.accept_threshold_cents_hour = 0;
+        }
+        let rid = w.riders[0].id;
+        let oid = plan.assignments[0].order_id;
+
+        let evs = tick(
+            &mut w,
+            TickInput {
+                llm_plan: Some(plan),
+                ..Default::default()
+            },
+        );
+
+        let Some(SimEvent::AiDecision {
+            source,
+            assignments,
+            ..
+        }) = evs.iter().find(|e| is_ai_decision(e))
+        else {
+            panic!("应当有决策");
+        };
+        assert_eq!(*source, DecisionSource::Llm);
+        assert!(
+            assignments.len() > 1,
+            "未覆盖骑手应在同一 tick 被补位：{assignments:?}"
+        );
+        // 混编一轮里，只有 LLM 明确接的那一条算 LLM 决策；
+        // 事件级的 `source` 相同，逐条来源必须自证，否则算法补位会被误记成 LLM。
+        let from_llm: Vec<_> = assignments
+            .iter()
+            .filter(|a| a.source == DecisionSource::Llm)
+            .collect();
+        assert_eq!(from_llm.len(), 1, "只有一个骑手是 LLM 亲自接的");
+        assert_eq!(from_llm[0].order_id, oid);
+        assert_eq!(
+            assignments
+                .iter()
+                .filter(|a| a.source == DecisionSource::Algorithm)
+                .count(),
+            assignments.len() - 1,
+            "其余补位必须逐条标成算法"
+        );
+        let mut riders: Vec<u32> = assignments.iter().map(|a| a.rider_id).collect();
+        riders.sort_unstable();
+        riders.dedup();
+        assert_eq!(riders.len(), assignments.len(), "一人只能接一单");
+        assert!(
+            w.rider(rid).unwrap().held_ids().contains(&oid),
+            "LLM 明确接下的单必须归他"
+        );
     }
 
     /// LLM 输出全是垃圾：一条都不能落地，来源必须标成「算法兜底」而非 LLM。
@@ -1349,6 +1572,74 @@ mod tests {
             1,
             "同一时刻只有一条当前腿"
         );
+    }
+
+    /// Director 的天气覆盖到期由 tick 交还：覆盖期间剧本不打断它，
+    /// 到期只对外报一次「剧本此刻的天气」。
+    #[test]
+    fn tick_hands_weather_back_when_the_override_expires() {
+        use crate::sim::weather::{Weather, WeatherEvent};
+
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            director_weather_ttl_min: 5,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 21);
+        w.weather_script = vec![WeatherEvent {
+            at: 2,
+            to: Weather::Cloudy,
+        }];
+        w.sim_minute = 0;
+        w.elapsed_min = 0;
+        w.set_weather_override(Weather::Fog, "测试");
+
+        let mut reported = Vec::new();
+        for _ in 0..5 {
+            let evs = tick(&mut w, TickInput::default());
+            for e in evs {
+                if let SimEvent::WeatherChanged { weather, .. } = e {
+                    reported.push(weather);
+                }
+            }
+            if w.elapsed_min < 5 {
+                assert_eq!(w.weather, Weather::Fog, "到期前覆盖必须压住剧本");
+            }
+        }
+
+        assert_eq!(w.weather, Weather::Cloudy, "到期交还剧本此刻的天气");
+        assert_eq!(reported, vec![Weather::Cloudy], "整个过程只对外报一次");
+        assert!(w.weather_override.is_none());
+        assert_eq!(w.script_cursor, 1, "覆盖期间剧本照常走，且没有重放");
+    }
+
+    /// 跨天把覆盖收掉：不继承前一天的人为天气，也不留下失效的覆盖状态。
+    #[test]
+    fn day_roll_clears_the_weather_override_through_tick() {
+        use crate::sim::weather::Weather;
+
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 33);
+        w.sim_minute = 1439;
+        w.elapsed_min = 1439;
+        w.script_weather = Weather::Cloudy;
+        w.set_weather_override(Weather::Snow, "测试");
+        assert_eq!(w.weather, Weather::Snow);
+
+        let mut reported = Vec::new();
+        for e in tick(&mut w, TickInput::default()) {
+            if let SimEvent::WeatherChanged { weather, .. } = e {
+                reported.push(weather);
+            }
+        }
+
+        assert_eq!(w.day, 2, "先确认真的跨天了");
+        assert!(w.weather_override.is_none(), "跨天不许继承覆盖");
+        assert_eq!(w.weather, Weather::Cloudy, "交还剧本天气");
+        assert_eq!(reported, vec![Weather::Cloudy], "只对外报最终值");
     }
 
     /// `is_llm` 只承认真模型：救单、兜底、人工、托管都不算 LLM 决策。

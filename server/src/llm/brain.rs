@@ -20,8 +20,8 @@ use lru::LruCache;
 
 use crate::sim::{
     OrderId, RiderId,
-    ai::{self, Assignment, LlmAssign, LlmPlan, LlmVerdict},
-    world::World,
+    ai::{self, Assignment, LlmAssign, LlmPlan, LlmRefusal, LlmVerdict},
+    world::{RefusalKind, World},
 };
 
 use super::{
@@ -652,6 +652,28 @@ impl TacticalBrain {
                 reason: a.why.clone(),
             })
             .collect();
+        // 拒单 / 观望：**不再被静默丢弃**。它们会变成 tick 里的短期排除项，
+        // 明确告诉本地算法「这一单 / 这一轮别再塞给他」。
+        let mut refusals: Vec<LlmRefusal> = Vec::new();
+        for a in &verdict.acts {
+            let kind = match a.act {
+                protocol::ActKind::Claim => continue,
+                protocol::ActKind::Reject => RefusalKind::Reject,
+                protocol::ActKind::Pass => RefusalKind::Pass,
+            };
+            if refusals
+                .iter()
+                .any(|r| r.rider == a.rider && r.order == a.order)
+            {
+                continue;
+            }
+            refusals.push(LlmRefusal {
+                rider: a.rider,
+                order: a.order,
+                kind,
+                reason: a.why.clone(),
+            });
+        }
         // 站长的强派也折进同一个计划——同样过 tick 的双保险校验。
         for op in &verdict.station_ops {
             if let ValidatedStationOp::ForceAssign { rider, order, why } = op {
@@ -662,14 +684,19 @@ impl TacticalBrain {
                 });
             }
         }
-        let plan = LlmPlan {
+        let mut plan = LlmPlan {
             assignments,
+            refusals,
+            covered: Vec::new(),
             model: model.clone(),
             latency_ms,
             note: String::new(),
             decision_id: 0, // 由 app 侧在收到结果时填上真实 id
         };
         let verdict_final = ai::validate_llm_plan(world, &plan, idle, pending);
+        // 覆盖范围由**校验通过**的决策决定：被丢掉的条目等于没发生，
+        // 对应骑手回到「可被本地补位」。
+        plan.covered = verdict_final.covered.clone();
         self.stats.applied += verdict_final.assignments.len() as u64;
         self.stats.dropped += verdict_final.dropped as u64;
 
@@ -683,7 +710,7 @@ impl TacticalBrain {
             BrainSource::Llm
         };
         let note = format!(
-            "{}：{} 条动作（{} 条落地）、{} 条策略（{} 条落地）、{} 条站长指令、丢弃 {} 条",
+            "{}：{} 条动作（{} 条接单、{} 条拒/观望）、{} 条策略（{} 条落地）、{} 条站长指令、丢弃 {} 条",
             if was_cached {
                 "指纹命中缓存"
             } else {
@@ -691,15 +718,17 @@ impl TacticalBrain {
             },
             verdict.acts.len(),
             verdict_final.assignments.len(),
+            verdict_final.refusals.len(),
             verdict.policies.len(),
             policies.len(),
             station_ops.len(),
             verdict.dropped() + verdict_final.dropped
         );
 
-        let mut plan = plan;
         plan.note = note.clone();
-        let has_claim = !plan.assignments.is_empty();
+        // 只要**有任何一条**校验通过的决策（接单或拒/观望），就必须把计划交给
+        // tick——否则「明确拒单」会被当成「没有决策」，贪心立刻把单塞回去。
+        let has_decision = !plan.assignments.is_empty() || !verdict_final.refusals.is_empty();
         (
             BrainOutcome {
                 verdict: verdict_final,
@@ -715,7 +744,7 @@ impl TacticalBrain {
                 prompt_orders,
                 prompt_bytes,
             },
-            if has_claim { Some(plan) } else { None },
+            if has_decision { Some(plan) } else { None },
         )
     }
 
@@ -756,6 +785,7 @@ fn apply_policies(world: &mut World, policies: &[ValidatedPolicy]) -> Vec<Valida
     let allow_speeding = world.cfg.allow_speeding;
     let allow_unrestricted = world.cfg.allow_unrestricted;
     let sim_minute = world.sim_minute as u64;
+    let elapsed_min = world.elapsed_min;
 
     let mut applied = Vec::new();
     for p in policies {
@@ -773,12 +803,17 @@ fn apply_policies(world: &mut World, policies: &[ValidatedPolicy]) -> Vec<Valida
             cap_override: cap,
             mode_override: mode,
             set_at_min: sim_minute,
+            set_at_elapsed: Some(elapsed_min),
             note: p.why.clone(),
         };
         if next.price_tier == rider.policy_override.price_tier
             && next.cap_override == rider.policy_override.cap_override
             && next.mode_override == rider.policy_override.mode_override
         {
+            // 内容没变也要续期：LLM 每小时重复一次同样的策略，
+            // 说明它现在仍然想要，不能因为「没变化」而让 TTL 到期失效。
+            rider.policy_override.set_at_min = sim_minute;
+            rider.policy_override.set_at_elapsed = Some(elapsed_min);
             continue;
         }
         rider.policy_override = next;
@@ -809,9 +844,16 @@ fn apply_station_ops(world: &mut World, ops: &[ValidatedStationOp]) -> Vec<Stati
         match op {
             ValidatedStationOp::CapRider { rider, cap, why } => {
                 let cap = (*cap).min(max_held);
+                // 站长指令也是「策略覆盖」，同样要盖时间戳：否则它会被
+                // `expire_policies` 当成老存档在下一 tick 清掉（或者反过来，
+                // 沿用上一轮 LLM 策略的时间，提前过期）。
+                let set_at_min = world.sim_minute as u64;
+                let set_at_elapsed = world.elapsed_min;
                 if let Some(r) = world.rider_mut(*rider) {
                     r.policy_override.cap_override = Some(cap);
                     r.policy_override.note = why.clone();
+                    r.policy_override.set_at_min = set_at_min;
+                    r.policy_override.set_at_elapsed = Some(set_at_elapsed);
                 }
                 applied.push(StationOpBrief {
                     op: "cap_rider",
@@ -821,6 +863,9 @@ fn apply_station_ops(world: &mut World, ops: &[ValidatedStationOp]) -> Vec<Stati
                 });
             }
             ValidatedStationOp::ForceOffline { rider, why } => {
+                // 只停「接新单」：在途单继续由 `advance_riders` 走完，
+                // 下一 tick 起 `ai_roster` 不再把他算进派单名单。
+                // 回收在途单会打断订单生命周期与顾客承诺，不在本阶段范围。
                 if let Some(r) = world.rider_mut(*rider) {
                     r.online = false;
                 }
@@ -1049,6 +1094,11 @@ mod tests {
             Some(max_held),
             "cap 要再钳一次上限"
         );
+        assert_eq!(
+            w.rider(1).unwrap().policy_override.set_at_elapsed,
+            Some(w.elapsed_min),
+            "站长指令也要盖时间戳，否则会被当成老存档清掉"
+        );
         assert!(!w.rider(2).unwrap().online, "force_offline 要真的下线");
         assert_eq!(w.rider(3).unwrap().recall_count, 1, "召回要记一次");
 
@@ -1056,5 +1106,33 @@ mod tests {
         assert_eq!(applied[0].op, "cap_rider");
         assert_eq!(applied[3].op, "force_assign");
         assert!(applied[3].detail.contains("12345"));
+    }
+
+    /// 策略覆盖必须盖绝对时间戳；0 是合法值（开局第一轮就在 0 上）。
+    #[test]
+    fn policies_stamp_the_absolute_time_including_zero() {
+        use crate::sim::rider::PriceTier;
+
+        let mut w = world();
+        assert_eq!(w.elapsed_min, 0);
+        let applied = apply_policies(
+            &mut w,
+            &[ValidatedPolicy {
+                rider: 1,
+                price: PriceTier::High,
+                cap: Some(2),
+                mode: None,
+                why: "测试".into(),
+            }],
+        );
+        assert_eq!(applied.len(), 1);
+        assert_eq!(
+            w.rider(1).unwrap().policy_override.set_at_elapsed,
+            Some(0),
+            "0 要写成 Some(0)，不能留成「缺失」"
+        );
+
+        w.elapsed_min = 1;
+        assert!(w.expire_policies().is_empty(), "下一 tick 不许立刻清掉");
     }
 }

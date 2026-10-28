@@ -273,7 +273,13 @@ fn one_cli_command_prints_a_full_day_ledger() {
 
 #[test]
 fn speed_multiplier_only_changes_real_time_pacing() {
-    let mut cfg = SimConfig::default();
+    // 这条用例验的是「倍率只改真实时间节奏」，必须先退出实时档：
+    // 实时档下 `tick_interval_ms()` 恒为 `REALTIME_TICK_MS`（1 模拟分钟 = 60 真实秒），
+    // 与倍率无关，是另一套刻意的语义（见 config.rs 同名字段与 `realtime_mode_*` 用例）。
+    let mut cfg = SimConfig {
+        realtime: false,
+        ..Default::default()
+    };
     for (mult, expect_ms) in [(1u32, 1000u64), (2, 500), (10, 100), (60, 16), (0, 1000)] {
         cfg.speed_multiplier = mult;
         assert_eq!(

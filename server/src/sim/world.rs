@@ -1,10 +1,10 @@
 //! 全局状态。tick 循环唯一的可变对象。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     MINUTES_PER_DAY, OrderId, RiderId, activity,
@@ -52,6 +52,49 @@ pub struct SimStats {
     pub llm_calls: u32,
     /// LLM 失败 / 被校验丢弃后回退算法的次数。
     pub llm_fallbacks: u32,
+}
+
+/// 骑手对一单的负面表态。
+///
+/// - `Reject`：这一单我不接（订单维度，TTL 内本地算法不得再塞给他）。
+/// - `Pass`：暂时观望（**骑手维度**，`llm_hold_ttl_min` 内不参与自动补位）。
+///
+/// 两者都**不是永久拉黑**：到期或订单离开大厅即失效，骑手可以重新评估。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalKind {
+    Reject,
+    Pass,
+}
+
+impl RefusalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefusalKind::Reject => "reject",
+            RefusalKind::Pass => "pass",
+        }
+    }
+}
+
+/// 一条短时拒单记录。只影响**本地补位**，不改订单状态、不计拒单处罚。
+#[derive(Debug, Clone)]
+pub struct RefusalRecord {
+    pub kind: RefusalKind,
+    pub why: String,
+    /// 绝对分钟（`elapsed_min`），到点自动失效。
+    pub expires_at: u64,
+}
+
+/// Director 的天气覆盖：优先于天气剧本，到期后交还给剧本。
+///
+/// **不做「重放」**：覆盖期间剧本游标照常推进，`World::script_weather`
+/// 持续更新；到期时直接切到「剧本此刻该有的天气」，而不是把错过的事件补一遍。
+#[derive(Debug, Clone)]
+pub struct WeatherOverride {
+    pub weather: Weather,
+    /// 绝对分钟（`elapsed_min`）。`u64::MAX` = 不过期。
+    pub expires_at: u64,
+    pub why: String,
 }
 
 /// 重投的归宿。**没有「流单」这一种**。
@@ -222,13 +265,22 @@ pub struct World {
     pub merchants: Vec<Merchant>,
     pub tasks: Vec<TaskTemplate>,
     pub weather: Weather,
+    /// 剧本「此刻应当呈现」的天气。覆盖生效时它仍在跟着剧本走，
+    /// 覆盖一撤就切回它——这是「不重放历史事件」的实现基础。
+    pub script_weather: Weather,
     pub weather_script: Vec<WeatherEvent>,
     pub script_cursor: usize,
+    /// Director 的天气覆盖；`None` = 听剧本的。
+    pub weather_override: Option<WeatherOverride>,
     pub next_order_id: OrderId,
     pub next_rider_id: RiderId,
     pub stats: SimStats,
     /// 本 tick 待消费的 LLM 计划（由 app 层异步拿到后塞进来）。
     pub llm_plan: Option<LlmPlan>,
+    /// 短期拒单记录：**只挡本地补位**，不是永久拉黑。
+    pub refusals: BTreeMap<(RiderId, OrderId), RefusalRecord>,
+    /// 骑手级「观望」窗口：截止前不参与自动补位（含凑单）。
+    pub rider_holds: BTreeMap<RiderId, u64>,
     pub last_day_ledgers: Vec<DayLedger>,
     /// 平台活动定义。进度不在这里——见 [`activity`]。
     pub activities: Vec<activity::PlatformActivity>,
@@ -259,12 +311,16 @@ impl World {
             merchants,
             tasks,
             weather: Weather::Clear,
+            script_weather: Weather::Clear,
             weather_script,
             script_cursor: 0,
+            weather_override: None,
             next_order_id: 1,
             next_rider_id: 1,
             stats: SimStats::default(),
             llm_plan: None,
+            refusals: BTreeMap::new(),
+            rider_holds: BTreeMap::new(),
             last_day_ledgers: Vec::new(),
             activities: Vec::new(),
             next_activity_id: 1,
@@ -533,6 +589,141 @@ impl World {
         changed
     }
 
+    /// 跨天清空所有 LLM 策略覆盖。策略是当日临时安排，不能继承到第二天。
+    pub fn clear_policies(&mut self) {
+        for r in &mut self.riders {
+            if !r.policy_override.is_identity() {
+                r.policy_override = Default::default();
+            }
+        }
+    }
+
+    // ---------- 短期拒单 / 观望 ----------
+
+    /// 这单现在还能不能再塞给这个骑手（拒绝或观望中 = 不能）。
+    ///
+    /// 只在**本地补位**时查。`rescue_nearest` 有意不查：那是「不允许流单」的
+    /// 最后一手，会被记录成强制兜底而不是普通派单。
+    pub fn is_refused(&self, rider: RiderId, order: OrderId) -> bool {
+        self.was_refused(rider, order).is_some()
+    }
+
+    /// 查拒单记录（含 `Pass`），已过期 / 订单不在大厅的返回 `None`。
+    pub fn was_refused(&self, rider: RiderId, order: OrderId) -> Option<RefusalKind> {
+        let rec = self.refusals.get(&(rider, order))?;
+        if self.elapsed_min >= rec.expires_at {
+            return None;
+        }
+        let order = self.order(order)?;
+        if order.status != OrderStatus::Pending {
+            return None;
+        }
+        Some(rec.kind)
+    }
+
+    /// 骑手是否处在「观望」窗口内。
+    pub fn is_held(&self, rider: RiderId) -> bool {
+        self.rider_holds
+            .get(&rider)
+            .is_some_and(|until| self.elapsed_min < *until)
+    }
+
+    /// 落地一批 LLM 的拒单 / 观望。
+    ///
+    /// - `Reject` 是**订单维度**：记下 `(骑手, 订单)`，TTL 内不再把这一单塞给他。
+    /// - `Pass` 是**骑手维度**：TTL 内他不参与任何自动补位（含凑单）。
+    ///
+    /// 两者都不写 `rider.held`、不改订单状态、不计拒单处罚——它们只是
+    /// 「本地补位时的排除项」。
+    pub fn record_refusals(&mut self, list: &[ai::LlmRefusal]) {
+        let now = self.elapsed_min;
+        let reject_ttl = self.cfg.llm_refusal_ttl_min as u64;
+        let hold_ttl = self.cfg.llm_hold_ttl_min as u64;
+        for r in list {
+            match r.kind {
+                RefusalKind::Reject => {
+                    self.refusals.insert(
+                        (r.rider, r.order),
+                        RefusalRecord {
+                            kind: RefusalKind::Reject,
+                            why: r.reason.clone(),
+                            expires_at: now.saturating_add(reject_ttl),
+                        },
+                    );
+                }
+                RefusalKind::Pass => {
+                    let until = now.saturating_add(hold_ttl);
+                    // 只延长，不缩短：连续观望不该被后一条更短的窗口覆盖。
+                    let entry = self.rider_holds.entry(r.rider).or_insert(until);
+                    *entry = (*entry).max(until);
+                    // 同一单上也留一条，救单时才说得出「他观望过这单」。
+                    // 这一点不会额外挡住他——`is_held` 已经把他整轮排除了。
+                    let until = *entry;
+                    self.refusals.insert(
+                        (r.rider, r.order),
+                        RefusalRecord {
+                            kind: RefusalKind::Pass,
+                            why: r.reason.clone(),
+                            expires_at: until,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// 清掉过期 / 订单已离开大厅的拒单记录与观望窗口。
+    pub fn prune_refusals(&mut self) {
+        let now = self.elapsed_min;
+        let orders = &self.orders;
+        self.refusals.retain(|(_, order), rec| {
+            now < rec.expires_at
+                && orders
+                    .iter()
+                    .any(|o| o.id == *order && o.status == OrderStatus::Pending)
+        });
+        self.rider_holds.retain(|_, until| now < *until);
+    }
+
+    /// 跨天清空短期拒单 / 观望：它们只对当天、当前大厅有意义。
+    pub fn clear_short_term(&mut self) {
+        self.refusals.clear();
+        self.rider_holds.clear();
+    }
+
+    /// 清掉过期的 LLM 策略覆盖，返回被清的骑手。
+    ///
+    /// 覆盖是**临时策略**，不是骑手属性：到期后整块回到默认（个人基线），
+    /// 不写穿 `speed_mode` / `strategy`。`llm_policy_ttl_min = 0` 表示不过期。
+    /// 跨天由 [`Self::close_day`] 统一清空，不依赖这里的 TTL。
+    pub fn expire_policies(&mut self) -> Vec<RiderId> {
+        let ttl = self.cfg.llm_policy_ttl_min as u64;
+        if ttl == 0 {
+            return Vec::new();
+        }
+        let now = self.elapsed_min;
+        let mut cleared = Vec::new();
+        for r in &mut self.riders {
+            if r.policy_override.is_identity() {
+                continue;
+            }
+            // 没有时间戳 = 缺字段的老存档，无法判断年龄：按已过期清掉，
+            // 免得一条来路不明的旧策略在新局里永久生效。0 是合法的开局时间，
+            // 必须和「不知道」区分开。
+            let Some(set_at) = r.policy_override.set_at_elapsed else {
+                r.policy_override = Default::default();
+                cleared.push(r.id);
+                continue;
+            };
+            if now.saturating_sub(set_at) < ttl {
+                continue;
+            }
+            r.policy_override = Default::default();
+            cleared.push(r.id);
+        }
+        cleared
+    }
+
     fn random_home(&mut self) -> LatLng {
         let spots: Vec<LatLng> = self.merchants.iter().filter_map(|m| m.coords()).collect();
         if spots.is_empty() {
@@ -544,7 +735,10 @@ impl World {
 
     // ---------- 天气 ----------
 
-    /// 按剧本推进天气。返回变化后的天气。
+    /// 按剧本推进天气。返回**实际对外可见**的变化。
+    ///
+    /// 有 Director 覆盖时：游标与 `script_weather` 照常推进，但 `weather`
+    /// 不动——否则覆盖会被下一个剧本事件无声吃掉。
     pub fn advance_weather_script(&mut self) -> Option<Weather> {
         let mut changed = None;
         while self.script_cursor < self.weather_script.len() {
@@ -552,7 +746,8 @@ impl World {
             let to = self.weather_script[self.script_cursor].to;
             if self.sim_minute >= ev_at {
                 self.script_cursor += 1;
-                if to != self.weather {
+                self.script_weather = to;
+                if self.weather_override.is_none() && to != self.weather {
                     self.weather = to;
                     changed = Some(to);
                 }
@@ -563,12 +758,61 @@ impl World {
         changed
     }
 
+    /// 控制端手动改天气：人的优先级最高，直接压掉 Director 覆盖。
+    ///
+    /// 本阶段不给控制端引入另一套 TTL 机制（产品语义第 6 条）。
     pub fn set_weather(&mut self, w: Weather) -> bool {
+        self.weather_override = None;
         if self.weather == w {
             return false;
         }
         self.weather = w;
         true
+    }
+
+    /// Director 下天气：优先于剧本，默认 `director_weather_ttl_min` 分钟后交还。
+    pub fn set_weather_override(&mut self, w: Weather, why: impl Into<String>) -> bool {
+        let changed = self.weather != w;
+        self.weather = w;
+        let ttl = self.cfg.director_weather_ttl_min as u64;
+        self.weather_override = Some(WeatherOverride {
+            weather: w,
+            expires_at: if ttl == 0 {
+                u64::MAX
+            } else {
+                self.elapsed_min.saturating_add(ttl)
+            },
+            why: why.into(),
+        });
+        changed
+    }
+
+    /// 覆盖到期则交还给剧本当前时刻的天气。返回是否真的变了。
+    pub fn expire_weather_override(&mut self) -> bool {
+        let Some(o) = &self.weather_override else {
+            return false;
+        };
+        if self.elapsed_min < o.expires_at {
+            return false;
+        }
+        self.weather_override = None;
+        let back = self.script_weather;
+        if self.weather == back {
+            return false;
+        }
+        self.weather = back;
+        true
+    }
+
+    /// 跨天清空覆盖（不影响剧本游标的重置）。
+    pub fn clear_weather_override(&mut self) -> bool {
+        if self.weather_override.take().is_none() {
+            return false;
+        }
+        let back = self.script_weather;
+        let changed = self.weather != back;
+        self.weather = back;
+        changed
     }
 
     // ---------- 订单 ----------
@@ -1277,6 +1521,219 @@ mod tests {
         assert_eq!(w.sim_minute, 5);
     }
 
+    /// 策略覆盖是临时安排：到期整块清掉，回到个人基线（不是把覆盖写进个人档位）。
+    #[test]
+    fn expired_policies_fall_back_to_the_personal_baseline() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            llm_policy_ttl_min: 90,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 5);
+        let rid = w.riders[0].id;
+        w.elapsed_min = 100;
+        {
+            let r = w.rider_mut(rid).unwrap();
+            r.policy_override.mode_override = Some(SpeedMode::Unrestricted);
+            r.policy_override.set_at_elapsed = Some(100);
+            r.policy_override.set_at_min = 100;
+        }
+
+        w.elapsed_min = 189;
+        assert!(w.expire_policies().is_empty(), "还没到期");
+        w.elapsed_min = 190;
+        assert_eq!(w.expire_policies(), vec![rid], "整 90 分钟到期");
+        assert!(
+            w.rider(rid).unwrap().policy_override.is_identity(),
+            "到期后回到默认覆盖"
+        );
+    }
+
+    /// TTL = 0 表示不过期；但跨天仍要清空（策略不继承到第二天）。
+    #[test]
+    fn zero_ttl_never_expires_but_a_new_day_clears_it() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            llm_policy_ttl_min: 0,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 5);
+        let rid = w.riders[0].id;
+        w.elapsed_min = 10;
+        {
+            let r = w.rider_mut(rid).unwrap();
+            r.policy_override.cap_override = Some(1);
+            r.policy_override.set_at_elapsed = Some(10);
+        }
+        w.elapsed_min = 10_000;
+        assert!(w.expire_policies().is_empty(), "TTL=0 不该过期");
+
+        w.clear_policies();
+        // 清的是**整块覆盖**，时间戳与说明也得一起归零，
+        // 否则下一天会拿着前一天的 `set_at_elapsed` 去判断新策略的年龄。
+        let cleared = &w.rider(rid).unwrap().policy_override;
+        assert!(cleared.is_identity());
+        assert_eq!(cleared.set_at_elapsed, None);
+        assert_eq!(cleared.set_at_min, 0);
+        assert!(cleared.note.is_empty());
+    }
+
+    /// `elapsed_min == 0` 是合法的开局时间，不能用它当「缺字段」的哨兵：
+    /// 开局下的策略必须活过下一次过期检查。
+    #[test]
+    fn a_policy_set_at_absolute_time_zero_survives_the_next_tick() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            llm_policy_ttl_min: 90,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 5);
+        let rid = w.riders[0].id;
+        assert_eq!(w.elapsed_min, 0, "新世界就是从 0 开始的");
+        w.rider_mut(rid).unwrap().policy_override = crate::sim::rider::StrategyOverride {
+            cap_override: Some(2),
+            set_at_elapsed: Some(0),
+            ..Default::default()
+        };
+
+        // 下一 tick：绝对时间 1，距生效才 1 分钟。
+        w.elapsed_min = 1;
+        assert!(w.expire_policies().is_empty(), "0 不是「没有时间戳」");
+        assert_eq!(
+            w.rider(rid).unwrap().policy_override.cap_override,
+            Some(2),
+            "策略必须还在"
+        );
+
+        // 正常到期仍然生效。
+        w.elapsed_min = 90;
+        assert_eq!(w.expire_policies(), vec![rid]);
+    }
+
+    /// 缺字段的老存档读成 `None`（不知道何时下的），按已过期安全降级，
+    /// 不能悄悄变成「0 分钟时下的」而多活 90 分钟。
+    #[test]
+    fn a_policy_without_a_timestamp_is_dropped_as_a_legacy_save() {
+        let mut v = serde_json::to_value(crate::sim::rider::StrategyOverride {
+            cap_override: Some(2),
+            set_at_min: 42,
+            set_at_elapsed: Some(42),
+            note: "旧".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        v.as_object_mut().unwrap().remove("set_at_elapsed");
+        let legacy: crate::sim::rider::StrategyOverride = serde_json::from_value(v).unwrap();
+        assert_eq!(legacy.set_at_elapsed, None, "缺字段必须是显式的 None");
+
+        // 反面：旧版本真的写出了数字 0 时，读回来是 `Some(0)`（开局时间），
+        // 不能和「缺失」混为一谈。
+        let mut z = serde_json::to_value(crate::sim::rider::StrategyOverride {
+            cap_override: Some(2),
+            set_at_min: 0,
+            set_at_elapsed: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+        z["set_at_elapsed"] = serde_json::Value::from(0u64);
+        let zero: crate::sim::rider::StrategyOverride = serde_json::from_value(z).unwrap();
+        assert_eq!(zero.set_at_elapsed, Some(0));
+
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            llm_policy_ttl_min: 90,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 5);
+        let rid = w.riders[0].id;
+        w.rider_mut(rid).unwrap().policy_override = legacy;
+        w.elapsed_min = 1;
+        assert_eq!(w.expire_policies(), vec![rid], "判断不了年龄就清掉");
+    }
+
+    /// 拒单只挡「这一单」，且到期自动失效——不是永久拉黑。
+    #[test]
+    fn a_refusal_blocks_only_the_named_order_and_expires() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            llm_refusal_ttl_min: 30,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 9);
+        let rid = w.riders[0].id;
+        let ids = w.generate_order_batch(2);
+        let (a, b) = (ids[0], ids[1]);
+        w.elapsed_min = 100;
+        w.record_refusals(&[ai::LlmRefusal {
+            rider: rid,
+            order: a,
+            kind: RefusalKind::Reject,
+            reason: "太远".into(),
+        }]);
+
+        assert!(w.is_refused(rid, a), "拒掉的那一单不能马上再塞回去");
+        assert!(!w.is_refused(rid, b), "拒单不该殃及其他单");
+
+        w.elapsed_min = 130;
+        assert!(!w.is_refused(rid, a), "到期后允许重新评估");
+        w.prune_refusals();
+        assert!(w.refusals.is_empty(), "过期记录要被清掉");
+    }
+
+    /// 订单一旦被接走 / 离开大厅，对应的拒单记录就没意义了，要提前清。
+    #[test]
+    fn a_refusal_is_dropped_once_the_order_leaves_the_hall() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 9);
+        let rid = w.riders[0].id;
+        let oid = w.generate_order_batch(1)[0];
+        w.record_refusals(&[ai::LlmRefusal {
+            rider: rid,
+            order: oid,
+            kind: RefusalKind::Reject,
+            reason: "不接".into(),
+        }]);
+        w.order_mut(oid).unwrap().status = OrderStatus::Cancelled;
+
+        assert!(!w.is_refused(rid, oid));
+        w.prune_refusals();
+        assert!(w.refusals.is_empty());
+    }
+
+    /// 观望是「这一轮先别给他」，不是拉黑：窗口走完必须立刻放行。
+    #[test]
+    fn a_hold_releases_the_rider_when_the_window_ends() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            llm_hold_ttl_min: 10,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 9);
+        let rid = w.riders[0].id;
+        let oid = w.generate_order_batch(1)[0];
+        w.elapsed_min = 0;
+        w.record_refusals(&[ai::LlmRefusal {
+            rider: rid,
+            order: oid,
+            kind: RefusalKind::Pass,
+            reason: "等更值的".into(),
+        }]);
+
+        assert!(w.is_held(rid), "窗口内不参与补位");
+        w.elapsed_min = 9;
+        assert!(w.is_held(rid), "第 9 分钟仍在窗口内");
+
+        w.elapsed_min = 10;
+        assert!(!w.is_held(rid), "10 分钟窗口走完就放行");
+        assert_eq!(w.was_refused(rid, oid), None, "同单留痕一起失效");
+        w.prune_refusals();
+        assert!(w.refusals.is_empty());
+        assert!(w.rider_holds.is_empty());
+    }
+
     #[test]
     fn rider_names_are_sanitized_and_applied_in_order() {
         let cfg = SimConfig {
@@ -1644,5 +2101,129 @@ mod tests {
         w.sim_minute = 25;
         assert_eq!(w.advance_weather_script(), Some(Weather::Rainstorm));
         assert_eq!(w.weather, Weather::Rainstorm);
+    }
+
+    /// Director 的覆盖优先于剧本：剧本事件照常到点，但不许把天气悄悄改回去。
+    #[test]
+    fn director_weather_survives_a_script_event() {
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            director_weather_ttl_min: 60,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 2);
+        w.weather_script = vec![WeatherEvent {
+            at: 10,
+            to: Weather::Cloudy,
+        }];
+        w.sim_minute = 5;
+        w.elapsed_min = 5;
+        assert!(w.set_weather_override(Weather::Rainstorm, "测试"));
+
+        w.sim_minute = 10;
+        w.elapsed_min = 10;
+        assert!(
+            w.advance_weather_script().is_none(),
+            "覆盖生效时剧本不能对外报变化"
+        );
+        assert_eq!(w.weather, Weather::Rainstorm, "覆盖必须压住剧本");
+        assert_eq!(w.script_weather, Weather::Cloudy, "剧本自己照常走");
+        assert_eq!(w.script_cursor, 1, "游标仍然推进");
+    }
+
+    /// 覆盖到期直接切到「剧本此刻该有的天气」，不重放覆盖期间错过的事件。
+    #[test]
+    fn override_expiry_applies_script_weather_without_replay() {
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            director_weather_ttl_min: 20,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 2);
+        w.weather_script = vec![WeatherEvent {
+            at: 10,
+            to: Weather::Cloudy,
+        }];
+        w.sim_minute = 5;
+        w.elapsed_min = 5;
+        w.set_weather_override(Weather::Fog, "测试");
+
+        // 剧本事件在覆盖期间到点：只更新影子状态，不对外生效。
+        w.sim_minute = 15;
+        w.elapsed_min = 15;
+        assert!(w.advance_weather_script().is_none());
+        assert_eq!(w.weather, Weather::Fog);
+
+        // 到期这一刻交还——取的是剧本此刻的天气，游标不回退。
+        w.elapsed_min = 25;
+        assert!(w.expire_weather_override());
+        assert_eq!(w.weather, Weather::Cloudy);
+        assert_eq!(w.script_cursor, 1, "不许回退游标重放历史事件");
+        assert!(w.weather_override.is_none());
+
+        // 已经交还，再调一次不该有任何动作。
+        assert!(!w.expire_weather_override());
+    }
+
+    /// TTL = 0 表示覆盖不过期（跨天仍由 `clear_weather_override` 收掉）。
+    #[test]
+    fn zero_ttl_weather_override_never_expires() {
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            director_weather_ttl_min: 0,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 2);
+        w.elapsed_min = 10;
+        w.set_weather_override(Weather::Snow, "测试");
+        w.elapsed_min = 10_000;
+        assert!(!w.expire_weather_override());
+        assert_eq!(w.weather, Weather::Snow);
+    }
+
+    /// 跨天把覆盖收掉，天气回到剧本（第二天由游标从 0 重新走）。
+    #[test]
+    fn day_roll_clears_weather_override() {
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 2);
+        w.script_weather = Weather::Cloudy;
+        w.set_weather_override(Weather::Fog, "测试");
+        assert_eq!(w.weather, Weather::Fog);
+
+        assert!(w.clear_weather_override());
+        assert!(w.weather_override.is_none());
+        assert_eq!(w.weather, Weather::Cloudy);
+        assert!(!w.clear_weather_override(), "没覆盖时是空操作");
+    }
+
+    /// 控制端手动改天气优先级最高：直接压掉 Director 的覆盖，不引入第二套 TTL。
+    #[test]
+    fn manual_weather_cancels_the_director_override() {
+        let cfg = SimConfig {
+            sim_rider_count: 0,
+            director_weather_ttl_min: 60,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 2);
+        w.script_weather = Weather::Cloudy;
+        w.set_weather_override(Weather::Rainstorm, "测试");
+        assert!(w.weather_override.is_some());
+
+        assert!(w.set_weather(Weather::Clear));
+        assert!(w.weather_override.is_none(), "手动改天气要撤掉覆盖");
+        assert_eq!(w.weather, Weather::Clear);
+        assert_eq!(
+            w.script_weather,
+            Weather::Cloudy,
+            "剧本影子状态不受手动改天气影响"
+        );
+        assert!(
+            !w.expire_weather_override(),
+            "覆盖已经撤掉，不该再有到期的残留动作"
+        );
+        assert_eq!(w.weather, Weather::Clear);
     }
 }

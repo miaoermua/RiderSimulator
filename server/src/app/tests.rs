@@ -1158,6 +1158,17 @@ fn director_world_ops_apply_to_the_world() {
     app.apply_pending_world_ops();
 
     assert_eq!(app.world.weather, target, "天气要落地");
+    let ov = app
+        .world
+        .weather_override
+        .as_ref()
+        .expect("烽火台下的天气必须是带期限的覆盖");
+    assert_eq!(ov.weather, target);
+    assert_eq!(ov.why, "测试");
+    assert!(
+        ov.expires_at > app.world.elapsed_min,
+        "覆盖默认有效，不是一落地就过期"
+    );
     assert!(
         (app.world.cfg.commission_rate - 0.18).abs() < 1e-6,
         "佣金要落地"

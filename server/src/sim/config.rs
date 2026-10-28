@@ -405,6 +405,20 @@ pub struct SimConfig {
     pub max_rejects_per_day: u32,
     pub ai_batch_enabled: bool,
     pub llm_brain_enabled: bool,
+    /// LLM 策略覆盖（门槛档位 / 背单上限 / 速度档）的有效期，单位模拟分钟。
+    ///
+    /// 0 = 不过期。跨天一律清除：策略是临时覆盖，不能变成永久属性。
+    #[serde(default = "default_llm_policy_ttl_min")]
+    pub llm_policy_ttl_min: u32,
+    /// 「拒这一单」的记录有效期（模拟分钟）。0 = 只在当前 tick 有效。
+    #[serde(default = "default_llm_refusal_ttl_min")]
+    pub llm_refusal_ttl_min: u32,
+    /// 「观望」的骑手级窗口（模拟分钟）。0 = 只在当前 tick 有效。
+    #[serde(default = "default_llm_hold_ttl_min")]
+    pub llm_hold_ttl_min: u32,
+    /// Director 天气覆盖的有效期（模拟分钟）。0 = 不过期。
+    #[serde(default = "default_director_weather_ttl_min")]
+    pub director_weather_ttl_min: u32,
     /// 控制端「显示期望值」开关，只影响下发字段。
     pub show_expected_value: bool,
     /// 模拟骑手数量 0~8。
@@ -426,6 +440,26 @@ pub struct SimConfig {
 /// 取送半径的默认值：100 米。老存档缺这个字段时也按它算。
 fn default_arrive_radius_m() -> u32 {
     100
+}
+
+/// LLM 策略覆盖默认有效期：90 分钟（约一个半小时）。
+fn default_llm_policy_ttl_min() -> u32 {
+    90
+}
+
+/// 拒单记录默认有效期：30 分钟。
+fn default_llm_refusal_ttl_min() -> u32 {
+    30
+}
+
+/// 观望窗口默认 10 分钟：够表达「等更值的单」，又不会把人晾一小时。
+fn default_llm_hold_ttl_min() -> u32 {
+    10
+}
+
+/// Director 天气覆盖默认 60 分钟，与它的轮询节奏对齐。
+fn default_director_weather_ttl_min() -> u32 {
+    60
 }
 
 impl Default for SimConfig {
@@ -518,6 +552,10 @@ impl Default for SimConfig {
             ai_batch_enabled: true,
             // 玩法设计 §7.3：LLM 战术大脑**默认关**，由控制端 / 命令行显式打开。
             llm_brain_enabled: false,
+            llm_policy_ttl_min: default_llm_policy_ttl_min(),
+            llm_refusal_ttl_min: default_llm_refusal_ttl_min(),
+            llm_hold_ttl_min: default_llm_hold_ttl_min(),
+            director_weather_ttl_min: default_director_weather_ttl_min(),
             show_expected_value: false,
             sim_rider_count: 3,
             order_spawn_interval_min: 3,

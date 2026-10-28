@@ -139,7 +139,9 @@ impl Rider {
         const AVG_MEDICAL_CENTS: i64 = 4000; // 医药费均值 40 元
         const DOWNTIME_LOSS_CENTS: i64 = 3000; // 停工 2 小时 ≈ 30 元
         let accident_cost = AVG_MEDICAL_CENTS + DOWNTIME_LOSS_CENTS;
-        let p = self.speed_mode.accident_rate(cfg);
+        // 用生效档位：LLM 把档位改到解限速后，期望值必须跟着变，
+        // 否则控制端会拿旧档位的概率去解释新行为。
+        let p = self.effective_speed_mode(cfg).accident_rate(cfg);
         AVG_FARE_CENTS - (p * accident_cost as f32).round() as i64
     }
 }
@@ -221,6 +223,33 @@ mod tests {
         assert!((-950..=-800).contains(&ev), "ev={ev}");
         r.speed_mode = SpeedMode::Compliant;
         assert!(r.expected_value_cents(&cfg) > 600);
+    }
+
+    /// 期望值必须读**生效档位**：LLM 把档位抬到解限速后，
+    /// 控制端看到的期望值要同步变成负的，而不是继续按个人基线算。
+    #[test]
+    fn expected_value_follows_the_effective_speed_mode() {
+        let cfg = SimConfig {
+            allow_speeding: true,
+            allow_unrestricted: true,
+            ..Default::default()
+        };
+        let mut r = Rider::new(
+            1,
+            RiderKind::Simulated,
+            "AI",
+            LatLng::new(30.5, 114.4),
+            &cfg,
+        );
+        r.speed_mode = SpeedMode::Compliant;
+        let calm = r.expected_value_cents(&cfg);
+
+        r.policy_override.mode_override = Some(SpeedMode::Unrestricted);
+        let fast = r.expected_value_cents(&cfg);
+        assert!(fast < calm, "calm={calm} fast={fast}");
+
+        r.policy_override = Default::default();
+        assert_eq!(r.expected_value_cents(&cfg), calm);
     }
 
     #[test]

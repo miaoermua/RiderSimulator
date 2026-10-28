@@ -94,7 +94,7 @@ pub struct RiderBrief {
 }
 
 impl RiderBrief {
-    fn base(r: &Rider, _cfg: &SimConfig, now_min: u64) -> Self {
+    fn base(r: &Rider, cfg: &SimConfig, now_min: u64) -> Self {
         let phase = r.held.first().map(|h| h.phase);
         Self {
             id: r.id,
@@ -104,7 +104,9 @@ impl RiderBrief {
             online: r.online,
             injured: r.is_injured(now_min),
             frozen: r.is_frozen(now_min),
-            speed_mode: r.speed_mode,
+            // 对外展示「实际正在用的档位」：LLM 覆盖生效时它不再是个人设置，
+            // 但个人档位仍原样保留在 `speed_mode` 里，覆盖撤销即恢复。
+            speed_mode: r.effective_speed_mode(cfg),
             level: r.level,
             rating: r.rating,
             completed: r.completed,
@@ -187,6 +189,11 @@ pub struct AiAssignment {
     pub rider_key: String,
     pub score: f32,
     pub reason: String,
+    /// 这一条具体是谁定的。
+    ///
+    /// 混编一轮里 LLM 接单和算法补位会同时出现在同一个 `AiDecision` 里，
+    /// 只看事件级的 `source` 会把算法补位误记成 LLM 决策。
+    pub source: DecisionSource,
 }
 
 /// AI 决策来源。

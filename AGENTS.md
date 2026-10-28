@@ -126,10 +126,9 @@ WGS-84 配 OSM 瓦片。换坐标系不换底图（或反之）会让所有点�
 
 ## 九、当前已知的失败项
 
-- `server/tests/acceptance.rs` 的
-  `speed_multiplier_only_changes_real_time_pacing` **当前失败**。
-  根因：`SimConfig::default()` 的 `realtime` 为 `true`，而该测试没有先关掉实时档，
-  于是 `tick_interval_ms()` 返回 `REALTIME_TICK_MS`（60000）而不是断言的 1000。
-  这是**过期测试**，不是产品缺陷——`server/src/sim/config.rs:616` 的
-  `tick_interval_scales` 单元测试就正确地先设了 `c.realtime = false`。
-  修它属于改测试代码，动手前先跟维护者确认，别把它跟你的功能改动混在一个提交里。
+- 暂无。`cargo test --workspace` 全绿。
+- 已修（2026-10-28，测试侧改动，生产代码未动）：`server/tests/acceptance.rs` 的
+  `speed_multiplier_only_changes_real_time_pacing` 曾失败——`SimConfig::default()`
+  的 `realtime` 为 `true`，`tick_interval_ms()` 于是返回 `REALTIME_TICK_MS`（60000）
+  而不是断言的 1000。这是**过期测试**，不是产品缺陷；修法是在测试里显式
+  `realtime: false`，与 `server/src/sim/config.rs` 的 `tick_interval_scales` 口径一致。

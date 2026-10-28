@@ -51,6 +51,7 @@ impl Assignment {
             rider_key: crate::sim::rider_key(self.rider),
             score: self.score,
             reason: self.reason.clone(),
+            source: self.source,
         }
     }
 }
@@ -364,6 +365,11 @@ pub fn batch_decide(
             let Some(r) = world.rider(*rid) else {
                 continue;
             };
+            // 拒单 / 观望记录：TTL 内别再把这一单塞回去。恢复评估靠时间或
+            // 订单离开大厅，不是靠下一次贪心「猜」。
+            if world.is_refused(*rid, *oid) || world.is_held(*rid) {
+                continue;
+            }
             if !accepts(world, r, o) {
                 continue;
             }
@@ -386,6 +392,10 @@ pub fn batch_decide(
             let Some(r) = world.rider(*rid) else {
                 continue;
             };
+            // 观望窗口内连凑单也不参与；拒单只挡具体这一单。
+            if world.is_refused(*rid, *oid) || world.is_held(*rid) {
+                continue;
+            }
             if !accepts(world, r, o) {
                 continue;
             }
@@ -440,6 +450,14 @@ pub fn batch_decide(
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 pub struct LlmPlan {
     pub assignments: Vec<LlmAssign>,
+    /// 「这一单我不接 / 暂时观望」。**不是空计划的替代品**：它们会被落地成
+    /// 短期排除项，明确告诉本地算法「不要再把这一单 / 这一轮塞给他」。
+    #[serde(default)]
+    pub refusals: Vec<LlmRefusal>,
+    /// 本轮被 LLM 明确处理过的骑手（接单或拒绝/观望）。本地补位只碰不在
+    /// 这个名单里的人——这是「不得悄悄反向覆盖有效决策」的执行依据。
+    #[serde(default)]
+    pub covered: Vec<RiderId>,
     /// 服务端补上的元信息，LLM 不产出。
     #[serde(default)]
     pub model: String,
@@ -461,10 +479,24 @@ pub struct LlmAssign {
     pub reason: String,
 }
 
+/// 一条拒单 / 观望。`Pass` 按**骑手级**处理（订单字段只用于说明是哪一单让他观望）。
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct LlmRefusal {
+    pub rider: RiderId,
+    pub order: OrderId,
+    pub kind: crate::sim::world::RefusalKind,
+    #[serde(default)]
+    pub reason: String,
+}
+
 /// LLM 计划校验结果。
 #[derive(Debug, Clone, Default)]
 pub struct LlmVerdict {
     pub assignments: Vec<Assignment>,
+    /// 通过引用校验的拒单 / 观望。
+    pub refusals: Vec<LlmRefusal>,
+    /// 本轮**有效决策覆盖到**的骑手（接单 + 拒单/观望）。
+    pub covered: Vec<RiderId>,
     /// 被丢弃的条目数（骑手非法 / 订单不存在 / 重复）。
     pub dropped: usize,
 }
@@ -512,9 +544,34 @@ pub fn validate_llm_plan(
         out.push(assign);
     }
 
-    // 去重后仍可能有重复（理论上上面已拦），再兜一层。
+    // 拒单 / 观望：只接受「本轮名单里、没在接单、订单还在大厅」的那些。
+    //
+    // 一条也不通过时由调用方决定怎么兜底；这里不替它猜。
+    let mut refusals = Vec::new();
+    let mut pairs = HashSet::new();
+    for rf in &plan.refusals {
+        if riders.contains(&rf.rider) || !idle.contains(&rf.rider) || !pending.contains(&rf.order) {
+            dropped += 1;
+            continue;
+        }
+        if !pairs.insert((rf.rider, rf.order)) {
+            dropped += 1;
+            continue;
+        }
+        refusals.push(rf.clone());
+    }
+
+    // 覆盖范围 = 接单的人 + 明确拒单/观望的人。**只认校验通过的条目**：
+    // 被丢掉的决策等于没有发生过，骑手应当回到「可被本地补位」。
+    let mut covered: Vec<RiderId> = riders.iter().copied().collect();
+    covered.extend(refusals.iter().map(|r| r.rider));
+    covered.sort_unstable();
+    covered.dedup();
+
     LlmVerdict {
         assignments: out,
+        refusals,
+        covered,
         dropped,
     }
 }
@@ -525,6 +582,7 @@ mod tests {
     use crate::sim::{
         config::{PEAK_PREP_FACTOR, SimConfig, TYPICAL_TO_SHOP_M},
         geo::LatLng,
+        rider::SpeedMode,
         world::World,
     };
 
@@ -574,6 +632,38 @@ mod tests {
                 to_customer,
             );
         }
+    }
+
+    /// LLM 的速度覆盖必须真的缩短预估腿时长，而不只是提示词里好看。
+    /// 行程时间在**腿开始时**估算，所以这里比较的是同一位置的 `plan_for`。
+    #[test]
+    fn speed_policy_shortens_the_estimated_legs() {
+        let mut w = world();
+        let rid = w.sim_rider_ids()[0];
+        w.rider_mut(rid).unwrap().speed_mode = SpeedMode::Compliant;
+        let oid = w.generate_order_batch(1)[0];
+
+        let before = plan_for(
+            &w,
+            w.rider(rid).expect("骑手在"),
+            w.order(oid).expect("订单在"),
+        );
+
+        w.rider_mut(rid).unwrap().policy_override.mode_override = Some(SpeedMode::Tolerant);
+        let rider = w.rider(rid).expect("骑手在");
+        let after = plan_for(&w, rider, w.order(oid).expect("订单在"));
+
+        assert!(
+            after.total_min() < before.total_min(),
+            "覆盖生效后腿时长应变短：before={} after={}",
+            before.total_min(),
+            after.total_min()
+        );
+        assert_eq!(
+            w.rider(rid).unwrap().speed_mode,
+            SpeedMode::Compliant,
+            "覆盖不得写穿个人档位"
+        );
     }
 
     #[test]
@@ -750,5 +840,39 @@ mod tests {
         let res = batch_decide(&w, &pending, &[rid]);
         assert_eq!(res.len(), 2, "上限 2 时该给这一个骑手派两单");
         assert!(res.iter().all(|a| a.rider == rid));
+    }
+
+    /// 普通派单（算法贪心）也要尊重有效拒单记录：只绕开那一对，
+    /// 不能因为拒过一单就把骑手整体排除。
+    #[test]
+    fn the_greedy_fill_respects_a_refusal_without_blacklisting_the_rider() {
+        use crate::sim::world::RefusalKind;
+
+        let mut w = world();
+        w.cfg.order_spawn_interval_min = 100_000;
+        // 门槛压到 0，确保「接不接」只取决于拒单记录。
+        for r in &mut w.riders {
+            r.strategy.accept_threshold_cents_hour = 0;
+            r.strategy.detour_tolerance_m = u32::MAX;
+        }
+        let ids = w.generate_order_batch(2);
+        let (refused, other) = (ids[0], ids[1]);
+        let rid = w.sim_rider_ids()[0];
+        w.record_refusals(&[LlmRefusal {
+            rider: rid,
+            order: refused,
+            kind: RefusalKind::Reject,
+            reason: "太远".into(),
+        }]);
+
+        let got = batch_decide(&w, &ids, &[rid]);
+        assert!(
+            !got.iter().any(|a| a.order == refused),
+            "拒过的单不能再塞回同一个人：{got:?}"
+        );
+        assert!(
+            got.iter().any(|a| a.order == other && a.rider == rid),
+            "同一骑手仍然可以接别的单：{got:?}"
+        );
     }
 }
