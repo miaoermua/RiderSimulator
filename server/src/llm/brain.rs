@@ -932,7 +932,12 @@ fn apply_station_ops(world: &mut World, ops: &[ValidatedStationOp]) -> Vec<Stati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::{config::SimConfig, world::World};
+    use crate::sim::{
+        config::SimConfig,
+        rider::{EpisodeKind, RiderEpisode},
+        rider_key,
+        world::World,
+    };
 
     fn world() -> World {
         World::new_for_test(SimConfig::default(), 42)
@@ -1160,5 +1165,90 @@ mod tests {
 
         w.elapsed_min = 1;
         assert!(w.expire_policies().is_empty(), "下一 tick 不许立刻清掉");
+    }
+
+    // ---- 经历变化必须让决策缓存失效 ----
+
+    /// 同指纹能命中；多一条经历，指纹就变，缓存自然落空。
+    #[test]
+    fn a_new_episode_misses_the_decision_cache() {
+        let mut w = world();
+        let (idle, pending) = (w.idle_riders(), w.pending_orders());
+        let fp_before = protocol::state_fingerprint(&BrainRequest::build(&w, &idle, &pending));
+
+        let mut brain = TacticalBrain::disabled();
+        brain.cache_store(fp_before, 0, 10, &DecisionResponse::default());
+        assert!(
+            brain.cache_lookup(fp_before, 0, 10).is_some(),
+            "前提：同指纹能命中"
+        );
+
+        w.rider_mut(idle[0])
+            .expect("骑手在")
+            .push_episode(RiderEpisode::new(
+                40,
+                EpisodeKind::Delivered,
+                pending.first().copied(),
+                800,
+                "送达",
+            ));
+        let fp_after = protocol::state_fingerprint(&BrainRequest::build(&w, &idle, &pending));
+
+        assert_ne!(fp_before, fp_after, "经历进了 prompt 就得进指纹");
+        assert!(
+            brain.cache_lookup(fp_after, 0, 10).is_none(),
+            "带着新经历的这一轮不许复用旧结论"
+        );
+        assert!(
+            brain.cache_lookup(fp_before, 0, 10).is_some(),
+            "旧键本身还在，只是不该被这一轮用到"
+        );
+    }
+
+    /// 只有 B 的经历变了：A 的快照一个字节都不许动；但因为整批共用一个
+    /// 请求指纹，这一批缓存会整体失效——宁可多调一次，也不许把「照着旧经历
+    /// 算出来的结论」套给 A。
+    #[test]
+    fn one_riders_episodes_cannot_leak_into_anothers_snapshot() {
+        let mut w = world();
+        assert!(w.riders.len() >= 2, "前提：至少两个骑手");
+        let (a, b) = (w.riders[0].id, w.riders[1].id);
+        let (idle, pending) = (w.idle_riders(), w.pending_orders());
+        let before = BrainRequest::build(&w, &idle, &pending);
+        let fp_before = protocol::state_fingerprint(&before);
+        let a_before = before
+            .riders
+            .iter()
+            .find(|r| r.id == rider_key(a))
+            .expect("A 在快照里")
+            .clone();
+
+        w.rider_mut(b)
+            .expect("骑手在")
+            .push_episode(RiderEpisode::new(
+                15,
+                EpisodeKind::Fined,
+                None,
+                -200,
+                "被罚",
+            ));
+
+        let after = BrainRequest::build(&w, &idle, &pending);
+        let snap = |id| {
+            after
+                .riders
+                .iter()
+                .find(|r| r.id == rider_key(id))
+                .expect("骑手在快照里")
+        };
+        assert!(snap(a).eps.is_empty(), "B 的经历不许跑到 A 的上下文里");
+        assert_eq!(snap(a), &a_before, "A 的快照不该因为 B 而变化");
+        assert_eq!(snap(b).eps.len(), 1);
+        assert_eq!(snap(b).eps[0].d, -200);
+        assert_ne!(
+            fp_before,
+            protocol::state_fingerprint(&after),
+            "整批共用一把键，B 变了这一批就得重算"
+        );
     }
 }

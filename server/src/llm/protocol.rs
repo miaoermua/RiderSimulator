@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::sim::{
     OrderId, RiderId, ai,
     order::OrderStatus,
-    rider::{PriceTier, RiderKind, SpeedMode},
+    rider::{EpisodeKind, PriceTier, RiderEpisode, RiderKind, SpeedMode},
     world::World,
 };
 
@@ -94,6 +94,62 @@ pub struct RiderSnap {
     /// 步行速度 m/s（只读，物理量）。
     pub walk: f32,
     pub held: Vec<HeldSnap>,
+    /// 最近经历，最旧在前（最多 [`crate::sim::rider::MAX_EPISODES`] 条）。
+    ///
+    /// 空时**整个键都不出现**：没有历史的人不该占 prompt 字节，也免得模型
+    /// 把 `[]` 读成「查不到他的历史」。
+    ///
+    /// 这是 [`crate::sim::rider::Rider::episodes`] 的只读投影——LLM 看不到、
+    /// 也改不了存档里的原件。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eps: Vec<EpSnap>,
+}
+
+/// 一条经历的提示词形态：`[t, k, o, d, n]`。
+///
+/// 用位置数组而不是对象：5 个字段的键名要多花 20 个字节，16 个骑手 × 5 条
+/// 就是 1.6KB——够再塞十张单了（模块头那句「每个字符都是 token」在这里最贵）。
+/// **顺序即协议**：调整位置等于换协议，指纹也会跟着变，等于让所有旧缓存失效。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "EpTuple", into = "EpTuple")]
+pub struct EpSnap {
+    /// 绝对模拟分钟（`World::elapsed_min`），**不是**当天第几分钟。
+    pub t: u64,
+    /// 短码：`dl` 送达 / `rj` 拒单 / `hd` 观望 / `fn` 罚款 / `fc` 强派。
+    pub k: String,
+    /// 相关订单；没有单的事（事故罚款）是 `null`。
+    pub o: Option<OrderId>,
+    /// 金额变化（分）：正=进账、负=扣钱、0=纯事件。
+    pub d: i64,
+    /// 一句话备注（业务侧已截到 ≤[`crate::sim::rider::MAX_EPISODE_NOTE_CHARS`] 字）。
+    pub n: String,
+}
+
+type EpTuple = (u64, String, Option<OrderId>, i64, String);
+
+impl From<EpTuple> for EpSnap {
+    fn from((t, k, o, d, n): EpTuple) -> Self {
+        Self { t, k, o, d, n }
+    }
+}
+
+impl From<EpSnap> for EpTuple {
+    fn from(e: EpSnap) -> Self {
+        (e.t, e.k, e.o, e.d, e.n)
+    }
+}
+
+impl EpSnap {
+    /// 从存档里的那条记录抄一份。**只读**：经历只能由业务事件写入。
+    fn of(e: &RiderEpisode) -> Self {
+        Self {
+            t: e.at_min,
+            k: episode_code(e.kind).to_string(),
+            o: e.order_id,
+            d: e.delta_cents,
+            n: e.note.clone(),
+        }
+    }
 }
 
 /// 手持单快照。
@@ -174,6 +230,7 @@ impl BrainRequest {
                         left: h.remaining_min,
                     })
                     .collect(),
+                eps: r.episodes().iter().map(EpSnap::of).collect(),
             })
             .collect();
 
@@ -233,6 +290,20 @@ impl BrainRequest {
     }
 }
 
+/// 经历短码（`eps` 里的 `k`）。
+///
+/// 别随手改：这些字符串就是 prompt 的一部分，改一次等于让所有缓存失效，
+/// 也让「同一份录像复现同一批决策」的旧录像对不上。
+pub fn episode_code(kind: EpisodeKind) -> &'static str {
+    match kind {
+        EpisodeKind::Delivered => "dl",
+        EpisodeKind::Refused => "rj",
+        EpisodeKind::Held => "hd",
+        EpisodeKind::Fined => "fn",
+        EpisodeKind::Forced => "fc",
+    }
+}
+
 /// 相位短码。
 pub fn phase_code(p: crate::sim::rider::Phase) -> &'static str {
     use crate::sim::rider::Phase;
@@ -259,7 +330,7 @@ pub struct TrimStats {
     pub truncated_remarks: usize,
 }
 
-/// 超预算时的裁剪（§2.4）。优先级：备注 → 尾部订单 → 尾部骑手 → 硬砍。
+/// 超预算时的裁剪（§2.4）。优先级：备注 → 经历 → 尾部订单 → 尾部骑手 → 硬砍。
 ///
 /// 顺序完全确定（先按价值排序再截断），否则同样的世界状态会生成不同的 prompt，
 /// 「同样状态 → 同样决策」的可复现性就没了。
@@ -288,6 +359,10 @@ pub fn trim_to_budget(req: &mut BrainRequest) -> TrimStats {
             .then(a.id.cmp(&b.id))
     });
 
+    // 经历排在订单前面：它是「这个人最近怎么样」的背景，大厅里的单才是
+    // 这一轮要决策的对象。预算不够时先让人物画像变薄，不能让模型看不见单。
+    trim_episodes(req);
+
     while req.body_bytes() > MAX_PROMPT_BYTES && !req.orders.is_empty() {
         req.orders.pop();
         stats.trimmed_orders += 1;
@@ -297,6 +372,29 @@ pub fn trim_to_budget(req: &mut BrainRequest) -> TrimStats {
         stats.trimmed_riders += 1;
     }
     stats
+}
+
+/// 超预算时先砍经历，每次只砍最旧的那条。
+///
+/// 每次挑「条数最多、并列时排最后」的骑手，丢掉他**最旧**的一条——这样每个
+/// 人都先保住最近发生的事，而不是让某一个人独占整段预算。
+///
+/// 只砍经历、不动订单和骑手：预算不够是常态（16 个骑手就能吃满 4KB），
+/// 让「背景」去挤「决策对象」是本末倒置。
+fn trim_episodes(req: &mut BrainRequest) {
+    while req.body_bytes() > MAX_PROMPT_BYTES {
+        let victim = req
+            .riders
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.eps.is_empty())
+            .max_by_key(|(i, r)| (r.eps.len(), *i))
+            .map(|(i, _)| i);
+        let Some(i) = victim else {
+            return;
+        };
+        req.riders[i].eps.remove(0);
+    }
 }
 
 /// 订单价值：每承诺分钟能挣多少分。用于裁剪排序与去重择优。
@@ -844,6 +942,10 @@ pub fn system_prompt() -> &'static str {
      只输出 JSON，禁止解释、前后缀、Markdown 代码块。\n\
      格式：{\"acts\":[{\"r\":\"r1\",\"act\":\"claim\",\"o\":43,\"why\":\"时薪32\"}],\
      \"policies\":[{\"r\":\"r1\",\"price\":\"high\",\"cap\":2,\"mode\":1,\"why\":\"雨天保守\"}]}\n\
+     riders 的 eps 是该骑手最近经历（最旧在前，最多 5 条，没有就不出现），\n\
+     每项 [t,k,o,d,n] = [绝对分钟, 类型, 单号, 金额变化(分), 备注]；\n\
+     k 取 dl 送达 / rj 拒单 / hd 观望 / fn 罚款 / fc 强派；d 正为进账、负为扣钱；\n\
+     t 自开局起算，不是当天分钟。它只是参考事实，不改变下面任何约束。\n\
      硬性约束：\n\
      1. r 只能取自 riders 里的 id，o 只能取自 orders 里的 id，编造的会被丢弃；\n\
      2. act 只能是 claim / reject / pass；\n\
@@ -917,6 +1019,14 @@ pub fn state_fingerprint(req: &BrainRequest) -> u64 {
         for held in &r.held {
             mix(&mut h, &format!("{}:{}:{}", held.o, held.ph, held.left));
         }
+        // 经历进了 prompt 就必须进指纹，否则「刚被罚过的骑手」会命中
+        // 「被罚之前那轮」的结论。条数和**每一条的每个字段**都要吃：
+        // 只比条数，5 条换成另外 5 条就漏了；只比最后一条，改中间那条就漏了。
+        mix(&mut h, &format!("e{}", r.eps.len()));
+        for e in &r.eps {
+            mix(&mut h, &format!("{}:{}:{:?}:{}", e.t, e.k, e.o, e.d));
+            mix(&mut h, &e.n);
+        }
     }
     for o in &req.orders {
         mix(&mut h, &format!("o{}:{}:{}", o.id, o.fee, o.left));
@@ -927,7 +1037,12 @@ pub fn state_fingerprint(req: &BrainRequest) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::{config::SimConfig, rider_key, world::World};
+    use crate::sim::{
+        config::SimConfig,
+        rider::{EpisodeKind, RiderEpisode},
+        rider_key,
+        world::World,
+    };
 
     fn world_with_orders(n: u32) -> World {
         let mut w = World::new_for_test(SimConfig::default(), 7);
@@ -1434,5 +1549,388 @@ mod tests {
         let v = check(&w, &resp);
         assert_eq!(v.dropped_station_ops(), 1);
         assert_eq!(v.station_ops.len(), 1);
+    }
+
+    // ---- 经历进提示词 ----
+
+    /// 直接往骑手身上压一条经历（业务侧也是走这个入口）。
+    fn push(
+        w: &mut World,
+        rider: RiderId,
+        at: u64,
+        kind: EpisodeKind,
+        order: Option<OrderId>,
+        delta: i64,
+        note: &str,
+    ) {
+        w.rider_mut(rider)
+            .expect("骑手在")
+            .push_episode(RiderEpisode::new(at, kind, order, delta, note));
+    }
+
+    fn snap_of(req: &BrainRequest, rider: RiderId) -> &RiderSnap {
+        req.riders
+            .iter()
+            .find(|r| r.id == rider_key(rider))
+            .expect("骑手在快照里")
+    }
+
+    fn request(w: &World) -> BrainRequest {
+        BrainRequest::build(w, &w.idle_riders(), &w.pending_orders())
+    }
+
+    /// 没有经历 → 连 `eps` 键都不出现，不留 `[]` 占位。
+    #[test]
+    fn an_empty_history_is_omitted_from_the_prompt() {
+        let w = world_with_orders(2);
+        let req = request(&w);
+        assert!(req.riders.iter().all(|r| r.eps.is_empty()));
+        assert!(
+            !user_prompt(&req).contains("\"eps\""),
+            "没有经历就不该有这个键"
+        );
+    }
+
+    /// 一条送达：类型、单号、金额（正号）、绝对时间、备注全都进载荷。
+    #[test]
+    fn a_delivered_episode_reaches_the_prompt() {
+        let mut w = world_with_orders(2);
+        let rid = w.riders[0].id;
+        let oid = w.pending_orders()[0];
+        push(
+            &mut w,
+            rid,
+            37,
+            EpisodeKind::Delivered,
+            Some(oid),
+            850,
+            "准时送达",
+        );
+
+        let req = request(&w);
+        assert_eq!(
+            snap_of(&req, rid).eps,
+            vec![EpSnap {
+                t: 37,
+                k: "dl".into(),
+                o: Some(oid),
+                d: 850,
+                n: "准时送达".into(),
+            }]
+        );
+        let json = user_prompt(&req);
+        assert!(json.contains("[37,\"dl\""), "{json}");
+        assert!(json.contains("850"), "{json}");
+    }
+
+    /// 罚款走真实扣款入口，到载荷里必须还是负数——丢了符号模型会读成「赚了」。
+    #[test]
+    fn a_fined_episode_keeps_its_negative_sign() {
+        let mut w = world_with_orders(2);
+        let rid = w.riders[0].id;
+        crate::sim::economy::issue_fine(
+            &mut w.riders[0],
+            &w.cfg,
+            500,
+            "camera",
+            "逆行被拍",
+            None,
+            12,
+        );
+
+        let req = request(&w);
+        let eps = &snap_of(&req, rid).eps;
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].k, "fn");
+        assert_eq!(eps[0].d, -500, "罚款是负数");
+        assert_eq!(eps[0].o, None, "罚款可以不挂单");
+        assert!(user_prompt(&req).contains("-500"), "{}", user_prompt(&req));
+    }
+
+    /// 五种经历各有代号且互不重复，模型才分得清「观望」和「强派」。
+    #[test]
+    fn all_five_episode_kinds_have_distinct_codes() {
+        let codes = [
+            episode_code(EpisodeKind::Delivered),
+            episode_code(EpisodeKind::Refused),
+            episode_code(EpisodeKind::Held),
+            episode_code(EpisodeKind::Fined),
+            episode_code(EpisodeKind::Forced),
+        ];
+        assert_eq!(codes, ["dl", "rj", "hd", "fn", "fc"]);
+
+        let mut uniq = codes.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 5, "代号撞了模型就分不清");
+    }
+
+    /// 观望与强派同时存在时，载荷里是两个不同的代号，顺序保持「最旧在前」。
+    #[test]
+    fn held_and_forced_stay_ordered_and_distinguishable() {
+        let mut w = world_with_orders(2);
+        let rid = w.riders[0].id;
+        push(&mut w, rid, 10, EpisodeKind::Held, Some(3), 0, "先观望");
+        push(&mut w, rid, 20, EpisodeKind::Forced, Some(4), 0, "被强派");
+
+        let req = request(&w);
+        let eps = &snap_of(&req, rid).eps;
+        assert_eq!(
+            eps.iter().map(|e| e.k.as_str()).collect::<Vec<_>>(),
+            ["hd", "fc"]
+        );
+        assert!(eps[0].t < eps[1].t, "越靠后越新");
+    }
+
+    /// `at_min` 是绝对分钟：1500 就写 1500，不会被取模成「当天第 60 分钟」。
+    #[test]
+    fn episode_time_is_absolute_not_the_minute_of_day() {
+        let mut w = world_with_orders(1);
+        let rid = w.riders[0].id;
+        push(&mut w, rid, 1500, EpisodeKind::Refused, Some(1), 0, "太远");
+
+        let req = request(&w);
+        assert_eq!(snap_of(&req, rid).eps[0].t, 1500);
+        assert!(req.sim.min < 1440, "前提：当天分钟是回绕过的");
+        assert_ne!(snap_of(&req, rid).eps[0].t, req.sim.min as u64);
+        assert!(user_prompt(&req).contains("1500"), "{}", user_prompt(&req));
+    }
+
+    /// 没有单号的经历序列化成 `null`（位置协议不能省格），读回来也正常。
+    #[test]
+    fn an_episode_without_an_order_round_trips() {
+        let mut w = world_with_orders(1);
+        let rid = w.riders[0].id;
+        push(&mut w, rid, 5, EpisodeKind::Fined, None, -300, "摔车赔钱");
+
+        let req = request(&w);
+        assert_eq!(snap_of(&req, rid).eps[0].o, None);
+        let json = user_prompt(&req);
+        assert!(json.contains("[5,\"fn\",null,-300,\"摔车赔钱\"]"), "{json}");
+
+        let back: BrainRequest = serde_json::from_str(&json).expect("能读回");
+        assert_eq!(back.riders, req.riders);
+    }
+
+    /// 经历只挂在自己名下：两个骑手的 `eps` 不许串。
+    #[test]
+    fn each_rider_carries_only_their_own_episodes() {
+        let mut w = world_with_orders(3);
+        assert!(w.riders.len() >= 2);
+        let (a, b) = (w.riders[0].id, w.riders[1].id);
+        push(
+            &mut w,
+            a,
+            10,
+            EpisodeKind::Delivered,
+            Some(3),
+            700,
+            "A 送达",
+        );
+        push(&mut w, b, 11, EpisodeKind::Refused, Some(4), 0, "B 拒单");
+        push(&mut w, b, 12, EpisodeKind::Held, Some(5), 0, "B 观望");
+
+        let req = request(&w);
+        let sa = snap_of(&req, a);
+        let sb = snap_of(&req, b);
+        assert_eq!(sa.eps.len(), 1);
+        assert_eq!(sa.eps[0].n, "A 送达");
+        assert_eq!(
+            sb.eps.iter().map(|e| e.k.as_str()).collect::<Vec<_>>(),
+            ["rj", "hd"]
+        );
+        assert_eq!(sb.eps[0].n, "B 拒单");
+    }
+
+    /// 旧载荷没有 `eps` 字段也要能读（存档与快照都是向前兼容的）。
+    #[test]
+    fn a_payload_without_eps_still_loads() {
+        let mut w = world_with_orders(1);
+        let rid = w.riders[0].id;
+        push(&mut w, rid, 5, EpisodeKind::Forced, Some(1), 0, "被强派");
+
+        let req = request(&w);
+        let mut v: serde_json::Value = serde_json::from_str(&user_prompt(&req)).expect("是 JSON");
+        for r in v["riders"].as_array_mut().expect("有骑手") {
+            r.as_object_mut().expect("是对象").remove("eps");
+        }
+        let back: BrainRequest = serde_json::from_value(v).expect("旧载荷要能读");
+        assert!(back.riders.iter().all(|r| r.eps.is_empty()));
+    }
+
+    // ---- 指纹必须跟着经历走 ----
+
+    /// 多出一条经历 → 指纹必变（空历史与有历史也必须不同）。
+    #[test]
+    fn a_new_episode_changes_the_fingerprint() {
+        let mut w = world_with_orders(2);
+        let rid = w.riders[0].id;
+        let before = state_fingerprint(&request(&w));
+
+        push(
+            &mut w,
+            rid,
+            20,
+            EpisodeKind::Delivered,
+            Some(1),
+            900,
+            "送达",
+        );
+        let after = state_fingerprint(&request(&w));
+
+        assert_ne!(before, after, "经历变了，缓存键不能还是旧的");
+    }
+
+    /// 条数不变、内容全换（5 条顶掉 5 条）也必须变——只比条数就会漏。
+    #[test]
+    fn replacing_five_episodes_with_five_others_changes_the_fingerprint() {
+        let mut w = world_with_orders(2);
+        let rid = w.riders[0].id;
+        for i in 0..5 {
+            push(
+                &mut w,
+                rid,
+                10 + i,
+                EpisodeKind::Delivered,
+                Some(i as OrderId + 1),
+                100 + i as i64,
+                "旧",
+            );
+        }
+        let before = state_fingerprint(&request(&w));
+        assert_eq!(w.rider(rid).expect("骑手在").episodes().len(), 5);
+
+        for i in 0..5 {
+            push(
+                &mut w,
+                rid,
+                20 + i,
+                EpisodeKind::Fined,
+                None,
+                -100 - i as i64,
+                "新",
+            );
+        }
+        let after = state_fingerprint(&request(&w));
+
+        assert_eq!(
+            w.rider(rid).expect("骑手在").episodes().len(),
+            5,
+            "条数没变"
+        );
+        assert_ne!(before, after, "内容全换了，指纹不能装看不见");
+    }
+
+    /// 时间、类型、单号、金额、备注——哪一个单独变，指纹都要变。
+    #[test]
+    fn every_episode_field_is_part_of_the_fingerprint() {
+        let mut w = world_with_orders(1);
+        let rid = w.riders[0].id;
+        push(
+            &mut w,
+            rid,
+            30,
+            EpisodeKind::Delivered,
+            Some(9),
+            500,
+            "准时",
+        );
+        let req = request(&w);
+        let base = state_fingerprint(&req);
+
+        type Mutator = fn(&mut EpSnap);
+        let cases: [(&str, Mutator); 5] = [
+            ("t", |e| e.t += 1),
+            ("k", |e| e.k = "fc".into()),
+            ("o", |e| e.o = Some(10)),
+            ("d", |e| e.d += 1),
+            ("n", |e| e.n.push('!')),
+        ];
+        for (name, mutate) in cases {
+            let mut c = req.clone();
+            mutate(&mut c.riders[0].eps[0]);
+            assert_ne!(base, state_fingerprint(&c), "改 {name} 必须换指纹");
+        }
+
+        // 单号从「有」变成「没有」也算变化，不能把 None 当成 0 号单。
+        let mut c = req.clone();
+        c.riders[0].eps[0].o = None;
+        assert_ne!(base, state_fingerprint(&c));
+    }
+
+    /// 只动最早那条、最后一条原样，指纹仍要变——否则「只看最后一条」就会漏。
+    #[test]
+    fn changing_an_older_episode_changes_the_fingerprint() {
+        let mut w = world_with_orders(1);
+        let rid = w.riders[0].id;
+        push(&mut w, rid, 1, EpisodeKind::Delivered, Some(1), 100, "一");
+        push(&mut w, rid, 2, EpisodeKind::Refused, Some(2), 0, "二");
+        push(&mut w, rid, 3, EpisodeKind::Held, Some(3), 0, "三");
+
+        let req = request(&w);
+        let mut c = req.clone();
+        c.riders[0].eps[0].d += 1;
+
+        assert_ne!(state_fingerprint(&req), state_fingerprint(&c));
+        assert_eq!(
+            c.riders[0].eps.last(),
+            req.riders[0].eps.last(),
+            "前提：最后一条没动"
+        );
+    }
+
+    /// 经历没变，指纹就稳定（否则缓存永远不命中，等于每轮都白调）。
+    #[test]
+    fn untouched_episodes_keep_the_fingerprint_stable() {
+        let mut w = world_with_orders(2);
+        let rid = w.riders[0].id;
+        push(&mut w, rid, 8, EpisodeKind::Delivered, Some(1), 600, "送达");
+
+        assert_eq!(
+            state_fingerprint(&request(&w)),
+            state_fingerprint(&request(&w))
+        );
+    }
+
+    /// 预算不够时先砍经历：订单和张数一个都不能少，砍到够为止。
+    #[test]
+    fn episodes_are_trimmed_before_orders() {
+        let cfg = SimConfig {
+            sim_rider_count: 8,
+            ..Default::default()
+        };
+        let mut bare = World::new_for_test(cfg.clone(), 11);
+        bare.generate_order_batch(6);
+        let reference = request(&bare);
+
+        let mut rich = World::new_for_test(cfg, 11);
+        rich.generate_order_batch(6);
+        let ids: Vec<RiderId> = rich.riders.iter().map(|r| r.id).collect();
+        for rid in &ids {
+            for k in 0..5 {
+                push(
+                    &mut rich,
+                    *rid,
+                    10 * k,
+                    EpisodeKind::Delivered,
+                    Some(1),
+                    300,
+                    "一直在跑单",
+                );
+            }
+        }
+        let req = request(&rich);
+
+        assert!(req.body_bytes() <= MAX_PROMPT_BYTES, "裁剪后必须进预算");
+        assert_eq!(req.orders.len(), reference.orders.len(), "经历不许挤掉订单");
+        assert_eq!(
+            req.riders.len(),
+            reference.riders.len(),
+            "经历也不许挤掉骑手"
+        );
+
+        let kept: usize = req.riders.iter().map(|r| r.eps.len()).sum();
+        assert!(kept < ids.len() * 5, "前提：确实超预算、确实砍了经历");
+        assert!(kept > 0, "省下的预算要留给经历，不能全砍光");
     }
 }
