@@ -14,7 +14,7 @@ use super::{
     event::{DecisionSource, SimEvent},
     geo::{LatLng, haversine_m},
     order::{AssignMode, OrderStatus, OrderTier},
-    rider::{HeldOrder, Phase, Rider, RiderKind, SpeedMode},
+    rider::{EpisodeKind, HeldOrder, Phase, Rider, RiderEpisode, RiderKind, SpeedMode},
     route::{LegKind, RouteLeg, RouteTask},
     world::World,
 };
@@ -240,6 +240,19 @@ pub fn assign_forced(
     // `reject_order`——后者靠这个标记才知道该吃拒单额度而不是扣 5 元罚款。
     if let Some(r) = world.rider_mut(rider_id) {
         r.assign_pending = Some(order_id);
+        // 只有**真强制**才记经历。这个函数同时也承担普通派单（`mode = Offer`，
+        // 来自 LLM / 本地算法 / 控制端「指派单」），那种单骑手还能拒，标成
+        // `Forced` 就是撒谎。判的是上面被 `forced_offline` 纠正过的**生效值**：
+        // 拒单额度用完被迫下线的人，收到的一切派单都是强制的。
+        if mode == AssignMode::Forced {
+            r.push_episode(RiderEpisode::new(
+                now,
+                EpisodeKind::Forced,
+                Some(order_id),
+                0,
+                "被强制派单",
+            ));
+        }
     }
     Ok(assignment)
 }
@@ -1040,6 +1053,17 @@ pub fn reject_order(
         }
         let used = world.rider(rider_id).map(|r| r.rejected).unwrap_or(0);
         world.release_to_hall(order_id);
+        // 走到这里才是「拒单生效」：额度用尽那条路在上面已经 `return Err`，
+        // 强制派单更早就被 `AssignForced` 挡回去了，两者都不会留下经历。
+        if let Some(rider) = world.rider_mut(rider_id) {
+            rider.push_episode(RiderEpisode::new(
+                now,
+                EpisodeKind::Refused,
+                Some(order_id),
+                0,
+                "拒绝指派单",
+            ));
+        }
         let mut events = vec![SimEvent::AssignRejected {
             rider_id,
             order_id,
@@ -1772,5 +1796,147 @@ mod tests {
         w.cfg.allow_rider_violation = true;
         deliver(&mut w, rid, oid).expect("放行后可以一步送到");
         assert_eq!(w.order(oid).expect("订单在").status, OrderStatus::Delivered);
+    }
+
+    // ---- 经历：拒单 / 强制指派 / 送达接线 ----
+
+    /// 拒掉一张还没接受的指派单 → 恰好一条 `Refused`。
+    #[test]
+    fn rejecting_a_pending_assign_writes_one_refused_episode() {
+        let (mut w, rid, oid) = world_with_pending_assign(3);
+        w.elapsed_min = 480;
+        assert!(
+            w.rider(rid).expect("骑手在").episodes().is_empty(),
+            "派到手还不算经历，拒了才算"
+        );
+
+        reject_order(&mut w, rid, oid).expect("额度够，拒得掉");
+
+        let eps = w.rider(rid).expect("骑手在").episodes();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].kind, EpisodeKind::Refused);
+        assert_eq!(eps[0].order_id, Some(oid));
+        assert_eq!(eps[0].at_min, 480);
+        assert_eq!(eps[0].delta_cents, 0);
+    }
+
+    /// 强制单拒不掉：命令返回错误就说明没生效，不许留下 `Refused`。
+    #[test]
+    fn refusing_a_forced_assignment_leaves_no_episode() {
+        let (mut w, rid) = one_rider(23);
+        let oid = w.generate_order_batch(1)[0];
+        assign_forced(&mut w, oid, rid, AssignMode::Forced).expect("能塞进去");
+        let before = w.rider(rid).expect("骑手在").episodes().len();
+
+        assert_eq!(
+            reject_order(&mut w, rid, oid).expect_err("强制单拒不掉"),
+            ClaimError::AssignForced
+        );
+        assert_eq!(
+            w.rider(rid).expect("骑手在").episodes().len(),
+            before,
+            "没生效就不许记"
+        );
+    }
+
+    /// 额度用尽时那一单根本拒不掉，不能记成一次成功的拒单。
+    #[test]
+    fn a_rejection_over_the_quota_leaves_no_episode() {
+        let (mut w, rid, first) = world_with_pending_assign(1);
+        reject_order(&mut w, rid, first).expect("第一次还在额度里");
+        assert_eq!(w.rider(rid).expect("骑手在").episodes().len(), 1);
+
+        // 额度用完之后平台又塞过来一张（现实里就是「已强制下线，单还在挂」）：
+        // 手挂一张待确认的单，但这单没被标成强制。
+        let second = w.generate_order_batch(1)[0];
+        w.rider_mut(rid).expect("骑手在").assign_pending = Some(second);
+
+        assert_eq!(
+            reject_order(&mut w, rid, second).expect_err("额度满了"),
+            ClaimError::RejectLimitReached
+        );
+        assert_eq!(
+            w.rider(rid).expect("骑手在").episodes().len(),
+            1,
+            "被拒的拒单不算经历"
+        );
+    }
+
+    /// 强制指派落地 → 恰好一条 `Forced`；同一单再塞一次失败，不再追加。
+    #[test]
+    fn a_forced_assignment_writes_one_forced_episode() {
+        let (mut w, rid) = one_rider(31);
+        let oid = w.generate_order_batch(1)[0];
+        w.elapsed_min = 900;
+
+        assign_forced(&mut w, oid, rid, AssignMode::Forced).expect("能强制指派");
+
+        let eps = w.rider(rid).expect("骑手在").episodes();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].kind, EpisodeKind::Forced);
+        assert_eq!(eps[0].order_id, Some(oid));
+        assert_eq!(eps[0].at_min, 900);
+        assert_eq!(eps[0].delta_cents, 0, "派单本身不产生流水");
+
+        assert_eq!(
+            assign_forced(&mut w, oid, rid, AssignMode::Forced).expect_err("同一单不能塞两次"),
+            ClaimError::AlreadyClaimed
+        );
+        assert_eq!(
+            w.rider(rid).expect("骑手在").episodes().len(),
+            1,
+            "失败的那次不许再记"
+        );
+    }
+
+    /// 普通的「指派单」（`Offer`，骑手还能拒）不是强制，不该标成 `Forced`。
+    #[test]
+    fn a_plain_offer_assignment_writes_no_forced_episode() {
+        let (w, rid, _oid) = world_with_pending_assign(3);
+        assert!(w.rider(rid).expect("骑手在").episodes().is_empty());
+    }
+
+    /// 被强制下线的人收到的一切派单都是强制的：调用方传 `Offer` 也一样。
+    #[test]
+    fn an_offer_to_a_forced_offline_rider_counts_as_forced() {
+        let (mut w, rid) = one_rider(37);
+        {
+            let r = w.rider_mut(rid).expect("骑手在");
+            r.online = false;
+            r.forced_offline = true;
+        }
+        let oid = w.generate_order_batch(1)[0];
+
+        assign_forced(&mut w, oid, rid, AssignMode::Offer).expect("强制单还是塞得进");
+
+        let eps = w.rider(rid).expect("骑手在").episodes();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(
+            eps[0].kind,
+            EpisodeKind::Forced,
+            "判的是生效值：`forced_offline` 会把 Offer 抬成 Forced"
+        );
+    }
+
+    /// 送达走业务入口，恰好一条 `Delivered`，金额和账上一致。
+    #[test]
+    fn delivering_writes_one_delivered_episode() {
+        let (mut w, rid, oid) = world_with_pending_assign(3);
+        {
+            let r = w.rider_mut(rid).expect("骑手在");
+            r.held[0].set_leg(Phase::ArrivedCustomer, 1);
+        }
+        w.order_mut(oid).expect("订单在").status = OrderStatus::PickedUp;
+        w.elapsed_min = 42;
+
+        deliver(&mut w, rid, oid).expect("能送到");
+
+        let r = w.rider(rid).expect("骑手在");
+        let eps = r.episodes();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].kind, EpisodeKind::Delivered);
+        assert_eq!(eps[0].order_id, Some(oid));
+        assert_eq!(eps[0].at_min, 42);
+        assert_eq!(eps[0].delta_cents, r.cash_cents, "经历金额 = 实际入账");
     }
 }

@@ -1076,6 +1076,39 @@ mod tests {
         assert_eq!(v.drops[0].reason, DropReason::RiderHeld);
     }
 
+    /// 被校验挡掉的表态不会进 `verdict.refusals`，于是也不会留下经历：
+    /// 「拒了 / 观望了」必须发生在真正落地的那一层（`World::record_refusals`）。
+    #[test]
+    fn a_refusal_dropped_by_validation_writes_no_episode() {
+        let mut w = world();
+        w.generate_order_batch(1);
+        let pending: Vec<_> = w.orders.iter().map(|o| o.id).collect();
+        // 名单里只有第一个骑手；第二个「不在本轮名单」，他这条表态要整条丢掉。
+        let idle = vec![w.riders[0].id];
+        let ghost = w.riders[1].id;
+
+        let plan = LlmPlan {
+            refusals: vec![LlmRefusal {
+                rider: ghost,
+                order: pending[0],
+                kind: crate::sim::world::RefusalKind::Pass,
+                reason: "先观望".into(),
+            }],
+            ..Default::default()
+        };
+        let v = validate_llm_plan(&w, &plan, &idle, &pending);
+        assert!(v.refusals.is_empty(), "前提：这一条被校验挡掉了");
+        assert_eq!(v.drops[0].reason, DropReason::RiderNotEligible);
+
+        w.record_refusals(&v.refusals);
+
+        assert!(!w.is_held(ghost), "校验没过，观望也不能生效");
+        assert!(
+            w.rider(ghost).expect("骑手在").episodes().is_empty(),
+            "没生效就不该有 Held 经历"
+        );
+    }
+
     /// 记录失效后必须能重新评估：拒一次不能等于永久黑名单。
     #[test]
     fn an_expired_refusal_lets_the_plan_through_again() {

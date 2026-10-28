@@ -6,7 +6,7 @@ use super::{
     OrderId,
     config::SimConfig,
     order::{FeeBreakdown, Order, OrderStatus, OrderTier},
-    rider::{LedgerEntry, Rider},
+    rider::{EpisodeKind, LedgerEntry, Rider, RiderEpisode},
     weather::Weather,
 };
 
@@ -182,13 +182,25 @@ pub fn issue_fine(
     rider.shift_mood(cfg.mood.per_fine, cfg);
     rider.fines_cents += amount_cents;
     debit(rider, amount_cents);
+    let reason = reason.into();
     rider.push_ledger(LedgerEntry {
         at_min: now_min,
         order_id,
         kind: kind.to_string(),
         amount_cents: -amount_cents,
-        reason: reason.into(),
+        reason: reason.clone(),
     });
+    // 经历也挂在这里，理由和情绪一样：调用点散在 `tick` / `scheduler` / `app`
+    // 六处，逐个手加迟早漏一个。金额取**这次真正扣掉的数**（`amount_cents`），
+    // 不是配置里的名义数值——虽然目前所有调用点传的就是配置值，
+    // 但把口径定在入参上，将来有人打折开罚单也不会记错账。
+    rider.push_episode(RiderEpisode::new(
+        now_min,
+        EpisodeKind::Fined,
+        order_id,
+        -amount_cents,
+        reason,
+    ));
 }
 
 /// 调整评分并夹在 [4.0, 5.0]。
@@ -276,6 +288,16 @@ pub fn settle_delivery(
         },
     };
     rider.push_ledger(entry.clone());
+    // 经历取**这一单真正发生的净变化**：`credited` 是 `credit()` 的返回值，
+    // 已经过超时赔付（`takehome` 里扣掉的）与欠款抵扣，不是报价、不是基础运费、
+    // 也不是 `order.takehome_cents()` 那个结算前的估值。
+    rider.push_episode(RiderEpisode::new(
+        now_min,
+        EpisodeKind::Delivered,
+        Some(order.id),
+        credited,
+        if late { "超时送达" } else { "准时送达" },
+    ));
     (entry, late)
 }
 
@@ -496,5 +518,113 @@ mod tests {
         close_day(&cfg, &mut r);
         assert_eq!(r.mood, cfg.mood.initial);
         assert_eq!(r.fatigue, 0.0, "日结同时清疲劳，两者一起回满");
+    }
+
+    // ---- 经历：结算与罚款接线 ----
+
+    /// 一张**真订单**（走世界生成，费用与时限都是真的）+ 一个空骑手。
+    fn real_order(seed: u64) -> (SimConfig, Rider, Order) {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            ..Default::default()
+        };
+        let mut w = crate::sim::world::World::new_for_test(cfg.clone(), seed);
+        let oid = w.generate_order_batch(1)[0];
+        let order = w.order(oid).expect("订单在").clone();
+        let r = rider(&cfg);
+        (cfg, r, order)
+    }
+
+    /// 结算成功就恰好一条 `Delivered`，金额是**真入账**的那一笔。
+    #[test]
+    fn a_delivery_writes_one_delivered_episode_with_the_credited_amount() {
+        let (cfg, mut r, mut o) = real_order(11);
+        let now = o.created_at_min + 1;
+        r.cash_cents = 0;
+
+        let (entry, late) = settle_delivery(&cfg, &mut r, &mut o, now);
+        assert!(!late, "前提：这不是超时单");
+
+        let eps = r.episodes();
+        assert_eq!(eps.len(), 1, "一单只记一条");
+        assert_eq!(eps[0].kind, EpisodeKind::Delivered);
+        assert_eq!(eps[0].order_id, Some(o.id));
+        assert_eq!(eps[0].at_min, now, "记的是传进来的绝对分钟");
+        assert_eq!(eps[0].delta_cents, entry.amount_cents);
+        assert_eq!(r.cash_cents, entry.amount_cents, "钱和经历说的是同一笔");
+        assert_eq!(eps[0].note, "准时送达");
+    }
+
+    /// 超时赔付从到手金额里扣，经历要记**扣完之后**的净额，不是结算前的估价。
+    #[test]
+    fn the_delivered_episode_is_the_net_after_the_late_penalty() {
+        let (cfg, mut r, mut o) = real_order(13);
+        let now = o.created_at_min + o.promised_minutes as u64 + 5;
+        let estimate = o.takehome_cents();
+        let penalty = cfg.fine.deliver_timeout_cents.min(estimate.max(0));
+        assert!(penalty > 0, "前提：超时确实要赔");
+
+        let (entry, late) = settle_delivery(&cfg, &mut r, &mut o, now);
+        assert!(late, "前提：已经超时");
+
+        let e = &r.episodes()[0];
+        assert_eq!(entry.amount_cents, estimate - penalty);
+        assert_eq!(
+            e.delta_cents,
+            estimate - penalty,
+            "净额，不是 takehome 估价"
+        );
+        assert!(e.delta_cents < estimate, "赔付已经扣掉了");
+        assert_eq!(e.note, "超时送达");
+    }
+
+    /// 罚款：一条 `Fined`，金额为负，`order_id` / `at_min` / 原因原样带过去。
+    #[test]
+    fn a_fine_writes_one_episode_with_a_negative_delta() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        issue_fine(&mut r, &cfg, 500, "camera", "逆行被拍", Some(7), 10);
+
+        assert_eq!(r.episodes().len(), 1);
+        let e = &r.episodes()[0];
+        assert_eq!(e.kind, EpisodeKind::Fined);
+        assert_eq!(e.delta_cents, -500, "扣钱，不是加钱");
+        assert_eq!(e.order_id, Some(7));
+        assert_eq!(e.at_min, 10);
+        assert_eq!(e.note, "逆行被拍");
+    }
+
+    /// 金额为 0 的「罚单」既没扣钱也没掉情绪，同样不该留经历。
+    #[test]
+    fn a_zero_fine_writes_no_episode() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        issue_fine(&mut r, &cfg, 0, "camera", "空单", None, 11);
+        assert!(r.episodes().is_empty());
+    }
+
+    /// 跨日后仍按绝对分钟追加（不是当日 0..1440），总量照旧卡在 5 条。
+    #[test]
+    fn episodes_keep_absolute_minutes_and_the_cap_across_days() {
+        use crate::sim::MINUTES_PER_DAY;
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        let base = MINUTES_PER_DAY as u64 + 100;
+        for i in 0..(crate::sim::rider::MAX_EPISODES as u64 + 1) {
+            issue_fine(&mut r, &cfg, 100, "late", "超时", None, base + i);
+        }
+
+        let eps = r.episodes();
+        assert_eq!(eps.len(), crate::sim::rider::MAX_EPISODES);
+        assert_eq!(eps[0].at_min, base + 1, "丢掉的是最旧那条");
+        assert_eq!(
+            eps.last().expect("不空").at_min,
+            base + crate::sim::rider::MAX_EPISODES as u64,
+            "新经历用的是绝对分钟，不是当日分钟"
+        );
+        assert!(
+            eps.iter().all(|e| e.at_min >= MINUTES_PER_DAY as u64),
+            "跨日之后不能出现 0..1440 的当日分钟"
+        );
     }
 }

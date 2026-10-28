@@ -481,6 +481,14 @@ pub struct Rider {
     /// 平台活动进度，每人一份。老存档没有这个字段 = 没参加过任何活动。
     #[serde(default)]
     pub activities: Vec<ActivityProgress>,
+
+    /// 最近几件值得记住的事，按时间**从旧到新**，最多 [`MAX_EPISODES`] 条。
+    ///
+    /// 私有是有意的：写入只留 [`Rider::push_episode`] 一个口子，
+    /// 谁都没法直接 `push` 一下把上限绕过去。读走 [`Rider::episodes`]。
+    /// 老存档没有这个字段 = 还没记过事。
+    #[serde(default)]
+    episodes: Vec<RiderEpisode>,
 }
 
 /// 账单明细一条。罚单必须带原因。
@@ -491,6 +499,95 @@ pub struct LedgerEntry {
     pub kind: String,
     pub amount_cents: i64,
     pub reason: String,
+}
+
+/// 每位骑手最多留几条近期经历。写满就丢最旧的。
+///
+/// 定成 5 条是**展示预算**而不是存储预算：这串东西迟早要进 LLM 提示词，
+/// 每条都花 token，而「最近五件事」已经够说清这人这两天顺不顺。
+/// 想放宽就改这里——上限只有一处，别在别处再写死一个数。
+pub const MAX_EPISODES: usize = 5;
+
+/// [`RiderEpisode::note`] 的字数上限。
+///
+/// 按**字符**算而不是字节：一个汉字三字节，按字节截会把汉字劈成乱码。
+pub const MAX_EPISODE_NOTE_CHARS: usize = 24;
+
+/// 一段近期经历的类型。
+///
+/// 只用粗粒度分类，不细分原因：细分留给 `note`（一句话）和订单本身。
+/// 这些码进存档、也进将来的提示词，**改名等于改存档格式**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeKind {
+    /// 送达一单（无论准时还是超时，`note` 里分）。
+    Delivered,
+    /// 拒了一单（拒掉平台指派、还没接下的那单）。
+    Refused,
+    /// 暂缓接单：进入观望窗口，一段时间内不接受自动补位。
+    ///
+    /// 注意别和 `Rider::held`（手上正在跑的单）混为一谈——这里的 `Held`
+    /// 是「他主动往后退了一步」，不是「他手上多了一单」。
+    Held,
+    /// 被罚款（钱真的从账上扣掉了，`delta_cents` 为负）。
+    Fined,
+    /// 被强制派单这类不由自己决定的事。
+    Forced,
+}
+
+/// 一条近期经历：骑手身上发生过的、值得记住的一件小事。
+///
+/// 与 [`LedgerEntry`] 的分工：账单记的是**钱**（每一笔收支都要有，可以很长），
+/// 这里记的是**事**（只留最近几条，可以没有金额）。两者都挂在骑手身上、
+/// 都按时间追加，但容量差了 40 倍——别把账单塞进经历。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiderEpisode {
+    /// 事件发生的模拟时间：**自开局起的绝对分钟**（`World::elapsed_min`）。
+    ///
+    /// 不用当日分钟（`sim_minute`）：经历跨天不清，用当日分钟会让昨天的
+    /// 23:50 排在今天的 00:10 后面。
+    pub at_min: u64,
+    pub kind: EpisodeKind,
+    /// 关联订单。不是每件事都有单（比如罚款可能来自事故）。
+    #[serde(default)]
+    pub order_id: Option<OrderId>,
+    /// 这次经历带来的**实际**经济变化，单位分：赚了为正、罚了为负、纯事件为 0。
+    /// 不做估算——写进来的必须是账上真的动过的数。
+    #[serde(default)]
+    pub delta_cents: i64,
+    /// 一句话说明。长度由 [`RiderEpisode::new`] 统一截断。
+    #[serde(default)]
+    pub note: String,
+}
+
+impl RiderEpisode {
+    /// 造一条经历，顺手把 `note` 截到上限。
+    ///
+    /// **截断只写在这一处**：业务层照原话传进来，不自己剪——剪法一散开，
+    /// 总有一条路径会漏，超长说明就会从那里漏进存档。
+    pub fn new(
+        at_min: u64,
+        kind: EpisodeKind,
+        order_id: Option<OrderId>,
+        delta_cents: i64,
+        note: impl AsRef<str>,
+    ) -> Self {
+        Self {
+            at_min,
+            kind,
+            order_id,
+            delta_cents,
+            note: clamp_note(note.as_ref()),
+        }
+    }
+}
+
+/// 把说明截到 [`MAX_EPISODE_NOTE_CHARS`] 个字符。
+///
+/// 超长不报错、不拒绝：经历是**观测记录**，不是入参校验点——一句话写长了
+/// 就不记，等于把真实发生的事吞掉。截断比丢事件好。
+fn clamp_note(note: &str) -> String {
+    note.chars().take(MAX_EPISODE_NOTE_CHARS).collect()
 }
 
 impl Rider {
@@ -536,6 +633,7 @@ impl Rider {
             recall_count: 0,
             last_ledger: Vec::new(),
             activities: Vec::new(),
+            episodes: Vec::new(),
         }
     }
 
@@ -780,6 +878,31 @@ impl Rider {
             self.last_ledger.drain(0..drop);
         }
     }
+
+    /// 最近的经历，按时间**从旧到新**（最后一条是最新的）。
+    ///
+    /// 顺序由追加顺序定死（`Vec`，不是 `HashMap`）：同一分钟内发生两件事时
+    /// 先后就按调用顺序，重放可复现。
+    pub fn episodes(&self) -> &[RiderEpisode] {
+        &self.episodes
+    }
+
+    /// 记一条经历。**所有写入都必须走这里**：满了就从最旧的开始丢。
+    ///
+    /// `note` 在这里再截一次：字段是公开的，有人完全可能绕过
+    /// [`RiderEpisode::new`] 直接拼一个结构体出来。容量上限是**存储**的性质，
+    /// 不能指望调用方守规矩。
+    ///
+    /// 不在本轮撒到各个业务事件里——先把「记得住、有上限」立起来，
+    /// 写哪些事件是下一步的事。
+    pub fn push_episode(&mut self, mut episode: RiderEpisode) {
+        episode.note = clamp_note(&episode.note);
+        self.episodes.push(episode);
+        if self.episodes.len() > MAX_EPISODES {
+            let drop = self.episodes.len() - MAX_EPISODES;
+            self.episodes.drain(0..drop);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -988,5 +1111,191 @@ mod tests {
         v.as_object_mut().unwrap().remove("mood");
         let back: Rider = serde_json::from_value(v).unwrap();
         assert_eq!(back.mood, crate::sim::config::DEFAULT_MOOD);
+    }
+
+    // ---- 近期经历（有界的）----
+
+    /// 造一条经历。测试只关心「记进去之后还在不在、顺序对不对」，
+    /// 金额与订单号给个固定的非零值，方便断言没被改写。
+    fn episode(at_min: u64, kind: EpisodeKind, note: &str) -> RiderEpisode {
+        RiderEpisode::new(at_min, kind, Some(at_min as OrderId + 1), 0, note)
+    }
+
+    /// 新骑手身上一条经历都没有。
+    #[test]
+    fn a_new_rider_starts_with_no_episodes() {
+        let cfg = SimConfig::default();
+        assert!(rider(&cfg).episodes().is_empty());
+    }
+
+    /// 五个字段原样保存，一个都不许丢或改。
+    #[test]
+    fn an_episode_keeps_every_field_it_was_given() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        r.push_episode(RiderEpisode::new(
+            137,
+            EpisodeKind::Fined,
+            Some(42),
+            -500,
+            "逆行被拍",
+        ));
+
+        let e = &r.episodes()[0];
+        assert_eq!(e.at_min, 137);
+        assert_eq!(e.kind, EpisodeKind::Fined);
+        assert_eq!(e.order_id, Some(42));
+        assert_eq!(e.delta_cents, -500);
+        assert_eq!(e.note, "逆行被拍");
+    }
+
+    /// 第 6 条进来时最旧的被挤掉：上限就是 5 条，不靠调用方自觉。
+    #[test]
+    fn only_the_latest_five_episodes_are_kept() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        for i in 0..(MAX_EPISODES as u64 + 1) {
+            r.push_episode(episode(i, EpisodeKind::Delivered, "送达"));
+        }
+
+        assert_eq!(r.episodes().len(), MAX_EPISODES);
+        assert_eq!(r.episodes()[0].at_min, 1, "丢掉的是最旧的 0 号");
+        assert_eq!(
+            r.episodes()[MAX_EPISODES - 1].at_min,
+            MAX_EPISODES as u64,
+            "最新一条在末尾"
+        );
+    }
+
+    /// 顺序 = 追加顺序（旧在前、新在后），不依赖任何遍历顺序。
+    #[test]
+    fn episodes_are_ordered_oldest_first() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        for (i, kind) in [EpisodeKind::Held, EpisodeKind::Refused, EpisodeKind::Forced]
+            .into_iter()
+            .enumerate()
+        {
+            r.push_episode(RiderEpisode::new(i as u64 * 30, kind, None, 0, ""));
+        }
+
+        let kinds: Vec<EpisodeKind> = r.episodes().iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![EpisodeKind::Held, EpisodeKind::Refused, EpisodeKind::Forced]
+        );
+        let times: Vec<u64> = r.episodes().iter().map(|e| e.at_min).collect();
+        assert_eq!(times, vec![0, 30, 60]);
+    }
+
+    /// 老存档没有 `episodes` 字段也能读，且读出来是空而不是报错。
+    #[test]
+    fn a_legacy_rider_without_episodes_still_loads() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        r.push_episode(episode(9, EpisodeKind::Delivered, "送达"));
+        let mut v = serde_json::to_value(&r).unwrap();
+        v.as_object_mut().unwrap().remove("episodes");
+
+        let back: Rider = serde_json::from_value(v).unwrap();
+        assert!(back.episodes().is_empty(), "缺字段 = 还没记过事");
+        assert_eq!(back.name, r.name, "其余字段照旧");
+    }
+
+    /// 日结照旧清当日计数与账单，但**不动**经历。
+    #[test]
+    fn closing_the_day_keeps_the_episodes() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        r.completed = 4;
+        r.push_ledger(LedgerEntry {
+            at_min: 10,
+            order_id: Some(1),
+            kind: "delivery".to_string(),
+            amount_cents: 800,
+            reason: "测试".to_string(),
+        });
+        r.push_episode(episode(10, EpisodeKind::Delivered, "准时送达"));
+        r.push_episode(episode(20, EpisodeKind::Fined, "超时赔付"));
+        let before = r.episodes().to_vec();
+
+        let _ = crate::sim::economy::close_day(&cfg, &mut r);
+
+        assert_eq!(r.completed, 0, "当日计数照旧清零");
+        assert!(r.last_ledger.is_empty(), "当天账单照旧清空");
+        assert_eq!(r.episodes(), before.as_slice(), "经历不随日结清空");
+    }
+
+    /// `note` 被截到上限，而且是**按字符**截：中文不会被劈成半个字。
+    #[test]
+    fn a_long_note_is_cut_to_the_limit() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        let long = "超".repeat(MAX_EPISODE_NOTE_CHARS * 8);
+        r.push_episode(RiderEpisode::new(1, EpisodeKind::Held, None, 0, long));
+
+        let note = &r.episodes()[0].note;
+        assert_eq!(note.chars().count(), MAX_EPISODE_NOTE_CHARS);
+        assert_eq!(
+            note.len(),
+            MAX_EPISODE_NOTE_CHARS * "超".len(),
+            "按字符截，不是按字节"
+        );
+        assert_eq!(note, &"超".repeat(MAX_EPISODE_NOTE_CHARS));
+
+        // 没超长的原样留着，别顺手加个省略号之类的东西。
+        r.push_episode(RiderEpisode::new(
+            2,
+            EpisodeKind::Held,
+            None,
+            0,
+            "正好五个字",
+        ));
+        assert_eq!(r.episodes()[1].note, "正好五个字");
+    }
+
+    /// 就算绕过 `RiderEpisode::new` 直接拼结构体，写进去的说明照样被截：
+    /// 上限是**存储**的性质，不是构造函数的口头约定。
+    #[test]
+    fn a_note_written_around_the_constructor_is_still_clamped() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        r.push_episode(RiderEpisode {
+            at_min: 1,
+            kind: EpisodeKind::Held,
+            order_id: None,
+            delta_cents: 0,
+            note: "长".repeat(MAX_EPISODE_NOTE_CHARS * 4),
+        });
+
+        assert_eq!(r.episodes()[0].note.chars().count(), MAX_EPISODE_NOTE_CHARS);
+    }
+
+    /// 存档往返之后，内容和顺序都不变；`kind` 走的是 snake_case 码。
+    #[test]
+    fn episodes_survive_a_save_round_trip() {
+        let cfg = SimConfig::default();
+        let mut r = rider(&cfg);
+        for i in 0..MAX_EPISODES as u64 {
+            r.push_episode(RiderEpisode::new(
+                i,
+                EpisodeKind::Delivered,
+                Some(i as OrderId),
+                i as i64 * 10 + 1,
+                format!("第{i}单"),
+            ));
+        }
+
+        let json = serde_json::to_string(&r).unwrap();
+        let back: Rider = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.episodes(), r.episodes());
+        assert_eq!(back.episodes().len(), MAX_EPISODES);
+        let times: Vec<u64> = back.episodes().iter().map(|e| e.at_min).collect();
+        assert_eq!(times, vec![0, 1, 2, 3, 4], "顺序必须原样保留");
+        assert!(
+            json.contains("\"delivered\""),
+            "类型的对外码是 snake_case，不是 Debug 名"
+        );
     }
 }

@@ -19,10 +19,18 @@ use super::{
     merchant::Merchant,
     notice,
     order::{ExtraTask, FeeBreakdown, Order, OrderStatus, OrderTier},
-    rider::{Phase, Rider, RiderKind, SpeedMode},
+    rider::{EpisodeKind, Phase, Rider, RiderEpisode, RiderKind, SpeedMode},
     task::TaskTemplate,
     weather::{Weather, WeatherEvent},
 };
+
+/// 挑一句能写进经历的话：模型给的 `why` 经常是空的，那就用兜底文案。
+///
+/// 长度不在这里管——[`RiderEpisode::new`] 会按字符截到 24。
+fn note_of<'a>(why: &'a str, fallback: &'a str) -> &'a str {
+    let why = why.trim();
+    if why.is_empty() { fallback } else { why }
+}
 
 /// 路网绕行系数：直线 → 实际骑行距离。
 pub const ROAD_FACTOR: f64 = 1.25;
@@ -635,13 +643,30 @@ impl World {
     ///
     /// 两者都不写 `rider.held`、不改订单状态、不计拒单处罚——它们只是
     /// 「本地补位时的排除项」。
+    /// 落地一批 LLM 的拒单 / 观望。**同时记经历**：这是两种表态真正生效的地方。
+    ///
+    /// 经历只在这里写：`validate_llm_plan` 那层只管筛掉不合法的意图（被筛掉的
+    /// 压根不会进这个列表），而「进列表」不等于「生效」——真正的生效点就是
+    /// `refusals` / `rider_holds` 被写进去的这一刻。
+    ///
+    /// **去重**：同一批里把同一个人对同一张单写两遍（模型偶尔会）只记一次；
+    /// 观望状态本来就在（`is_held` 为真）时也不再追加——状态没变，不算新经历。
     pub fn record_refusals(&mut self, list: &[ai::LlmRefusal]) {
         let now = self.elapsed_min;
         let reject_ttl = self.cfg.llm_refusal_ttl_min as u64;
         let hold_ttl = self.cfg.llm_hold_ttl_min as u64;
+        let mut seen_rejects: Vec<(RiderId, OrderId)> = Vec::new();
+        let mut seen_holds: Vec<RiderId> = Vec::new();
         for r in list {
             match r.kind {
                 RefusalKind::Reject => {
+                    // 过期 / 单已离场的旧记录不算「已经拒过」，那是一条新表态。
+                    // 只认 `Reject` 的记录：同一张单上先「观望」后「拒掉」是**两个**
+                    // 不同的表态，后者不该被前者的记录吞掉。
+                    let already = matches!(
+                        self.was_refused(r.rider, r.order),
+                        Some(RefusalKind::Reject)
+                    ) || seen_rejects.contains(&(r.rider, r.order));
                     self.refusals.insert(
                         (r.rider, r.order),
                         RefusalRecord {
@@ -650,9 +675,23 @@ impl World {
                             expires_at: now.saturating_add(reject_ttl),
                         },
                     );
+                    if !already {
+                        seen_rejects.push((r.rider, r.order));
+                        self.push_rider_episode(
+                            r.rider,
+                            RiderEpisode::new(
+                                now,
+                                EpisodeKind::Refused,
+                                Some(r.order),
+                                0,
+                                note_of(&r.reason, "拒了这一单"),
+                            ),
+                        );
+                    }
                 }
                 RefusalKind::Pass => {
                     let until = now.saturating_add(hold_ttl);
+                    let was_held = self.is_held(r.rider) || seen_holds.contains(&r.rider);
                     // 只延长，不缩短：连续观望不该被后一条更短的窗口覆盖。
                     let entry = self.rider_holds.entry(r.rider).or_insert(until);
                     *entry = (*entry).max(until);
@@ -667,8 +706,35 @@ impl World {
                             expires_at: until,
                         },
                     );
+                    if !was_held {
+                        seen_holds.push(r.rider);
+                        self.push_rider_episode(
+                            r.rider,
+                            RiderEpisode::new(
+                                now,
+                                EpisodeKind::Held,
+                                Some(r.order),
+                                0,
+                                note_of(&r.reason, "先观望一下"),
+                            ),
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    /// 把一条经历挂到指定骑手身上。骑手不存在就当没这回事（不 panic）。
+    ///
+    /// 用 `id` 找而不是取 `&mut` 索引：调用点手上往往只有 `RiderId`，
+    /// 而 `riders` 的顺序不是契约（别拿它当下标）。
+    fn push_rider_episode(&mut self, rider: RiderId, episode: RiderEpisode) -> bool {
+        match self.riders.iter_mut().find(|r| r.id == rider) {
+            Some(r) => {
+                r.push_episode(episode);
+                true
+            }
+            None => false,
         }
     }
 
@@ -2225,5 +2291,165 @@ mod tests {
             "覆盖已经撤掉，不该再有到期的残留动作"
         );
         assert_eq!(w.weather, Weather::Clear);
+    }
+
+    // ---- 经历：拒单 / 观望接线 ----
+
+    fn llm_refusal(rider: RiderId, order: OrderId, kind: RefusalKind, why: &str) -> ai::LlmRefusal {
+        ai::LlmRefusal {
+            rider,
+            order,
+            kind,
+            reason: why.to_string(),
+        }
+    }
+
+    /// 拒单真正写进 `refusals` 才记一条 `Refused`；同一批里重复写的只算一次。
+    #[test]
+    fn a_reject_writes_one_refused_episode() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 21);
+        let rid = w.riders[0].id;
+        let oid = w.generate_order_batch(1)[0];
+        w.elapsed_min = 300;
+
+        w.record_refusals(&[
+            llm_refusal(rid, oid, RefusalKind::Reject, "太远"),
+            llm_refusal(rid, oid, RefusalKind::Reject, "太远"),
+        ]);
+
+        let eps = w.rider(rid).expect("骑手在").episodes();
+        assert_eq!(eps.len(), 1, "同一批里重复的拒单只算一次");
+        assert_eq!(eps[0].kind, EpisodeKind::Refused);
+        assert_eq!(eps[0].order_id, Some(oid));
+        assert_eq!(eps[0].at_min, 300, "记的是绝对分钟");
+        assert_eq!(eps[0].delta_cents, 0, "拒单只吃额度，不罚款");
+        assert_eq!(eps[0].note, "太远");
+    }
+
+    /// 模型没给理由时用兜底文案，不能留一条空说明。
+    #[test]
+    fn a_refusal_without_a_reason_still_gets_a_note() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 23);
+        let rid = w.riders[0].id;
+        let oid = w.generate_order_batch(1)[0];
+
+        w.record_refusals(&[llm_refusal(rid, oid, RefusalKind::Reject, "  ")]);
+
+        assert_eq!(
+            w.rider(rid).expect("骑手在").episodes()[0].note,
+            "拒了这一单"
+        );
+    }
+
+    /// 观望生效记一条 `Held`；窗口内再说一次「观望」不算新经历。
+    #[test]
+    fn a_pass_writes_one_held_episode_per_window() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            llm_hold_ttl_min: 10,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 25);
+        let rid = w.riders[0].id;
+        let oid = w.generate_order_batch(1)[0];
+        w.elapsed_min = 60;
+
+        w.record_refusals(&[llm_refusal(rid, oid, RefusalKind::Pass, "等更值的单")]);
+        let eps = w.rider(rid).expect("骑手在").episodes();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].kind, EpisodeKind::Held);
+        assert_eq!(eps[0].order_id, Some(oid));
+        assert_eq!(eps[0].at_min, 60);
+        assert_eq!(eps[0].delta_cents, 0, "观望不动钱");
+
+        // 窗口里再观望一次：状态没变，不该多一条。
+        w.elapsed_min = 65;
+        w.record_refusals(&[llm_refusal(rid, oid, RefusalKind::Pass, "还是在等")]);
+        assert_eq!(w.rider(rid).expect("骑手在").episodes().len(), 1);
+
+        // 窗口走完再观望：那是新的一段状态，记。
+        w.elapsed_min = 90;
+        w.record_refusals(&[llm_refusal(rid, oid, RefusalKind::Pass, "再等等")]);
+        let eps = w.rider(rid).expect("骑手在").episodes();
+        assert_eq!(eps.len(), 2);
+        assert_eq!(eps[1].at_min, 90);
+    }
+
+    /// 同一张单上先观望、后拒掉：是两个表态，两条经历，后者不能被前者吞掉。
+    #[test]
+    fn a_pass_then_a_reject_on_one_order_records_both() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 26);
+        let rid = w.riders[0].id;
+        let oid = w.generate_order_batch(1)[0];
+
+        w.record_refusals(&[llm_refusal(rid, oid, RefusalKind::Pass, "先看看")]);
+        w.record_refusals(&[llm_refusal(rid, oid, RefusalKind::Reject, "算了")]);
+
+        let kinds: Vec<EpisodeKind> = w
+            .rider(rid)
+            .expect("骑手在")
+            .episodes()
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, vec![EpisodeKind::Held, EpisodeKind::Refused]);
+    }
+
+    /// 两个骑手各拒各的，经历不会串到别人身上。
+    #[test]
+    fn episodes_land_on_the_rider_that_acted() {
+        let cfg = SimConfig {
+            sim_rider_count: 2,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 27);
+        let rid_a = w.riders[0].id;
+        let rid_b = w.riders[1].id;
+        let ids = w.generate_order_batch(2);
+
+        w.record_refusals(&[llm_refusal(rid_a, ids[0], RefusalKind::Reject, "A 拒")]);
+        w.record_refusals(&[llm_refusal(rid_b, ids[1], RefusalKind::Pass, "B 观望")]);
+
+        let a = w.rider(rid_a).expect("骑手在").episodes();
+        let b = w.rider(rid_b).expect("骑手在").episodes();
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(a[0].kind, EpisodeKind::Refused);
+        assert_eq!(a[0].order_id, Some(ids[0]));
+        assert_eq!(a[0].note, "A 拒");
+        assert_eq!(b[0].kind, EpisodeKind::Held);
+        assert_eq!(b[0].order_id, Some(ids[1]));
+        assert_eq!(b[0].note, "B 观望");
+    }
+
+    /// 骑手 ID 对不上时不 panic、也不给别人记。
+    #[test]
+    fn an_episode_for_an_unknown_rider_is_dropped() {
+        let cfg = SimConfig {
+            sim_rider_count: 1,
+            ..Default::default()
+        };
+        let mut w = World::new_for_test(cfg, 29);
+        let oid = w.generate_order_batch(1)[0];
+        let ghost = RiderId::MAX;
+
+        w.record_refusals(&[
+            llm_refusal(ghost, oid, RefusalKind::Reject, "谁"),
+            llm_refusal(ghost, oid, RefusalKind::Pass, "谁"),
+        ]);
+
+        assert!(w.riders.iter().all(|r| r.episodes().is_empty()));
     }
 }
