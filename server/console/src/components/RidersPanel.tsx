@@ -7,13 +7,24 @@ import {
   Empty,
   Input,
   List,
+  Menu,
   Modal,
+  Popover,
   Space,
   Statistic,
   Tag,
   Typography,
   theme,
+  type MenuProps,
 } from "antd";
+import {
+  DeleteOutlined,
+  EditOutlined,
+  LoginOutlined,
+  LogoutOutlined,
+  MoreOutlined,
+  WalletOutlined,
+} from "@ant-design/icons";
 import { HUMAN_RIDER_COLOR, PHASE_LABEL, SPEED_MODE_LABEL } from "../const";
 import { useIsControl, useStore } from "../hooks";
 import type { RiderBrief } from "../protocol";
@@ -64,6 +75,36 @@ export function RidersPanel({ selected, onSelect }: Props) {
           cancelText: "我再想想",
           onOk: () => store.resetRiderWallet(r.id),
         });
+      },
+    });
+  };
+
+  /**
+   * 删账号。
+   *
+   * 注意语义：删的是**登录凭证**，不是世界里那具身体。
+   * 身体还在本局跑（手上的单、钱包、历史都留着），只是这个号再也登不进来。
+   * 想让人彻底消失得等本局结束——世界里没有「删除骑手」这个动作，
+   * 因为历史流水、罚单、订单都按 rider_id 引用，抽掉会让账目断链。
+   *
+   * AI 骑手没有账号，所以这一项对它们禁用。
+   */
+  const confirmDeleteAccount = (r: RiderBrief) => {
+    if (r.kind !== "human") return;
+    modal.confirm({
+      title: `删掉「${r.name}」的账号？`,
+      content:
+        "删掉后这个号登不进来（要重新建号拿二维码）。本局里这具身体会留到本局结束，手上的单也不会被收回。",
+      okText: "确认删除",
+      okButtonProps: { danger: true },
+      cancelText: "取消",
+      onOk: async () => {
+        try {
+          const res = await store.deleteAccount(r.name);
+          message.success(res.deleted ? `已删「${r.name}」的账号` : `「${r.name}」本来就没有账号`);
+        } catch (e) {
+          message.error(`删号失败：${String(e)}`);
+        }
       },
     });
   };
@@ -131,39 +172,13 @@ export function RidersPanel({ selected, onSelect }: Props) {
             actions={
               isControl
                 ? [
-                    <Button
-                      key="rename"
-                      size="small"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        openRename(r);
-                      }}
-                    >
-                      改名
-                    </Button>,
-                    <Button
-                      key="online"
-                      size="small"
-                      // 被强制下线的人当天不可再上线，服务端也会挡；按钮直接禁掉。
-                      disabled={r.forced_offline && !r.online}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        store.send("set_rider_online", { rider_id: r.id, online: !r.online });
-                      }}
-                    >
-                      {r.forced_offline && !r.online ? "今日禁上线" : r.online ? "下线" : "上线"}
-                    </Button>,
-                    <Button
-                      key="wallet"
-                      size="small"
-                      danger
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        confirmClearWallet(r);
-                      }}
-                    >
-                      清空钱包
-                    </Button>,
+                    <RiderOps
+                      key="ops"
+                      rider={r}
+                      onRename={() => openRename(r)}
+                      onWallet={() => confirmClearWallet(r)}
+                      onDelete={() => confirmDeleteAccount(r)}
+                    />,
                   ]
                 : undefined
             }
@@ -269,4 +284,96 @@ function Wallet({ cents }: { cents: number | null }) {
     );
   }
   return <Metric>钱包 ¥{yuan(cents)}</Metric>;
+}
+
+/**
+ * 一行骑手的操作入口：一个「操作」按钮，点开是气泡菜单。
+ *
+ * ## 为什么要收起来
+ *
+ * 原来是三个并排的小按钮（改名 / 下线 / 清空钱包），每行都占掉 200 多像素。
+ * 骑手列表本来就窄（侧栏 420px），三个按钮挤在右侧，名字一长就被压到换行。
+ * 更要紧的是**危险操作和日常操作混在一起**：「下线」每天点十次，
+ * 「清空钱包」可能一整局都不点，却和它一样大、一样近，手滑一下就点到。
+ *
+ * 收进气泡后：列表行只剩一个图标，危险项靠分隔线隔开并标红，
+ * 眼睛扫一眼不会误触。
+ *
+ * ## 为什么用 Menu 而不是自定义列表
+ *
+ * 键盘可达（上下键 + 回车）和焦点管理是白送的。自定义 div 列表要自己补这些，
+ * 补不全就成了「只有鼠标能用」的菜单。
+ */
+function RiderOps({
+  rider,
+  onRename,
+  onWallet,
+  onDelete,
+}: {
+  rider: RiderBrief;
+  onRename: () => void;
+  onWallet: () => void;
+  onDelete: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  // 拒单额度用尽 → 当天被强制下线，服务端也会挡，这里直接禁掉别让人白点。
+  const bannedToday = rider.forced_offline && !rider.online;
+  const isHuman = rider.kind === "human";
+
+  const items: MenuProps["items"] = [
+    { key: "rename", icon: <EditOutlined />, label: "改名" },
+    {
+      key: "online",
+      icon: rider.online ? <LogoutOutlined /> : <LoginOutlined />,
+      label: bannedToday ? "今日禁上线" : rider.online ? "下线" : "上线",
+      disabled: bannedToday,
+    },
+    { type: "divider" },
+    { key: "wallet", icon: <WalletOutlined />, label: "清空钱包", danger: true },
+    {
+      key: "delete",
+      icon: <DeleteOutlined />,
+      label: "删除账号",
+      danger: true,
+      // AI 骑手没有账号可删——它们由配置生成，不是登录进来的。
+      disabled: !isHuman,
+    },
+  ];
+
+  return (
+    <Popover
+      open={open}
+      onOpenChange={setOpen}
+      trigger="click"
+      placement="bottomRight"
+      // 菜单自己不带边框和底色，交给 Popover 的容器面板统一提供，
+      // 否则会出现「面板里嵌了一张卡片」的套娃边框。
+      content={
+        <Menu
+          mode="vertical"
+          selectable={false}
+          items={items}
+          style={{ border: "none", boxShadow: "none", minWidth: 152, padding: 0 }}
+          onClick={({ key, domEvent }) => {
+            // 行本身是点击选中的，菜单项点击不能再冒泡上去。
+            domEvent.stopPropagation();
+            setOpen(false);
+            if (key === "rename") onRename();
+            else if (key === "online") {
+              store.send("set_rider_online", { rider_id: rider.id, online: !rider.online });
+            } else if (key === "wallet") onWallet();
+            else if (key === "delete") onDelete();
+          }}
+        />
+      }
+    >
+      <Button
+        size="small"
+        icon={<MoreOutlined />}
+        onClick={(e) => e.stopPropagation()}
+        aria-label={`${rider.name} 的操作`}
+      />
+    </Popover>
+  );
 }

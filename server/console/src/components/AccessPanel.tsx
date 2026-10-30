@@ -14,6 +14,7 @@ import {
   Typography,
 } from "antd";
 import { useIsControl, useStore } from "../hooks";
+import { PanelHeading } from "./PanelHeading";
 import type { Account, AccountJoin, AccountList, RiderBrief } from "../protocol";
 import { store } from "../store";
 
@@ -96,7 +97,7 @@ export function AccessPanel() {
 
   return (
     <div className="console-scroll">
-      <Heading>手机可达地址</Heading>
+      <PanelHeading>手机可达地址</PanelHeading>
       {primary ? (
         <>
           <AddressCard primary={primary} hosts={hosts} />
@@ -116,7 +117,7 @@ export function AccessPanel() {
         </Typography.Text>
       )}
 
-      <Heading>建号</Heading>
+      <PanelHeading>建号</PanelHeading>
       <CreateForm
         onMinted={(a) => {
           setMinted(a);
@@ -129,7 +130,7 @@ export function AccessPanel() {
       <Divider style={{ margin: "16px 0 8px" }} />
 
       <Space style={{ marginBottom: 8 }} align="center">
-        <Heading inline>账号名单</Heading>
+        <PanelHeading inline>账号名单</PanelHeading>
         <Button size="small" loading={loading} onClick={() => void refresh()}>
           刷新
         </Button>
@@ -217,7 +218,7 @@ function JoinAddrEditor({
   effective: string;
 }) {
   return (
-    <Card size="small" style={{ marginTop: 8 }} title="自定义接入地址（临时）">
+    <Card size="small" style={{ marginTop: 12 }} title="自定义接入地址（临时）">
       <Space direction="vertical" size={8} style={{ width: "100%" }}>
         <Input
           placeholder="https://xxx.trycloudflare.com"
@@ -462,13 +463,6 @@ function CopyButton({ text, label = "复制" }: { text: string; label?: string }
   );
 }
 
-function Heading({ children, inline }: { children: React.ReactNode; inline?: boolean }) {
-  return (
-    <Typography.Title level={5} style={{ margin: inline ? 0 : "24px 0 8px" }}>
-      {children}
-    </Typography.Title>
-  );
-}
 
 /** SVG 文本 → data URL。去掉 XML 声明：data URL 里不需要它。 */
 function qrDataUrl(svg: string): string {

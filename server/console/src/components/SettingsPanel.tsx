@@ -17,6 +17,7 @@ import {
 } from "antd";
 import { COORD_LABEL, WEATHERS } from "../const";
 import { useIsControl, useStore } from "../hooks";
+import { PanelHeading } from "./PanelHeading";
 import type { CoordSystem } from "../protocol";
 import { store, yuan } from "../store";
 
@@ -143,7 +144,7 @@ export function SettingsPanel() {
         />
       )}
 
-      <Heading>显示</Heading>
+      <PanelHeading>显示</PanelHeading>
       <Row label="地图坐标系" hint="切换后底图跟着换：GCJ-02 用高德，WGS-84 用 OpenStreetMap">
         <Segmented
           disabled={!isControl}
@@ -159,7 +160,7 @@ export function SettingsPanel() {
         <Typography.Text type="secondary">{COORD_LABEL[c.coord_system ?? "gcj02"]}</Typography.Text>
       </Row>
 
-      <Heading>AI</Heading>
+      <PanelHeading>AI</PanelHeading>
       <Row label="AI 骑手数量" hint="0~8；减少时手上有单的先跑完">
         <Space>
           <InputNumber
@@ -239,7 +240,7 @@ export function SettingsPanel() {
         onChange={(v) => store.send("set_config", { ai_batch_enabled: v })}
       />
 
-      <Heading>世界</Heading>
+      <PanelHeading>世界</PanelHeading>
       <Row label="天气">
         <Select
           style={{ width: 120 }}
@@ -263,7 +264,7 @@ export function SettingsPanel() {
 
       {/* 单价的账要能对得起来：给的（起步 + 里程 + 加成）、乘的（高峰）、
           抽的（平台），一样一行摊开。只留一个「抽水」滑块等于把另外三样藏了。 */}
-      <Heading>计价</Heading>
+      <PanelHeading>计价</PanelHeading>
       <Row label="起步价" hint="含第一档里程；单位：元">
         <InputNumber
           min={0}
@@ -321,7 +322,7 @@ export function SettingsPanel() {
         </Typography.Text>
       </Row>
 
-      <Heading>规则</Heading>
+      <PanelHeading>规则</PanelHeading>
       <Row label="抢单窗口（秒）">
         <InputNumber
           min={1}
@@ -386,7 +387,7 @@ export function SettingsPanel() {
 
       {/* 事故率：档位基准率（0.5% / 4% / 22%）是文档定死的，倍率只管手感。
           默认 1.0 = 设计值，嫌吵就往左拉。 */}
-      <Heading>事故</Heading>
+      <PanelHeading>事故</PanelHeading>
       <SwitchRow
         label="骑手会出事故"
         hint="关掉就完全不掷事故（演示 / 排查用）"
@@ -411,7 +412,7 @@ export function SettingsPanel() {
       </Row>
 
       {/* 情绪：低到 lazy_below 之下才开始懒——挑单（门槛上浮）+ 磨洋工（速度打折）。 */}
-      <Heading>情绪</Heading>
+      <PanelHeading>情绪</PanelHeading>
       <SwitchRow
         label="骑手有情绪"
         hint="罚款、超时、在线久了都掉；收工和日结回血。情绪低就变懒"
@@ -457,7 +458,7 @@ export function SettingsPanel() {
 
       {info?.hub && (
         <>
-          <Heading>服务器</Heading>
+          <PanelHeading>服务器</PanelHeading>
           <Typography.Text type="secondary" style={{ wordBreak: "break-all" }}>
             {JSON.stringify(info.hub)}
           </Typography.Text>
@@ -562,7 +563,7 @@ function AdvancedSection({
 
   return (
     <>
-      <Heading>骑手名单</Heading>
+      <PanelHeading>骑手名单</PanelHeading>
       <Row label="AI 骑手名字" hint="一行一个，按骑手 id 顺序覆盖；空行跳过，重启后仍在" stack>
         <Input.TextArea
           rows={4}
@@ -579,7 +580,7 @@ function AdvancedSection({
         </Button>
       </Row>
 
-      <Heading>LLM 接入</Heading>
+      <PanelHeading>LLM 接入</PanelHeading>
       <Row
         label="API Key"
         hint={info?.llm_configured ? `已配置（${info.llm_model || "?"}）` : "未配置：填一个 Key 才能用 LLM 大脑"}
@@ -678,14 +679,6 @@ function AdvancedSection({
   );
 }
 
-/** 分组标题：`title-lg`（16px / 600）。标题就该是主文本色，次级色留给描述。 */
-function Heading({ children }: { children: React.ReactNode }) {
-  return (
-    <Typography.Title level={5} style={{ marginTop: 24, marginBottom: 8 }}>
-      {children}
-    </Typography.Title>
-  );
-}
 
 function Row({
   label,

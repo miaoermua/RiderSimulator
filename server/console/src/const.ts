@@ -31,6 +31,48 @@ export const MONO_STACK =
 
 export const SPEEDS = [1, 2, 4, 8, 10, 60] as const;
 
+/* ---------------------------------------------------------------------------
+ * 控件尺寸基线
+ *
+ * 以前每个组件各写各的高度：`Title level=4` 是 32、`level=5` 是 28、
+ * `Tag` 是 24、`Button` 是 32、带文字的 `Badge` 是 22，靠 `align="center"`
+ * 视觉上凑齐——实际是五种高度排一行，上下沿都不对齐。
+ *
+ * 现在统一到这里：**一行的所有控件都占 CONTROL_H**，需要"看起来小一点"的
+ * 控件（Tag）用 `CONTROL_H - TAG_INSET` 并让父容器负责居中，而不是各写各的。
+ * 32 这个值不是随手取的：antd 的 `size="middle"`（Button / Input / Select
+ * 的默认档）就是 32，跟它对齐后原生控件不用额外覆盖。
+ * ------------------------------------------------------------------------- */
+
+/** 单行控件的基准高度。与 antd `middle` 档一致。 */
+export const CONTROL_H = 32;
+
+/**
+ * Tag 比基准高度矮的量。
+ *
+ * Tag 自带 1px 边框 + 上下内边距，撑到 32 时视觉上比同行的 Button 高一线；
+ * 压掉 4px 再让父容器（`inline-flex` + `align-items:center`）居中，
+ * 边框才和按钮的中线重合。
+ */
+export const TAG_INSET = 4;
+
+/** 同一行内不同控件组之间的间距。 */
+export const GAP_INLINE = 16;
+
+/** 同一组内元素之间的紧凑间距。 */
+export const GAP_TIGHT = 8;
+
+/**
+ * Card 之间的垂直间距，按**语义**分两档，不要随手写第三个值：
+ *
+ * - `GAP_INLINE`（16）：两个不同区块之间，让人一眼看出"这是两件事"；
+ * - `GAP_TIGHT`（8）：同一区块内紧贴上一块的附属卡片。
+ *
+ * 组内卡片堆叠（AI 面板那五张）另有约定：12，比区块间距紧、比紧凑间距松。
+ */
+export const CARD_GAP_BLOCK = 16;
+export const CARD_GAP_STACK = 12;
+
 export const WEATHERS: ReadonlyArray<readonly [Weather, string]> = [
   ["clear", "晴"],
   ["cloudy", "多云"],

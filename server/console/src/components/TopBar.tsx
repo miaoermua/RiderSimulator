@@ -1,5 +1,10 @@
-import { Badge, Button, Dropdown, Space, Tag, Typography } from "antd";
-import { SPEEDS } from "../const";
+import { Badge, Button, Dropdown, Space, Tag, Tooltip, Typography, theme } from "antd";
+import {
+  PauseCircleOutlined,
+  PlayCircleOutlined,
+  SettingOutlined,
+} from "@ant-design/icons";
+import { CONTROL_H, GAP_INLINE, GAP_TIGHT, SPEEDS, TAG_INSET } from "../const";
 import { useStore } from "../hooks";
 import { hhmm, nowMinuteOfDay, store, yuan } from "../store";
 
@@ -13,32 +18,39 @@ import { hhmm, nowMinuteOfDay, store, yuan } from "../store";
  */
 
 /**
- * 顶栏所有控件的**统一高度**。
+ * 行高统一取自 `const.ts` 的 `CONTROL_H`。
  *
- * 之前这里混着 `Title level=4/5`（32/28px）、`Tag`（24px）、`Button`（32px）
- * 和带文字的 `Badge`（22px），靠 `align="center"` 对齐——结果是每种控件
- * 各有各的高度，看起来参差不齐。改成统一到 32px 后，
- * 一行控件的顶边和底边落在同一条线上。
+ * 这里曾经有一个本地的 `BAR_H = 32`，与弹窗、面板里的同类常量各写各的；
+ * 改一个高度要翻三处。现在只留一个来源——顶栏和设置弹窗的量尺是同一把。
  */
-const BAR_H = 32;
+const BAR_H = CONTROL_H;
 
 /** 顶栏里反复出现的控件样式。抽出来是为了让高度只在一个地方定义。 */
 const boxStyle = { height: BAR_H, display: "inline-flex", alignItems: "center" } as const;
 
+/** Tag 比行高矮一档，靠父容器的居中对齐到同一中线。 */
+const tagStyle = {
+  ...boxStyle,
+  height: BAR_H - TAG_INSET,
+  lineHeight: `${BAR_H - TAG_INSET - 2}px`,
+  marginInlineEnd: 0,
+  fontVariantNumeric: "tabular-nums" as const,
+} as const;
+
 /**
- * 标题统一成同一档字重与行高。
+ * 标识文字（「烽火台」）的样式。
  *
- * 「烽火台」是标识，「第 N 天 HH:MM」是读数——后者才是顶栏的主角，
- * 所以时间字号更大，但两者必须同高同基线，否则一行里会有两种高度。
+ * 时间已经从同一个 Title 里拆出去了（见下面 JSX 的说明），
+ * 所以这里只剩标识本身——不再需要给两种字号找共同基线。
  */
 const titleStyle = {
   margin: 0,
   lineHeight: `${BAR_H}px`,
   whiteSpace: "nowrap" as const,
-  fontVariantNumeric: "tabular-nums" as const,
 };
 
-export function TopBar() {
+export function TopBar({ onOpenSettings }: { onOpenSettings: () => void }) {
+  const { token } = theme.useToken();
   const role = useStore((s) => s.role);
   const conn = useStore((s) => s.conn);
   const snap = useStore((s) => s.snap);
@@ -65,8 +77,39 @@ export function TopBar() {
     store.send("set_realtime", { enabled: true, wall_minute: nowMinuteOfDay() });
   };
 
-  // 下拉按钮上只写倍率本身；暂停与否由旁边的 Badge 说，避免同一件事说两遍。
+  // 下拉按钮上只写倍率本身；暂停与否由状态点说，避免同一件事说两遍。
   const speedLabel = realtime ? "实时" : `${speed}x`;
+
+  /**
+   * 一个状态点说完整件事，不再分「运行状态」和「连接状态」两颗。
+   *
+   * 之前顶栏有两个 Badge：左边「运行中 / 已暂停」，右边「已连接 / 已断开」。
+   * 它们表达的是同一件事的三个层次——**连接是运行的前提**，断了就无所谓跑没跑，
+   * 分成两颗反而要多看一处才知道"为什么时间不动了"。
+   *
+   * 优先级：连不上 > 暂停 > 跑着。断开时不再提"运行中"，
+   * 因为那时的"运行中"没有意义。
+   */
+  const state: { status: "success" | "processing" | "warning" | "error"; text: string } =
+    conn !== "online"
+      ? {
+          status: conn === "connecting" ? "processing" : "error",
+          text: conn === "connecting" ? "连接中" : "未连接",
+        }
+      : paused
+        ? { status: "warning", text: "已暂停" }
+        : { status: "success", text: "运行中" };
+
+  /**
+   * 天气读数。
+   *
+   * 系数贴 1 时不写尾巴——「晴 ×1.00」里的乘数没有任何信息量，
+   * 常态天气占着一块位置只会挤掉时间。真影响速度了（雨雪雾）才亮出来。
+   */
+  const wxFactor = snap?.weather_speed_factor ?? 1;
+  const wxText = `${snap?.weather_label ?? ""}${
+    Math.abs(wxFactor - 1) >= 0.005 ? ` ${wxFactor.toFixed(2)}×` : ""
+  }`;
 
   const speedMenu = {
     selectable: true,
@@ -81,58 +124,56 @@ export function TopBar() {
   };
 
   return (
-    <Space size={16} align="center" style={{ width: "100%", height: BAR_H, lineHeight: `${BAR_H}px` }}>
+    <Space size={GAP_INLINE} align="center" style={{ width: "100%", height: BAR_H, lineHeight: `${BAR_H}px` }}>
       <Typography.Title level={5} style={{ ...titleStyle, fontSize: 18, fontWeight: 600 }}>
         烽火台
       </Typography.Title>
 
-      <Typography.Title level={4} style={{ ...titleStyle, fontSize: 22, fontWeight: 600 }}>
-        第 {day} 天 {hhmm(minute)}
-      </Typography.Title>
+      {/* 时间分两档：`第 N 天` 是背景信息，`HH:MM` 才是每次都要读的数。
+          以前两者同字号挤在一个 Title 里，视线没有落点；拆开后
+          小字天数退到次级色，时间保持 22px 等宽数字，读起来是一眼的事。 */}
+      <span
+        style={{
+          display: "inline-flex",
+          alignItems: "baseline",
+          gap: 6,
+          height: BAR_H,
+          whiteSpace: "nowrap",
+        }}
+      >
+        <span style={{ fontSize: 13, color: token.colorTextSecondary }}>第 {day} 天</span>
+        <span
+          style={{
+            fontSize: 22,
+            fontWeight: 600,
+            lineHeight: `${BAR_H}px`,
+            fontVariantNumeric: "tabular-nums",
+          }}
+        >
+          {hhmm(minute)}
+        </span>
+      </span>
 
       <span style={boxStyle}>
-        <Badge status={paused ? "warning" : "processing"} text={paused ? "已暂停" : "运行中"} />
+        <Badge status={state.status} text={state.text} />
       </span>
 
       {snap && (
-        <Space size={4} align="center" style={{ height: BAR_H }}>
-          <Tag
-            style={{
-              ...boxStyle,
-              height: BAR_H - 4,
-              lineHeight: `${BAR_H - 6}px`,
-              marginInlineEnd: 0,
-              fontVariantNumeric: "tabular-nums",
-            }}
-          >
-            {snap.weather_label} ×{snap.weather_speed_factor.toFixed(2)}
-          </Tag>
+        <Space size={GAP_TIGHT} align="center" style={{ height: BAR_H }}>
+          <Tooltip title="天气对骑行速度的影响。接近 1 表示没影响，不显示系数。">
+            <Tag style={tagStyle}>{wxText}</Tag>
+          </Tooltip>
           {snap.rain_bonus_cents > 0 && (
-            <Tag
-              color="blue"
-              style={{
-                ...boxStyle,
-                height: BAR_H - 4,
-                lineHeight: `${BAR_H - 6}px`,
-                marginInlineEnd: 0,
-                fontVariantNumeric: "tabular-nums",
-              }}
-            >
+            <Tag color="blue" style={tagStyle}>
               雨补 {yuan(snap.rain_bonus_cents)}
             </Tag>
           )}
-          <Tag
-            color={c?.is_peak ? "gold" : "default"}
-            style={{
-              ...boxStyle,
-              height: BAR_H - 4,
-              lineHeight: `${BAR_H - 6}px`,
-              marginInlineEnd: 0,
-              fontVariantNumeric: "tabular-nums",
-            }}
-          >
-            {c?.is_peak ? `高峰 ×${c.surge_multiplier.toFixed(1)}` : "平峰"}
-          </Tag>
+          {/* 平峰是常态，不占位。只有高峰才值得提示——那才是该多跑单的时候。 */}
+          {c?.is_peak && (
+            <Tag color="gold" style={tagStyle}>
+              高峰 {c.surge_multiplier.toFixed(1)}×
+            </Tag>
+          )}
         </Space>
       )}
 
@@ -146,29 +187,39 @@ export function TopBar() {
         </Button>
       </Dropdown>
 
-      <Button
-        style={{ height: BAR_H }}
-        disabled={!isControl}
-        onClick={() => store.send("set_paused", { paused: !paused })}
-      >
-        {paused ? "继续" : "暂停"}
-      </Button>
+      {/* 暂停/继续做成图标：它是个开关，不是"执行某件事"，
+          一个图标加 tooltip 比两个字的按钮更省地方，也不会和「变速」抢宽度。
+          方框钉成 BAR_H，与左侧按钮同高。 */}
+      <Tooltip title={paused ? "继续" : "暂停"}>
+        <Button
+          icon={paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
+          disabled={!isControl}
+          onClick={() => store.send("set_paused", { paused: !paused })}
+          aria-label={paused ? "继续" : "暂停"}
+          style={{ width: BAR_H, height: BAR_H, minWidth: BAR_H }}
+        />
+      </Tooltip>
 
-      <Space size={16} align="center" style={{ marginInlineStart: "auto", height: BAR_H }}>
+      <Space size={GAP_INLINE} align="center" style={{ marginInlineStart: "auto", height: BAR_H }}>
         <span style={boxStyle}>
-          <Tag
-            color={role === "control" ? "green" : "default"}
-            style={{ height: BAR_H - 4, lineHeight: `${BAR_H - 6}px`, marginInlineEnd: 0 }}
-          >
+          <Tag color={role === "control" ? "green" : "default"} style={tagStyle}>
             {role === "control" ? "控制端" : role === "spectator" ? "观战" : role === "rider" ? "骑手端" : "未连接"}
           </Tag>
         </span>
-        <span style={boxStyle}>
-          <Badge
-            status={conn === "online" ? "success" : conn === "connecting" ? "processing" : "error"}
-            text={conn === "online" ? "已连接" : conn === "connecting" ? "连接中" : "已断开"}
+        {/* 连接状态不再单独一颗 Badge：已并入左侧的统一状态点
+            （连不上 > 暂停 > 跑着）。同一件事说两遍只会让顶栏更挤。 */}
+        {/* 设置入口。用 text 按钮而不是带文字的主按钮：
+            它是低频动作，不该和「变速 / 暂停」抢注意力。
+            方框尺寸钉成 BAR_H，边框对齐同一中线。 */}
+        <Tooltip title="控制台设置">
+          <Button
+            type="text"
+            icon={<SettingOutlined />}
+            onClick={onOpenSettings}
+            aria-label="控制台设置"
+            style={{ width: BAR_H, height: BAR_H, minWidth: BAR_H }}
           />
-        </span>
+        </Tooltip>
       </Space>
     </Space>
   );

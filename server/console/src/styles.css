@@ -57,31 +57,6 @@ body {
   background: var(--rs-accent, var(--rs-text-tertiary));
 }
 
-/* 宽度不够时的箭头提示。位置贴左边缘（靠地图那一侧），
- * 因为用户想「拉宽侧栏」的动作方向就是往左拖。 */
-.sider-grip-nudge {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: 13px;
-  height: 28px;
-  border-radius: 3px;
-  background: var(--rs-bg-elevated);
-  border: 1px solid var(--rs-border-secondary);
-  color: var(--rs-text-tertiary);
-  font-size: 10px;
-  line-height: 26px;
-  text-align: center;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 120ms ease;
-}
-
-.sider-grip:hover .sider-grip-nudge {
-  opacity: 1;
-}
-
 /* Tabs 占满侧栏：头部钉住，内容区吃剩下高度，滚动交给面板自己。 */
 .console-sider .ant-tabs {
   height: 100%;
@@ -94,19 +69,17 @@ body {
   padding: 0 16px;
 }
 
-/* 标签**不能均分宽度**，必须按内容自适应 + 放不下时横向滚动。
+/* 标签按内容自适应，不做均分。
  *
- * 之前这里是 `flex: 1`，看着整齐，实则是这个布局最大的坑：
- * 侧栏固定 420px，扣掉 32px 内边距只剩 388px，却要放 7 个标签
- * （骑手 / 订单 / 会话 / AI / 骑手接入 / 设置 / 日志）。
- * 按中文 14px + antd 默认左右各 12px padding + 32px tabBarGutter 算，
- * 实际需要 571px——差 183px。`flex: 1` 把缺口摊给每个标签后，
- * 每个只剩 55px，而「骑手接入」四个字就要 56px，于是被挤成**一字一行**，
- * 「日志」最后只剩一个「日」露在外面。
+ * 历史：这里曾用 `flex: 1` 均分，而侧栏固定 420px、扣掉 32px 内边距只剩 388px，
+ * 却要放 8 个标签（骑手 / 订单 / 会话 / AI / 骑手接入 / 活动 / 设置 / 日志），
+ * 按中文 14px + 左右各 12px padding + 32px gutter 算需要 650px——差 262px。
+ * 均分后每个只剩 48px，而「骑手接入」四个字要 56px，于是被挤成**一字一行**。
  *
- * `flex: 0 0 auto` 让标签回到内容宽度，多出来的由antd 的
- * `.ant-tabs-nav-wrap` 自动接管成左右滚动（还有 hover 箭头），
- * 不再出现「一个字一列」。
+ * 现在只剩 4 个标签（骑手 / 订单 / 会话 / 日志），388px 绰绰有余，
+ * 均分其实也能看。但**仍然不用 `flex: 1`**：标签宽度会随语言和字号变，
+ * 均分意味着宽度由"有几个标签"决定，加一个标签就让所有标签一起缩水。
+ * 按内容走，宽度只由自己的文字决定，与邻居无关。
  *
  * `flex-shrink: 0` 配 `white-space: nowrap` 双保险：任何情况下
  * 都不允许标签内部换行——那才是真正难看的形态。 */
@@ -118,10 +91,11 @@ body {
   padding-inline: 8px;
 }
 
-/* tabBarGutter 同样收一收。antd 默认 32 是一行放得下时的宽间距，
- * 放不下时纯属浪费横向空间，14px 已足够区分相邻标签。 */
+/* 标签间距。14px 是当年为了塞下 8 个标签压缩出来的值；
+ * 现在只有 4 个，宽度富余，回到 antd 默认档（32px）——
+ * 疏朗的间距让「点哪个」这件事更清楚，也省得手指点错。 */
 .console-sider .ant-tabs-nav .ant-tabs-tab + .ant-tabs-tab {
-  margin-inline-start: 14px;
+  margin-inline-start: 32px;
 }
 
 .console-sider .ant-tabs-content-holder {

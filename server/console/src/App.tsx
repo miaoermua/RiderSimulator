@@ -1,16 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { App as AntApp, Layout, Tabs, theme } from "antd";
 import { useStore } from "./hooks";
-import { AccessPanel } from "./components/AccessPanel";
-import { ActivitiesPanel } from "./components/ActivitiesPanel";
-import { AiPanel } from "./components/AiPanel";
 import { ChatPanel } from "./components/ChatPanel";
 import { LoginGate } from "./components/LoginGate";
 import { LogPanel } from "./components/LogPanel";
 import { MapView } from "./components/MapView";
 import { OrdersPanel } from "./components/OrdersPanel";
 import { RidersPanel } from "./components/RidersPanel";
-import { SettingsPanel } from "./components/SettingsPanel";
+import { SettingsModal } from "./components/SettingsModal";
 import { TopBar } from "./components/TopBar";
 import { store } from "./store";
 
@@ -18,8 +15,7 @@ import { store } from "./store";
 const SIDER_MIN = 380;
 const SIDER_MAX = 720;
 const SIDER_DEFAULT = 420;
-/** 8 个标签（多了「活动」）按中文 14px 实测需要约 650px，见 styles.css 里的说明。 */
-const SIDER_FITS_TABS = 680;
+/** 4 个标签按中文 14px 实测约 320px，380px 的下界已经放得下，不需要再滚动。 */
 
 export function App() {
   const { message } = AntApp.useApp();
@@ -28,6 +24,7 @@ export function App() {
   const [tab, setTab] = useState("riders");
   const [selected, setSelected] = useState<number | null>(null);
   const [sider, setSider] = useState(SIDER_DEFAULT);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const dragging = useRef(false);
 
   // store 不直接依赖 antd，提示能力在挂载时注入。
@@ -70,14 +67,12 @@ export function App() {
     setTab("riders");
   };
 
+  // 只留「跑单时要盯的」四个。AI / 骑手接入 / 活动 / 设置已经收进右上角的
+  // 设置弹窗——那四样配一次就不动了，占着标签宽度却几乎不点。
   const panels = [
     { key: "riders", label: "骑手", children: <RidersPanel selected={selected} onSelect={pickRider} /> },
     { key: "orders", label: "订单", children: <OrdersPanel /> },
     { key: "chat", label: "会话", children: <ChatPanel /> },
-    { key: "ai", label: "AI", children: <AiPanel /> },
-    { key: "access", label: "骑手接入", children: <AccessPanel /> },
-    { key: "activities", label: "活动", children: <ActivitiesPanel /> },
-    { key: "settings", label: "设置", children: <SettingsPanel /> },
     { key: "log", label: "日志", children: <LogPanel /> },
   ];
 
@@ -97,7 +92,7 @@ export function App() {
           borderBottom: `1px solid ${token.colorBorderSecondary}`,
         }}
       >
-        <TopBar />
+        <TopBar onOpenSettings={() => setSettingsOpen(true)} />
       </Layout.Header>
       {/* 有侧栏时antd 会给 Layout 挂 `has-sider`，默认 row 布局。
           手柄必须排在 Sider **左边**（贴住分隔线），而它在 JSX 里写在 Sider 之后，
@@ -126,15 +121,7 @@ export function App() {
           }}
           onDoubleClick={() => setSider(SIDER_DEFAULT)}
           title={`侧栏 ${sider}px（双击复位，← → 键微调）`}
-        >
-          {/* 宽度不够放全部标签时，hover 给出箭头提示，
-              别让用户以为是控件坏了 */}
-          {sider < SIDER_FITS_TABS && (
-            <span className="sider-grip-nudge" aria-hidden>
-              ‹
-            </span>
-          )}
-        </div>
+        />
         <Layout.Sider
           width={sider}
           theme="light"
@@ -144,6 +131,7 @@ export function App() {
           <Tabs activeKey={tab} onChange={setTab} items={panels} />
         </Layout.Sider>
       </Layout>
+      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <LoginGate open={role === null} />
     </Layout>
   );

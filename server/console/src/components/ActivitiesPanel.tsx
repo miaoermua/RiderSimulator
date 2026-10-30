@@ -240,7 +240,7 @@ export function ActivitiesPanel() {
   };
 
   return (
-    <div className="panel-scroll">
+    <div className="console-scroll">
       <NoticeEditor activities={activities} />
 
       <Card size="small" title="新建活动">
