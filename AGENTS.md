@@ -9,7 +9,7 @@
 |---|---|---|
 | 服务端（仿真引擎 + WS Hub + HTTP API） | `server/` | Rust |
 | 烽火台控制台 | `server/console/` | React 18.3 + TypeScript 5.6 + Ant Design 5.22 + Leaflet 1.9 + Vite 6 |
-| 骑手端 | `client/` | Flutter（`client/pubspec.yaml` 当前版本 0.2.5+6） |
+| 骑手端 | `client/` | Flutter（`client/pubspec.yaml` 当前版本 0.2.6+8） |
 
 控制台的构建产物 `server/static/console.html` 由 `include_str!` 编进 Rust 二进制
 （`server/src/net/ws.rs:85`），**不是**运行时去磁盘读的静态文件。改了控制台源码

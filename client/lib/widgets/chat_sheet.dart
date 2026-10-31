@@ -125,7 +125,8 @@ class _ChatSheetState extends State<_ChatSheet> {
                       '任务：${task.name} · 奖励 ${yuan(task.rewardCents)} 元'
                       '${task.penaltyCents > 0 ? ' · 做错扣 ${yuan(task.penaltyCents)} 元' : ''}\n'
                       '现在说的话会判定任务进度；说完任务再看普通会话。',
-                      style: TextStyle(fontSize: 12, color: Colors.orange.shade900),
+                      style: TextStyle(
+                          fontSize: 12, color: Colors.orange.shade900),
                     ),
                   ),
                 const Divider(height: 1),

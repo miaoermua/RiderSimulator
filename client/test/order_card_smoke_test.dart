@@ -71,7 +71,10 @@ void main() {
     );
 
     expect(find.text('老王牛肉面'), findsOneWidget);
-    expect(find.text('取'), findsOneWidget);
+    // 左侧竖条现在是「取货点 → 送货点」两个圆点 + 里程数，
+    // 不再有「取 / 送」文字（上下切点箭头也一并移除）。
+    // 用方向箭头认这条竖条。
+    expect(find.byIcon(Icons.east), findsOneWidget);
     expect(tester.takeException(), isNull);
 
     // 点左侧中间那块：展开地图。

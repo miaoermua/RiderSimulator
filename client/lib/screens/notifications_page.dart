@@ -176,7 +176,8 @@ class _ActivityCard extends StatelessWidget {
                   else
                     Text(
                       left > 0 ? '还差 $left 单' : '已达标，下一单入账',
-                      style: const TextStyle(color: Colors.orange, fontSize: 12),
+                      style:
+                          const TextStyle(color: Colors.orange, fontSize: 12),
                     ),
                 ],
               ),
@@ -209,7 +210,8 @@ class _LogsTab extends StatelessWidget {
         final line = logs[i];
         return ListTile(
           dense: true,
-          leading: Icon(logIcon(line.kind), size: 20, color: logColor(line.kind)),
+          leading:
+              Icon(logIcon(line.kind), size: 20, color: logColor(line.kind)),
           title: Text(line.text),
           subtitle: Text(
             clockLabel(line.at.hour * 60 + line.at.minute),

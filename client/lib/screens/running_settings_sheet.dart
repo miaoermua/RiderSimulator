@@ -76,8 +76,7 @@ class _RunningSettingsSheet extends StatelessWidget {
                       ChoiceChip(
                         label: Text(r.label),
                         selected: LocationService.instance.rate == r,
-                        onSelected: (_) =>
-                            LocationService.instance.setRate(r),
+                        onSelected: (_) => LocationService.instance.setRate(r),
                       ),
                   ],
                 ),
@@ -149,7 +148,6 @@ class _RunningSettingsSheet extends StatelessWidget {
     return '运行中 · 最近 $t · '
         '世界坐标 ${loc.lastLat!.toStringAsFixed(5)}, ${loc.lastLng!.toStringAsFixed(5)}';
   }
-
 }
 
 class _Label extends StatelessWidget {
@@ -166,4 +164,3 @@ class _Label extends StatelessWidget {
             ?.copyWith(fontWeight: FontWeight.bold),
       );
 }
-

@@ -46,13 +46,16 @@ class WalletPage extends StatelessWidget {
                   ListTile(
                     dense: true,
                     leading: _icon(e),
-                    title: Text(e.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    title: Text(e.title,
+                        maxLines: 1, overflow: TextOverflow.ellipsis),
                     subtitle: Text(_stamp(e.at)),
                     trailing: Text(
                       '${e.income ? '+' : '-'}¥${yuan(e.cents.abs())}',
                       style: TextStyle(
                         fontWeight: FontWeight.bold,
-                        color: e.income ? Colors.green.shade700 : Colors.red.shade600,
+                        color: e.income
+                            ? Colors.green.shade700
+                            : Colors.red.shade600,
                       ),
                     ),
                   ),

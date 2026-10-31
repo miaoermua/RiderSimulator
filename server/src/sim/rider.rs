@@ -396,6 +396,17 @@ pub struct Rider {
     pub name: String,
     pub lat: f64,
     pub lng: f64,
+    /// 上一次**从客户端上报**坐标的墙钟毫秒（`World.wall_ms`）。
+    ///
+    /// `0` = 从来没上报过（新骑手的 `home` 坐标、模拟骑手的自动移动都不算）。
+    /// 派单范围要用它判断「这个位置还算不算数」——没有时间戳就无法区分
+    /// 「刚上报的 30 秒前」和「半小时前断线留下的僵尸坐标」。
+    ///
+    /// 只有 `set_position` 会刷新它。**模拟骑手走的每一步都不刷新**：
+    /// 它们的坐标由服务端自己算，不存在"GPS 过期"这回事，
+    /// 混淆进来只会让 TTL 对 AI 骑手失效。
+    #[serde(default)]
+    pub position_report_wall_ms: u64,
     pub speed_mode: SpeedMode,
 
     /// 今日已入账（到手）。
@@ -604,6 +615,9 @@ impl Rider {
             name: name.into(),
             lat: pos.lat,
             lng: pos.lng,
+            // 出生坐标是剧本给的 `home`，不是 GPS 上报——按"从没上报过"处理，
+            // 派单范围会因此拒绝给它派单，直到客户端真的传来第一帧定位。
+            position_report_wall_ms: 0,
             speed_mode: SpeedMode::Compliant,
             cash_cents: 0,
             gross_cents: 0,
@@ -644,6 +658,18 @@ impl Rider {
     pub fn set_pos(&mut self, p: LatLng) {
         self.lat = p.lat;
         self.lng = p.lng;
+    }
+
+    /// 客户端上报的定位：改坐标，**并刷新上报时间戳**。
+    ///
+    /// 与 [`Rider::set_pos`] 分开是必须的。模拟骑手每 tick 都在 `set_pos`
+    /// 往前走一段，如果它们也走这条路径，"最后上报时间"会永远新鲜，
+    /// 派单范围的 TTL 对 AI 骑手就形同虚设——而这个 TTL 本来只该约束
+    /// 真人手机的 GPS 新鲜度。
+    pub fn report_position(&mut self, p: LatLng, now_wall_ms: u64) {
+        self.lat = p.lat;
+        self.lng = p.lng;
+        self.position_report_wall_ms = now_wall_ms;
     }
 
     pub fn is_injured(&self, now_min: u64) -> bool {

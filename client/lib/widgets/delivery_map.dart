@@ -328,7 +328,8 @@ class _DeliveryMapState extends State<DeliveryMap> {
                 border: Border.all(color: Colors.white, width: 2),
               ),
               alignment: Alignment.center,
-              child: const Icon(Icons.delivery_dining, size: 16, color: Colors.white),
+              child: const Icon(Icons.delivery_dining,
+                  size: 16, color: Colors.white),
             ),
           ),
         ],
@@ -399,8 +400,7 @@ class _DeliveryMapState extends State<DeliveryMap> {
             ),
             for (final bm in basemaps.values)
               _BasemapTile(
-                current:
-                    state.basemapOverride == bm.id ? bm.id.wire : null,
+                current: state.basemapOverride == bm.id ? bm.id.wire : null,
                 title: bm.label,
                 subtitle: '${bm.id.label} · 最大缩放 ${bm.maxZoom}',
                 warn: bm.id != state.config.coordSystem,
@@ -448,7 +448,8 @@ class _BasemapTile extends StatelessWidget {
       ),
       title: Text(title),
       subtitle: Text(warn ? '$subtitle · 与下发坐标系不一致，会有偏移' : subtitle),
-      trailing: warn ? const Icon(Icons.warning_amber, color: Colors.orange) : null,
+      trailing:
+          warn ? const Icon(Icons.warning_amber, color: Colors.orange) : null,
       onTap: onTap,
     );
   }

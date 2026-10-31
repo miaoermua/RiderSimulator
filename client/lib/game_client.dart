@@ -44,10 +44,13 @@ class GameClient {
   ///
   /// 两种身份二选一：`riderName` + `password`（烽火台建的号，正常路径），
   /// 或 `token`（`rider:<id>` / `new:<昵称>`，**开发后门**，会绕过账号表）。
-  void connect(String url, {String? token, String? riderName, String? password}) {
+  void connect(String url,
+      {String? token, String? riderName, String? password}) {
     _url = url;
     _token = (token == null || token.trim().isEmpty) ? null : token.trim();
-    _riderName = (riderName == null || riderName.trim().isEmpty) ? null : riderName.trim();
+    _riderName = (riderName == null || riderName.trim().isEmpty)
+        ? null
+        : riderName.trim();
     _password = _riderName == null ? null : password;
     _rejected = false;
     _rejectReason = null;
@@ -67,7 +70,8 @@ class GameClient {
 
   Future<void> _open() async {
     if (_disposed) return;
-    state.setStatus(_attempt == 0 ? ConnStatus.connecting : ConnStatus.retrying);
+    state
+        .setStatus(_attempt == 0 ? ConnStatus.connecting : ConnStatus.retrying);
     try {
       final channel = WebSocketChannel.connect(Uri.parse(_url));
       await channel.ready;
@@ -99,7 +103,7 @@ class GameClient {
 
       _pingTimer?.cancel();
       _pingTimer = Timer.periodic(const Duration(seconds: 20), (_) {
-        _send({ 'type': Msg.ping });
+        _send({'type': Msg.ping});
       });
     } catch (e) {
       _fail('连不上 $_url：$e');
@@ -184,23 +188,25 @@ class GameClient {
   }
 
   void claim(int orderId, {bool backOrder = false}) =>
-      _send({ 'type': Msg.claim, 'order_id': orderId, 'back_order': backOrder });
+      _send({'type': Msg.claim, 'order_id': orderId, 'back_order': backOrder});
 
-  void reject(int orderId) => _send({ 'type': Msg.reject, 'order_id': orderId });
+  void reject(int orderId) => _send({'type': Msg.reject, 'order_id': orderId});
+
   /// 收下系统塞来的指派单。指派后订单已在名下，这一步只是摘掉「待确认」标记；
   /// 但必须发：不发，之后退单会被当成「拒指派」再吃一次额度。
   void acceptAssign(int orderId) =>
-      _send({ 'type': Msg.acceptAssign, 'order_id': orderId });
-  void urge(int orderId) => _send({ 'type': Msg.urge, 'order_id': orderId });
+      _send({'type': Msg.acceptAssign, 'order_id': orderId});
+  void urge(int orderId) => _send({'type': Msg.urge, 'order_id': orderId});
   void arriveShop(int orderId) =>
-      _send({ 'type': Msg.arriveShop, 'order_id': orderId });
+      _send({'type': Msg.arriveShop, 'order_id': orderId});
   void arriveCustomer(int orderId) =>
-      _send({ 'type': Msg.arriveCustomer, 'order_id': orderId });
+      _send({'type': Msg.arriveCustomer, 'order_id': orderId});
   void deliver(int orderId) =>
-      _send({ 'type': Msg.deliver, 'order_id': orderId });
+      _send({'type': Msg.deliver, 'order_id': orderId});
 
   void setOnline(bool online) =>
-      _send({ 'type': Msg.setOnline, 'online': online });
+      _send({'type': Msg.setOnline, 'online': online});
+
   /// 上报手机定位（世界坐标 GCJ-02，换算在 `LocationService` 里做）。
   ///
   /// 服务端只改坐标、不动状态机，所以这一步不会让人跳过「到店 / 送达」。
@@ -208,7 +214,7 @@ class GameClient {
       _send({'type': Msg.setPosition, 'lat': lat, 'lng': lng});
 
   void setSpeedMode(SpeedMode mode) =>
-      _send({ 'type': Msg.setSpeedMode, 'mode': mode.wire });
+      _send({'type': Msg.setSpeedMode, 'mode': mode.wire});
 
   /// 改自己的密码。旧密码必须对——这是把二维码里的明文密码作废的唯一办法。
   void changePassword(String oldPassword, String newPassword) => _send({
@@ -217,14 +223,14 @@ class GameClient {
         'new_password': newPassword,
       });
   void sendTaskMessage(int orderId, String text) =>
-      _send({ 'type': Msg.taskMessage, 'order_id': orderId, 'text': text });
+      _send({'type': Msg.taskMessage, 'order_id': orderId, 'text': text});
 
   /// 订单会话（末端交付沟通）里说一句话。
   ///
   /// 与 [sendTaskMessage] 不同：**不要求订单挂任务**，末端任何一单都能说。
   /// 顾客会不会回由服务端决定——说了话不等于一定有人搭理。
   void sendChatSay(int orderId, String text) =>
-      _send({ 'type': Msg.chatSay, 'order_id': orderId, 'text': text });
+      _send({'type': Msg.chatSay, 'order_id': orderId, 'text': text});
 
   /// 订单会话里点一条预设话术。文本由服务端按枚举补全，这里只发枚举名。
   void sendChatPreset(int orderId, ChatPreset preset) => _send({
@@ -233,7 +239,7 @@ class GameClient {
         'preset': preset.wire,
       });
 
-  void resync() => _send({ 'type': Msg.resync });
+  void resync() => _send({'type': Msg.resync});
 
   void dispose() {
     _disposed = true;

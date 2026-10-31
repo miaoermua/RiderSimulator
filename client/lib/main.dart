@@ -36,6 +36,10 @@ class _RiderAppState extends State<RiderApp> {
     unawaited(AlertCenter.instance.init());
     // 定位频率是本地偏好，跟账号无关，先读出来再决定要不要开流。
     LocationService.instance.loadSaved();
+    // 「平台偏好」也是本地开关，同样与账号无关。不 await：
+    // 读盘失败最多是首帧按默认（关）渲染，不该拖慢启动。
+    unawaited(_state.loadPlatformPref());
+    unawaited(_state.loadNavApp());
   }
 
   /// 已经发起了连接（等着握手结果）。

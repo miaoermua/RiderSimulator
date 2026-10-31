@@ -200,16 +200,32 @@ class _QuotaBanner extends StatelessWidget {
     final limit = state.config.maxRejectsPerDay;
 
     final (text, fg, bg, icon) = state.rejectQuotaExhausted
-        ? ('你今天拒绝已超出上限，这一单拒不掉、只能收下', Colors.red.shade800, Colors.red.shade50, Icons.block)
+        ? (
+            '你今天拒绝已超出上限，这一单拒不掉、只能收下',
+            Colors.red.shade800,
+            Colors.red.shade50,
+            Icons.block
+          )
         : left == null
-            ? ('今日拒单不限次数（已拒 $used 单）', Colors.grey.shade800, Colors.grey.shade100, Icons.info_outline)
-            : ('今日还能拒 $left 单（已用 $used/$limit）', Colors.orange.shade900, Colors.orange.shade50, Icons.info_outline);
+            ? (
+                '今日拒单不限次数（已拒 $used 单）',
+                Colors.grey.shade800,
+                Colors.grey.shade100,
+                Icons.info_outline
+              )
+            : (
+                '今日还能拒 $left 单（已用 $used/$limit）',
+                Colors.orange.shade900,
+                Colors.orange.shade50,
+                Icons.info_outline
+              );
 
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(8)),
+      decoration:
+          BoxDecoration(color: bg, borderRadius: BorderRadius.circular(8)),
       child: Row(
         children: [
           Icon(icon, size: 16, color: fg),

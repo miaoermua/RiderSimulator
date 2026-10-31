@@ -11,6 +11,8 @@ pub mod activity;
 pub mod ai;
 pub mod chat;
 pub mod config;
+/// 派单范围：骑手有效位置 → 订单取货点的距离判定。见模块内注释。
+pub mod dispatch;
 pub mod economy;
 pub mod event;
 pub mod geo;

@@ -6,6 +6,7 @@ import '../alert_center.dart';
 import '../alert_event.dart';
 import '../game_client.dart';
 import '../game_state.dart';
+import '../navigation_service.dart';
 import '../protocol.dart';
 
 /// 设置（骑手端）。
@@ -65,8 +66,163 @@ class SettingsPage extends StatelessWidget {
                 onChanged: AlertCenter.instance.setSoundEnabled,
               ),
               if (AlertCenter.canPickCustomSound)
-                for (final slot in AlertSoundSlot.values) _SoundTile(slot: slot),
+                for (final slot in AlertSoundSlot.values)
+                  _SoundTile(slot: slot),
               const _PermissionBlock(),
+              const Divider(height: 28),
+              const _Label('界面'),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                value: state.platformPref,
+                title: const Text('平台偏好', style: TextStyle(fontSize: 13)),
+                subtitle: const Text(
+                  '换一套首页版式：路线规划挪到「待送」右边，点开是页内地图。'
+                  '只影响你自己的界面，不改变派单范围。',
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+                onChanged: state.setPlatformPref,
+              ),
+              // 只有「系统默认」一个选项时（Web / 桌面）不给点——
+              // 点开一个只有一项的选择器没有意义。
+              Builder(
+                builder: (context) {
+                  final apps = NavApp.forPlatform();
+                  return ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    title: const Text('默认导航应用', style: TextStyle(fontSize: 13)),
+                    subtitle: const Text(
+                      '点订单上的导航图标时交给哪个地图',
+                      style: TextStyle(fontSize: 12, color: Colors.grey),
+                    ),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          state.navApp.label,
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                        const Icon(Icons.chevron_right, size: 18),
+                      ],
+                    ),
+                    onTap: apps.length <= 1
+                        ? null
+                        : () async {
+                            final picked = await showModalBottomSheet<NavApp>(
+                              context: context,
+                              builder: (sheetCtx) => SafeArea(
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Padding(
+                                      padding:
+                                          EdgeInsets.fromLTRB(16, 14, 16, 6),
+                                      child: Text(
+                                        '默认导航应用',
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ),
+                                    for (final item in apps)
+                                      ListTile(
+                                        title: Text(item.label),
+                                        trailing: item == state.navApp
+                                            ? const Icon(Icons.check, size: 20)
+                                            : null,
+                                        onTap: () =>
+                                            Navigator.of(sheetCtx).pop(item),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            );
+                            if (picked != null) {
+                              await state.setNavApp(picked);
+                            }
+                          },
+                  );
+                },
+              ),
+              const Divider(height: 28),
+              const _Label('界面'),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                value: state.platformPref,
+                title: const Text('平台偏好', style: TextStyle(fontSize: 13)),
+                subtitle: const Text(
+                  '换一套首页版式：路线规划挪到「待送」右边，点开是页内地图。'
+                  '只影响你自己的界面，不改变派单范围。',
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+                onChanged: state.setPlatformPref,
+              ),
+              // 只有「系统默认」一个选项时（Web / 桌面）不给点——
+              // 点开一个只有一项的选择器没有意义。
+              Builder(
+                builder: (context) {
+                  final apps = NavApp.forPlatform();
+                  return ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    title: const Text('默认导航应用', style: TextStyle(fontSize: 13)),
+                    subtitle: const Text(
+                      '点订单上的导航图标时交给哪个地图',
+                      style: TextStyle(fontSize: 12, color: Colors.grey),
+                    ),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          state.navApp.label,
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                        const Icon(Icons.chevron_right, size: 18),
+                      ],
+                    ),
+                    onTap: apps.length <= 1
+                        ? null
+                        : () async {
+                            final picked = await showModalBottomSheet<NavApp>(
+                              context: context,
+                              builder: (sheetCtx) => SafeArea(
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Padding(
+                                      padding:
+                                          EdgeInsets.fromLTRB(16, 14, 16, 6),
+                                      child: Text(
+                                        '默认导航应用',
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ),
+                                    for (final item in apps)
+                                      ListTile(
+                                        title: Text(item.label),
+                                        trailing: item == state.navApp
+                                            ? const Icon(Icons.check, size: 20)
+                                            : null,
+                                        onTap: () =>
+                                            Navigator.of(sheetCtx).pop(item),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            );
+                            if (picked != null) {
+                              await state.setNavApp(picked);
+                            }
+                          },
+                  );
+                },
+              ),
               const Divider(height: 28),
               const _Label('骑行模式'),
               const SizedBox(height: 6),
@@ -95,17 +251,25 @@ class SettingsPage extends StatelessWidget {
               const _Label('当前派单规则（控制端设定）'),
               const SizedBox(height: 4),
               _Rule('抢单窗口', '${cfg.claimWindowSecs} 秒'),
-              _Rule('背单',
-                  cfg.backorderEnabled ? '开启 · 最多 ${cfg.backorderMax} 单' : '关闭'),
+              _Rule(
+                  '背单',
+                  cfg.backorderEnabled
+                      ? '开启 · 最多 ${cfg.backorderMax} 单'
+                      : '关闭'),
               _Rule('每日单量上限', '${cfg.maxOrdersPerDay} 单'),
-              _Rule('平台抽水', '${(cfg.commissionRate * 100).toStringAsFixed(1)}%'),
-              _Rule('时段',
-                  cfg.isPeak ? '高峰 · ×${cfg.surgeMultiplier.toStringAsFixed(2)}' : '平峰'),
-              _Rule('世界速度', '×${cfg.speedMultiplier}${cfg.paused ? '（已暂停）' : ''}'),
+              _Rule(
+                  '平台抽水', '${(cfg.commissionRate * 100).toStringAsFixed(1)}%'),
+              _Rule(
+                  '时段',
+                  cfg.isPeak
+                      ? '高峰 · ×${cfg.surgeMultiplier.toStringAsFixed(2)}'
+                      : '平峰'),
+              _Rule('世界速度',
+                  '×${cfg.speedMultiplier}${cfg.paused ? '（已暂停）' : ''}'),
               _Rule('取送半径', '${cfg.arriveRadiusM} 米'),
               const Divider(height: 28),
               const _Label('关于'),
-              const _Rule('版本', '0.2.5'),
+              const _Rule('版本', '0.2.6'),
               const _Rule('客户端', '骑手端 · arm64-v8a'),
             ],
           );
@@ -183,8 +347,7 @@ class _PermissionBlockState extends State<_PermissionBlock>
 
   /// 真正需要用户动手的状态。`limited` / `provisional` 已经够用，不算缺。
   static bool _needsAction(PermissionStatus? s) =>
-      s != null &&
-      (s.isDenied || s.isPermanentlyDenied || s.isRestricted);
+      s != null && (s.isDenied || s.isPermanentlyDenied || s.isRestricted);
 
   static String _text(PermissionStatus? s) {
     if (s == null) return '—';

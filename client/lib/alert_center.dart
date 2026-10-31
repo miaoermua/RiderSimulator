@@ -116,9 +116,8 @@ class AlertCenter extends ChangeNotifier {
   }
 
   Future<void> _createChannels() async {
-    final android = _notifications
-        .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>();
+    final android = _notifications.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
     if (android == null) return;
 
     await android.createNotificationChannel(

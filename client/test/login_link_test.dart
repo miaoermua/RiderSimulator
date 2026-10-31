@@ -4,8 +4,7 @@ import 'package:rider_client/login_link.dart';
 /// 服务端 `server/src/net/join.rs` 的 `login_uri_carries_everything_the_form_needs`
 /// 用的同一组值。**这是两边唯一的对接口**，所以这里不写「跟 build() 对得上」，
 /// 而是直接钉死服务端会产出的那串字面量。
-const _serverMadeUri =
-    'ridersim://login?host=192.168.1.7&port=8080'
+const _serverMadeUri = 'ridersim://login?host=192.168.1.7&port=8080'
     '&name=%E5%BC%A0%E4%B8%89&password=abc123';
 
 void main() {
@@ -71,7 +70,8 @@ void main() {
     });
 
     test('带了端口就用它的', () {
-      expect(normalizeServerUrl('192.168.1.7:9000'), 'ws://192.168.1.7:9000/ws');
+      expect(
+          normalizeServerUrl('192.168.1.7:9000'), 'ws://192.168.1.7:9000/ws');
     });
 
     test('http / https 换成 ws / wss', () {

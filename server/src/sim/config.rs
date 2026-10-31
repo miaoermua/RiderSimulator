@@ -346,6 +346,19 @@ impl Default for MoodRules {
     }
 }
 
+/// `dispatch_radius_km` 的 serde 默认值。
+///
+/// 单独一个函数是因为 `#[serde(default = "...")]` 只认函数路径，不认关联常量。
+/// 具体数值仍然取自 `dispatch` 模块，保持"一个数只写一次"。
+fn default_dispatch_radius_km() -> f64 {
+    crate::sim::dispatch::RADIUS_DEFAULT_KM
+}
+
+/// `recommend_percent` 的 serde 默认值：老配置没有这个字段时用 20%。
+fn default_recommend_percent() -> u32 {
+    crate::sim::dispatch::RECOMMEND_PERCENT_DEFAULT
+}
+
 /// 单局可调参数（控制端能改的都在这）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimConfig {
@@ -379,6 +392,26 @@ pub struct SimConfig {
     pub discriminative_commission: bool,
     /// 抢单窗口秒数 1~10。
     pub claim_window_secs: u32,
+    /// 派单范围半径（km）。
+    ///
+    /// 圆心的骑手**有效当前定位**，判的是「骑手 → 订单**取货点**」的球面距离。
+    /// 详见 `sim::dispatch`——那里同时定义了定位有效期与边界口径（等于半径算通过）。
+    ///
+    /// 默认 90、合法区间 1~500：默认值给一个"同城 + 邻近区县"的量级，
+    /// 上下限的理由见 `dispatch::RADIUS_MIN_KM` / `RADIUS_MAX_KM`。
+    ///
+    /// `#[serde(default)]` 保证老配置（没有这个字段）读进来时自动落到 90，
+    /// 不会因为缺字段反序列化失败。
+    #[serde(default = "default_dispatch_radius_km")]
+    pub dispatch_radius_km: f64,
+    /// 推荐单概率（百分比，0~100）。
+    ///
+    /// 控制的是**订单被标上「推荐」的概率**，不是被接单/被派送的概率——
+    /// 后者由派单算法决定，跟这个数无关。判定用的是
+    /// `hash(seed, rider_id, order_id) % 100 < 概率`，同一骑手同一订单结果恒定，
+    /// 刷新/重连/重启都不会让标签闪。
+    #[serde(default = "default_recommend_percent")]
+    pub recommend_percent: u32,
     pub allow_speeding: bool,
     pub allow_unrestricted: bool,
     /// 允许真人骑手做**违规操作**：路还没走完就点到店 / 到顾客（等价于
@@ -540,6 +573,10 @@ impl Default for SimConfig {
             discriminative_commission: false,
             // 3 秒 × 倍率 = 窗口 tick 数；实时档下退化为 1 tick（= 1 模拟分钟）。
             claim_window_secs: 3,
+            // 90 km：同城 + 邻近区县的量级。数值与 `dispatch::RADIUS_DEFAULT_KM`
+            // 同源，改一处即可，别在这里写第二份字面量。
+            dispatch_radius_km: crate::sim::dispatch::RADIUS_DEFAULT_KM,
+            recommend_percent: crate::sim::dispatch::RECOMMEND_PERCENT_DEFAULT,
             allow_speeding: true,
             allow_unrestricted: false,
             // 默认禁止：不到位置就点「到店 / 送达」是违规操作，得由控制端显式放行。

@@ -33,8 +33,9 @@ enum LocationRate {
   /// 距离过滤：原地不动时不产生新定位，省电的关键。
   final int meters;
 
-  String get detail =>
-      this == LocationRate.off ? '不请求定位，也不上报' : '${interval.inSeconds} 秒 / $meters 米';
+  String get detail => this == LocationRate.off
+      ? '不请求定位，也不上报'
+      : '${interval.inSeconds} 秒 / $meters 米';
 
   static LocationRate byName(String? name) => values.firstWhere(
         (r) => r.name == name,

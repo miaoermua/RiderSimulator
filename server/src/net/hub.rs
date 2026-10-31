@@ -21,6 +21,7 @@
 //! | `day_closed` | 只有自己的流水 | ✘ | 只有汇总 | 全部 |
 
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::sim::{
@@ -459,6 +460,33 @@ fn render_filtered(world: &World, ev: &SimEvent, role: Role, now_min: u64) -> Op
             out["ledgers"] = serde_json::to_value(visible).ok()?;
             Some(out)
         }
+        SimEvent::OrderBroadcast { order, .. } => {
+            // 控制端看全量（要调度），观战者也看全量（他不抢单，
+            // 没有"派单范围"这回事）。只有骑手按自己的半径收。
+            //
+            // 这一道和快照里的 `hall.retain` 必须同时在：快照管"进来时看到什么"，
+            // 这里管"跑着的时候新单要不要推送给他"。少了这一道，
+            // 范围外的单会先弹一下再在下次快照时消失——闪一下比不显示更糟。
+            if is_control {
+                return payload_of(ev);
+            }
+            match me {
+                Some(id) => {
+                    let rider = world.rider(id)?;
+                    if crate::sim::dispatch::order_in_range(
+                        rider,
+                        order,
+                        world.cfg.dispatch_radius_km,
+                        world.wall_ms,
+                    ) {
+                        payload_of(ev)
+                    } else {
+                        None
+                    }
+                }
+                None => payload_of(ev),
+            }
+        }
         // 其余事件都是公开信息
         _ => payload_of(ev),
     }
@@ -471,6 +499,31 @@ fn render_filtered(world: &World, ev: &SimEvent, role: Role, now_min: u64) -> Op
 /// - `Spectator`：全部公开版，且不含任何个人收入。
 pub fn render_snapshot(world: &World, role: Role, now_min: u64) -> Value {
     let mut snap = world.public_snapshot();
+    // 骑手视角的订单标记（推荐 / 顺路 / 同点）。空 Map = 不注入。
+    //
+    // 这些字段必须**落在订单之外**：同一张单，甲看到是推荐、乙看到不是，
+    // 顺路度更是每人一套。写进 `Order` 本体就成了"给全服打标签"。
+    let mut marks: HashMap<crate::sim::OrderId, crate::sim::dispatch::OrderMarks> = HashMap::new();
+    // 大厅按骑手的派单范围裁剪。**只裁 hall**，不动 `active_orders`：
+    // 已经接到手上的单不会因为骑手走远了就消失——那是另一条业务线。
+    //
+    // 骑手不存在（连接还在、身体被删）时清空大厅：宁可什么都不给，
+    // 也不能让一条没有身份的连接继续看到全城订单。
+    if let Role::Rider(id) = role {
+        match world.rider(id) {
+            Some(me) => {
+                let radius = world.cfg.dispatch_radius_km;
+                let now_ms = world.wall_ms;
+                snap.hall
+                    .retain(|o| crate::sim::dispatch::order_in_range(me, o, radius, now_ms));
+                // 推荐/顺路只在**已通过半径**的列表上算——两者都不该绕过派单范围。
+                marks = crate::sim::dispatch::marks_for_hall(world, me, &snap.hall)
+                    .into_iter()
+                    .collect();
+            }
+            None => snap.hall.clear(),
+        }
+    }
     let me = role.rider_id();
     snap.riders = world
         .riders
@@ -494,6 +547,34 @@ pub fn render_snapshot(world: &World, role: Role, now_min: u64) -> Value {
         };
     }
     let mut v = serde_json::to_value(&snap).unwrap_or(Value::Null);
+    // 把每骑手的标记贴到对应的订单对象上。
+    //
+    // 顺序放在序列化之后：`Order` 是共享结构，不能为了这几个字段
+    // 给它加一堆 `Option`（那会让"订单本身"和"某人的视角"混成一团）。
+    // 按 `id` 匹配而不是按下标——序列化不保证顺序，按下标会错位。
+    if !marks.is_empty()
+        && let Some(hall) = v.get_mut("hall").and_then(|h| h.as_array_mut())
+    {
+        for item in hall.iter_mut() {
+            let Some(oid) = item.get("id").and_then(|x| x.as_u64()) else {
+                continue;
+            };
+            let Some(m) = marks.get(&(oid as crate::sim::OrderId)) else {
+                continue;
+            };
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("recommended".into(), Value::Bool(m.recommended));
+                obj.insert("same_pickup".into(), Value::Bool(m.same_pickup));
+                obj.insert("same_dropoff".into(), Value::Bool(m.same_dropoff));
+                // `null` 表示"算不出来"（没有配送中的单 / 缺坐标），
+                // 与「顺路度 0%」是两件事，客户端要能区分。
+                obj.insert(
+                    "on_the_way_pct".into(),
+                    m.on_the_way_pct.map_or(Value::Null, |p| Value::from(p)),
+                );
+            }
+        }
+    }
     apply_coord_system(world, &mut v);
     v
 }

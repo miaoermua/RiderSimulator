@@ -51,4 +51,5 @@ const Map<CoordSystem, Basemap> basemaps = {
 };
 
 /// 按坐标系取底图。未知值退回高德（服务端默认 GCJ-02）。
-Basemap basemapFor(CoordSystem cs) => basemaps[cs] ?? basemaps[CoordSystem.gcj02]!;
+Basemap basemapFor(CoordSystem cs) =>
+    basemaps[cs] ?? basemaps[CoordSystem.gcj02]!;

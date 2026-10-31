@@ -18,6 +18,12 @@ enum AlertKind {
 
   /// 自己点了下线。
   offline,
+
+  /// 抢单成功。
+  ///
+  /// 只出声、不落通知栏：屏幕亮着、手刚离开滑块，再弹一条系统通知是噪音。
+  /// 界面里的成功态（[OrderCard] 抢单区）已经把事情说清楚了。
+  claimSuccess,
 }
 
 /// 设置里能单独配音效的槽位。
@@ -50,13 +56,17 @@ class RiderAlert {
   /// 上下线是自己刚按的按钮，屏幕还亮着，再弹一条通知纯属打扰，
   /// 只出声就够了。
   bool get showsNotification =>
-      kind != AlertKind.online && kind != AlertKind.offline;
+      kind != AlertKind.online &&
+      kind != AlertKind.offline &&
+      kind != AlertKind.claimSuccess;
 
   /// 对应的音效槽。`null` = 用系统默认通知音，不进设置。
   AlertSoundSlot? get soundSlot {
     switch (kind) {
       case AlertKind.assignOrder:
       case AlertKind.forcedAssign:
+      // 抢单成功复用「来单」那一套音效：用户已经能换它，不必多一个设置项。
+      case AlertKind.claimSuccess:
         return AlertSoundSlot.assign;
       case AlertKind.online:
         return AlertSoundSlot.online;

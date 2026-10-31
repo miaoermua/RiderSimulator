@@ -323,6 +323,37 @@ export function SettingsPanel() {
       </Row>
 
       <PanelHeading>规则</PanelHeading>
+      {/* 派单范围：圆心是骑手**当前有效定位**，判的是「骑手 → 订单取货点」。
+          等于半径算通过、超过才拒；骑手没有新鲜定位时大厅直接为空。
+          上下限来自服务端 `sim::dispatch`（1~500），后台这里只是把它显出来——
+          越界值服务端会拒（返回 400），不会静默改成边界值。 */}
+      <Row label="派单范围半径（km）" hint="骑手只能看到取货点在此半径内的待抢单；1~500">
+        <InputNumber
+          min={1}
+          max={500}
+          step={10}
+          addonAfter="km"
+          disabled={!isControl}
+          value={c.dispatch_radius_km}
+          onChange={(v) => v != null && store.send("set_config", { dispatch_radius_km: v })}
+        />
+      </Row>
+      {/* 推荐概率：只管"被标推荐"的概率，与订单是否被接单无关。
+          0 = 关掉推荐标签；100 = 大厅里每张都标。服务端同样严格校验（>100 报错）。 */}
+      <Row
+        label="推荐单概率（%）"
+        hint="订单被标上「推荐」的概率，不是被接单的概率；0 = 关闭"
+      >
+        <InputNumber
+          min={0}
+          max={100}
+          step={10}
+          addonAfter="%"
+          disabled={!isControl}
+          value={c.recommend_percent}
+          onChange={(v) => v != null && store.send("set_config", { recommend_percent: v })}
+        />
+      </Row>
       <Row label="抢单窗口（秒）">
         <InputNumber
           min={1}

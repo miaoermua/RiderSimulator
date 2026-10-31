@@ -140,7 +140,8 @@ class _Cell extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+            Text(label,
+                style: const TextStyle(fontSize: 11, color: Colors.grey)),
             Text(value, style: const TextStyle(fontWeight: FontWeight.w600)),
           ],
         ),

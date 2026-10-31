@@ -10,7 +10,7 @@ use super::{
     OrderId, RiderId,
     ai::{self, Assignment},
     config::{PEAK_PREP_FACTOR, STORM_PREP_FACTOR, SimConfig},
-    economy,
+    dispatch, economy,
     event::{DecisionSource, SimEvent},
     geo::{LatLng, haversine_m},
     order::{AssignMode, OrderStatus, OrderTier},
@@ -31,7 +31,14 @@ pub enum ClaimError {
     RiderFrozen,
     RiderInjured,
     RatingTooLow,
+    /// 手上**还没送完**的单量已经到上限（背单容量）。
     HeldLimitReached,
+    /// 当天**已完成**的单量已经到上限（`cfg.max_orders_per_day`）。
+    ///
+    /// 与 [`HeldLimitReached`] 分开：两者在界面上要给的提示完全不同——
+    /// 容量不足是「送完手上的再来」，每日上限是「今天不能接了」。
+    /// 共用同一个码时客户端没法区分，只能含糊地说「手上的单太多了」。
+    DailyLimitReached,
     BackOrderDisabled,
     BackOrderDetourTooLong,
     WrongPhase,
@@ -48,6 +55,12 @@ pub enum ClaimError {
     /// 世界不在实时档。真人骑手的时间必须和现实对齐（秒级出餐、真实距离），
     /// 模拟加速档只跑 AI——真人此时不能接入。
     RealtimeOnly,
+    /// 订单取货点超出了骑手的派单范围（半径由后台配置，见 `sim::dispatch`）。
+    ///
+    /// 单独一个码而不是并入 `NotAssignedToYou`：大厅里根本不该出现的单，
+    /// 客户端却发来了 claim——这要么是界面没刷新，要么是有人在绕过界面调接口，
+    /// 两种情况的排查方向完全不同，日志里必须能分开。
+    OutOfRange,
     /// 改派的目标就是这单现在的持有人——那不是改派。
     ///
     /// 单独给一个码是为了文案：`ALREADY_CLAIMED`（"订单已被抢走"）用在改派上，
@@ -72,6 +85,7 @@ impl ClaimError {
             ClaimError::RiderInjured => "RIDER_INJURED",
             ClaimError::RatingTooLow => "RATING_TOO_LOW",
             ClaimError::HeldLimitReached => "HELD_LIMIT_REACHED",
+            ClaimError::DailyLimitReached => "DAILY_LIMIT_REACHED",
             ClaimError::BackOrderDisabled => "BACK_ORDER_DISABLED",
             ClaimError::BackOrderDetourTooLong => "BACK_ORDER_DETOUR_TOO_LONG",
             ClaimError::WrongPhase => "WRONG_PHASE",
@@ -83,6 +97,7 @@ impl ClaimError {
             ClaimError::ForcedOffline => "FORCED_OFFLINE",
             ClaimError::RealtimeOnly => "REALTIME_ONLY",
             ClaimError::SameRider => "SAME_RIDER",
+            ClaimError::OutOfRange => "OUT_OF_RANGE",
         }
     }
 
@@ -98,6 +113,7 @@ impl ClaimError {
             ClaimError::RiderInjured => "受伤停工中",
             ClaimError::RatingTooLow => "评分不足，接不了这一档的单",
             ClaimError::HeldLimitReached => "手持单已达上限",
+            ClaimError::DailyLimitReached => "今日接单已达上限",
             ClaimError::BackOrderDisabled => "控制端关闭了背单",
             ClaimError::BackOrderDetourTooLong => "绕路太远，不划算",
             ClaimError::WrongPhase => "当前状态不允许这个操作",
@@ -109,6 +125,7 @@ impl ClaimError {
             ClaimError::ForcedOffline => "今天已被强制下线，明天再来",
             ClaimError::RealtimeOnly => "当前是模拟档，真人骑手只能在实时档上线",
             ClaimError::SameRider => "这单已经在该骑手手上了",
+            ClaimError::OutOfRange => "超出派单范围",
         }
     }
 }
@@ -149,22 +166,31 @@ pub fn check_claimable(
     if !economy::can_claim_tier(&world.cfg, rider.rating, order.tier) {
         return Err(ClaimError::RatingTooLow);
     }
-    // 「背不动了」有两个互不相干的理由，共用同一个错误码：
-    // - `reached_daily_cap` 数的是当天**已完成**的单量（`rider.rs:577`）；
-    // - 这里比的是手上**还没送完**的单量与当前有效背单上限。
+    // 「背不动了」有两个互不相干的理由，错码也分开——客户端要给的提示不同：
+    // - `reached_daily_cap` 数的是当天**已完成**的单量（`rider.rs:701`）；
+    // - 手持量比的是手上**还没送完**的单量与当前有效背单上限。
     //   后者曾经只在 `assign_forced` / `reassign` / `claim_extra` / `rescue_nearest`
     //   和 AI 那两条通道里查，大厅抢单漏了——满员骑手能从大厅再抢一单，
     //   `cap = 0`（只把手上的送完）的人也照样能抢。
     //
+    // 每日上限先判：它更硬，骑手今天不管送完多少都不能再接。
+    if rider.reached_daily_cap(&world.cfg) {
+        return Err(ClaimError::DailyLimitReached);
+    }
     // 复用 `effective_max_held`：策略覆盖（`cap_override`，含 0）与配置硬上限
     // 取小已在那里算好。`held.len() >= 上限` 就拒，所以上限为 0 时即使手上
     // 一单没有也接不了新单——这正是 `cap = 0` 的语义。
-    // 放在最后：前面的离线 / 冻结 / 受伤 / 评分错码是调用方已经依赖的既有结果，
-    // 新判定只在这四条都不成立时才可能出现。
-    if rider.reached_daily_cap(&world.cfg)
-        || rider.held.len() as u32 >= rider.effective_max_held(&world.cfg)
-    {
+    // 放在距离判定之前：前面几条都是读内存字段，这里也是。
+    if rider.held.len() as u32 >= rider.effective_max_held(&world.cfg) {
         return Err(ClaimError::HeldLimitReached);
+    }
+    // 距离放在最后：前面五条都是读内存字段，这里要算一次 haversine。
+    // 廉价判断先挡掉绝大多数请求，贵的留到最后。
+    //
+    // 这一道不是"重复校验"——大厅过滤只保证**列表里没有**，
+    // 接口本身必须自己挡，否则改个客户端就能接全国的单。
+    if !dispatch::order_in_range(rider, order, world.cfg.dispatch_radius_km, world.wall_ms) {
+        return Err(ClaimError::OutOfRange);
     }
     Ok(())
 }
@@ -1255,6 +1281,27 @@ mod tests {
         assert_eq!(o.assigned_to, None, "不能留下半截归属");
         assert!(!o.forced, "抢单失败不该带强制标记");
         assert_eq!(w.stats.claims, claims_before, "统计也不该动");
+    }
+
+    /// 每日上限与手持容量是两个理由，必须给两个错误码。
+    ///
+    /// 共用 `HELD_LIMIT_REACHED` 时，客户端只能含糊地提示「手上的单太多了」，
+    /// 而真实原因是「今天不能再接了」——这两种情况骑手的下一步动作不同。
+    #[test]
+    fn a_daily_cap_rider_gets_its_own_error_code() {
+        let (mut w, rid) = one_rider(17);
+        w.cfg.max_orders_per_day = 1;
+        {
+            let r = w.rider_mut(rid).expect("骑手在");
+            r.completed = 1;
+            assert!(r.held.is_empty(), "前提：不是容量不足");
+        }
+        let oid = w.generate_order_batch(1)[0];
+
+        let err = try_claim(&mut w, oid, rid).expect_err("到日上限不能再接");
+        assert_eq!(err, ClaimError::DailyLimitReached);
+        assert_eq!(err.code(), "DAILY_LIMIT_REACHED");
+        assert_eq!(w.order(oid).expect("订单在").assigned_to, None);
     }
 
     /// `cap = 0` = 只把手上的送完，不再接新单：手上空着也接不了。

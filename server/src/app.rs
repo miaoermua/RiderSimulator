@@ -1818,9 +1818,47 @@ impl App {
         Ok(json!({ "applied": applied, "failed": failed, "results": results }))
     }
 
+    /// `set_config` 的前置校验：只对**必须报错**的字段做检查。
+    ///
+    /// 老字段（抢单窗口、背单上限…）仍然走 `apply_config_patch` 里的 clamp，
+    /// 不挪到这里——那会连带改变既有行为与控制台预期。
+    fn validate_patch(p: &crate::net::ConfigPatch) -> Result<(), String> {
+        if let Some(v) = p.dispatch_radius_km {
+            crate::sim::dispatch::validate_radius_km(v)?;
+        }
+        if let Some(v) = p.recommend_percent
+            && v > 100
+        {
+            return Err(format!("推荐概率需在 0~100 之间，收到 {v}"));
+        }
+        Ok(())
+    }
+
+    /// WS `set_config` 的实际应用段。抽出来只是为了让上面那个分支
+    /// 不用把 `control` 的闭包嵌在 if/else 里——嵌进去会很难读。
+    fn apply_set_config(&mut self, conn_id: ConnId, role: Role, patch: crate::net::ConfigPatch) {
+        self.control(conn_id, role, "set_config", |app| {
+            // 调用方已经校验过半径，这里理论上不会失败；
+            // 仍然按 Result 走一遍，是为了让"校验"只有 apply_config_patch 一个入口。
+            let Ok(changed) = app.apply_config_patch(&patch) else {
+                return None;
+            };
+            for id in changed {
+                if let Some(ev) = scheduler::state_event(&app.world, id) {
+                    app.outbox.push(ev);
+                }
+            }
+            serde_json::to_value(app.world.config_view()).ok()
+        });
+    }
+
     /// 与 WS 的 `set_config` 走同一套夹取逻辑。
     fn rpc_set_config(&mut self, patch: &crate::net::ConfigPatch) -> RpcReply {
-        let changed = self.apply_config_patch(patch);
+        let changed = match self.apply_config_patch(patch) {
+            Ok(v) => v,
+            // 400 而不是 500：这是调用方参数错了，不是服务端故障。
+            Err(msg) => return Err(ApiError::bad_request(msg)),
+        };
         let events: Vec<SimEvent> = changed
             .into_iter()
             .filter_map(|id| scheduler::state_event(&self.world, id))
@@ -1862,6 +1900,9 @@ impl App {
             );
             return;
         }
+        // 先取墙钟：等下 `rider_mut` 会独占借用 `self.world`，
+        // 那时再读 `wall_ms` 就借不到了。
+        let now = self.world.wall_ms;
         let Some(r) = self.world.rider_mut(rid) else {
             self.hub.send_ack(
                 conn_id,
@@ -1869,7 +1910,7 @@ impl App {
             );
             return;
         };
-        r.set_pos(crate::sim::geo::LatLng { lat, lng });
+        r.report_position(crate::sim::geo::LatLng { lat, lng }, now);
         self.hub.send_ack(conn_id, &Ack::ok("set_position"));
     }
 
@@ -1885,12 +1926,13 @@ impl App {
                 "坐标越界：lat={lat} lng={lng}"
             )));
         }
+        let now = self.world.wall_ms;
         let Some(r) = self.world.rider_mut(rider_id) else {
             return Err(ApiError::bad_request(format!(
                 "没有 id 为 {rider_id} 的骑手"
             )));
         };
-        r.set_pos(crate::sim::geo::LatLng { lat, lng });
+        r.report_position(crate::sim::geo::LatLng { lat, lng }, now);
         Ok(json!({
             "rider_id": rider_id,
             "lat": lat,
@@ -2183,15 +2225,27 @@ impl App {
                 app.world.cfg.llm_brain_enabled = actual;
                 Some(json!({ "llm_enabled": actual }))
             }),
-            M::SetConfig(patch) => self.control(conn_id, role, "set_config", |app| {
-                let changed = app.apply_config_patch(&patch);
-                for id in changed {
-                    if let Some(ev) = scheduler::state_event(&app.world, id) {
-                        app.outbox.push(ev);
+            M::SetConfig(patch) => {
+                // `control` 的错误通道只认 `ClaimError`（业务拒绝），
+                // 装不下"配置非法"这种参数错误。所以在进入 control 之前
+                // 先挡一道：非法值直接回 error 信封，而不是"成功但没有数据"。
+                if role != Role::Control {
+                    self.hub.send_ack(
+                        conn_id,
+                        &Ack::err("set_config", code::NOT_A_CONTROLLER, "只有控制端能改世界"),
+                    );
+                } else {
+                    match Self::validate_patch(&patch) {
+                        Err(msg) => {
+                            self.hub.send_ack(
+                                conn_id,
+                                &Ack::err("set_config", code::BAD_REQUEST, &msg),
+                            );
+                        }
+                        Ok(()) => self.apply_set_config(conn_id, role, patch),
                     }
                 }
-                serde_json::to_value(app.world.config_view()).ok()
-            }),
+            }
             M::SetRiderOnline { rider_id, online } => self.control(
                 conn_id,
                 role,
@@ -2535,8 +2589,32 @@ impl App {
     }
 
     /// 应用 `set_config`，返回状态被连带改动的骑手。
-    fn apply_config_patch(&mut self, p: &crate::net::ConfigPatch) -> Vec<RiderId> {
+    ///
+    /// 返回 `Err` 表示**整条补丁一条都没落地**——先校验、后应用，
+    /// 不做"能落的先落"。半套配置生效比整条报错更难排查：
+    /// 管理员看到报错了，却不知道哪些字段其实已经改了。
+    fn apply_config_patch(&mut self, p: &crate::net::ConfigPatch) -> Result<Vec<RiderId>, String> {
+        // 派单半径是唯一严格校验的字段：它决定"骑手能看见哪些单"，
+        // 越界静默夹取会让人以为设成 0 生效了。老字段保持原有的 clamp 行为，
+        // 不在这里顺手改——那会连带改变既有测试与控制台的预期。
+        if let Some(v) = p.dispatch_radius_km {
+            crate::sim::dispatch::validate_radius_km(v)?;
+        }
+        // 推荐概率同样是"参数错误必须报出来"的字段：
+        // 百分比写错（比如想填 20 却填了 200）静默夹到 100 会让人以为生效了。
+        if let Some(v) = p.recommend_percent
+            && v > 100
+        {
+            return Err(format!("推荐概率需在 0~100 之间，收到 {v}"));
+        }
+
         let cfg = &mut self.world.cfg;
+        if let Some(v) = p.dispatch_radius_km {
+            cfg.dispatch_radius_km = v;
+        }
+        if let Some(v) = p.recommend_percent {
+            cfg.recommend_percent = v;
+        }
         if let Some(v) = p.claim_window_secs {
             cfg.claim_window_secs = v.clamp(1, 10);
         }
@@ -2622,7 +2700,7 @@ impl App {
         }
         changed.sort_unstable();
         changed.dedup();
-        changed
+        Ok(changed)
     }
 
     /// 握手。
@@ -3029,7 +3107,17 @@ impl App {
                     ),
                 );
             }
-            Err(e) => self.ack_err(conn_id, "claim", e),
+            // 失败也要带上 order_id：骑手可能同时滑了多张卡，只回 code 的话
+            // 客户端没法把原因挂到正确的卡片上（并发抢单时尤其明显）。
+            Err(e) => self.hub.send_ack(
+                conn_id,
+                &Ack::err_with(
+                    "claim",
+                    claim_code(&e),
+                    e.message(),
+                    json!({ "order_id": order_id }),
+                ),
+            ),
         }
     }
 

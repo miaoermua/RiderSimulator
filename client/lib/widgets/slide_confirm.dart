@@ -109,6 +109,9 @@ class _SlideToConfirmState extends State<SlideToConfirm>
                         opacity: (1 - _pos.value).clamp(0.0, 1.0),
                         child: Text(
                           widget.label,
+                          // 失败后文案里会带原因，窄屏时单行省略，不撑破滑块。
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             color: color,
                             fontSize: 13,

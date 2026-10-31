@@ -8,6 +8,14 @@
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
 	<string>骑手端</string>
+	<!-- 导航：iOS 9+ 用 canOpenURL 探测第三方 scheme 必须先在这里白名单，
+	     否则 canLaunchUrl 恒为 false（Apple 地图属于系统应用，不需要声明）。 -->
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>iosamap</string>
+		<string>baidumap</string>
+		<string>comgooglemaps</string>
+	</array>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>用你的位置校准骑手在模拟地图上的位置，并计算到店、送达的距离。</string>
 	<key>CFBundleExecutable</key>

@@ -174,6 +174,10 @@ pub struct ConfigView {
     pub commission_rate: f32,
     pub discriminative_commission: bool,
     pub claim_window_secs: u32,
+    /// 派单范围半径（km）。骑手大厅只展示取货点落在这个圈内的订单。
+    pub dispatch_radius_km: f64,
+    /// 推荐单概率（百分比）。控制"订单被标推荐"的概率，与接单率无关。
+    pub recommend_percent: u32,
     pub allow_speeding: bool,
     pub allow_unrestricted: bool,
     /// 允许真人骑手未到位置就点到店 / 送达。
@@ -347,9 +351,30 @@ impl World {
         let merchants = synth_merchants(seed, 40);
         let tasks = vec![synth_task()];
         let mut w = Self::new(cfg, merchants, tasks, Vec::new());
+        // 测试世界给一个固定的非零墙钟。
+        //
+        // 0 是「从没上报过定位」的哨兵值（见 `dispatch::PositionState::Never`），
+        // 所以夹具不能拿 0 当"现在"——否则骑手的时间戳也必须是 0，
+        // 又会被判成 Never，整个大厅永远是空的。
+        // 取一个随便的 2023 年时间，只要非零且足够大即可。
+        w.wall_ms = 1_700_000_000_000;
+        let now = w.wall_ms;
         for r in &mut w.riders {
             r.online = true;
             r.strategy.speed_mode = SpeedMode::Tolerant;
+            // 测试世界的默认前提：这些骑手**刚上报过位置**。
+            //
+            // 不补这一条，所有「大厅抢单」类测试都会撞上派单范围——
+            // 因为 `Rider::new` 给的出生坐标是剧本里的 `home`，
+            // `position_report_wall_ms` 是 0，按 `dispatch::position_state`
+            // 判定属于「从没上报过」，一单都不给看见。
+            //
+            // 之所以在夹具里统一补而不是逐个测试补：真实世界里骑手上线后
+            // 客户端立刻就上报定位（`LocationService` 默认 30 秒一次），
+            // 「能抢单的骑手一定有新鲜定位」本来就是常态。
+            // 「没定位 / 定位过期」是**异常路径**，由 `dispatch` 的单元测试
+            // 直接构造，不靠夹具。
+            r.position_report_wall_ms = now;
         }
         w
     }
@@ -1345,6 +1370,8 @@ impl World {
             commission_rate: self.cfg.commission_rate,
             discriminative_commission: self.cfg.discriminative_commission,
             claim_window_secs: self.cfg.claim_window_secs,
+            dispatch_radius_km: self.cfg.dispatch_radius_km,
+            recommend_percent: self.cfg.recommend_percent,
             allow_speeding: self.cfg.allow_speeding,
             allow_unrestricted: self.cfg.allow_unrestricted,
             allow_rider_violation: self.cfg.allow_rider_violation,

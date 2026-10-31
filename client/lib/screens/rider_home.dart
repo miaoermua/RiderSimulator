@@ -30,6 +30,26 @@ class RiderHomePage extends StatefulWidget {
 }
 
 class _RiderHomePageState extends State<RiderHomePage> {
+  /// 页内路线规划是否打开。
+  ///
+  /// 只在「平台偏好」模式下用：那个模式要求点路线规划**不跳页**，
+  /// 而是在首页盖一层地图。关闭时这个值一定是 false，
+  /// 走的是独立页面（`showRoutePlan`），两种入口互不影响。
+  ///
+  /// 用条件构建（`if (_routeOpen)`）而不是 `Offstage`：关闭时
+  /// `DeliveryMap` 整个从树上摘掉，地图控制器随之销毁，不会留定时器或订阅。
+  bool _routeOpen = false;
+
+  // TODO(audio): 平台偏好模式的**内置音效**接这里。
+  //
+  // 计划是「新单进大厅」「指派单到达」各放一声短提示。本期**刻意不实现**，
+  // 原因不是没时间：`AlertCenter` 已经有一整套音效体系（系统铃声 + 可换的
+  // 本地音频 + 自定义提示音），再叠一套必须先定清楚三件事——
+  // 两套谁优先、同时触发时怎么避免双响、静音开关管不管这一套。
+  // 这些没定之前先接上，用户会听到两声重叠的提示。
+  // 接入点就在这里：`_watchOnline` / `_onState` 旁边，那里已经在监听
+  // 这些状态变化了。
+
   Timer? _ticker;
 
   /// 已经为哪一张指派单弹过确认界面——同一张不重复弹。
@@ -51,6 +71,9 @@ class _RiderHomePageState extends State<RiderHomePage> {
   void initState() {
     super.initState();
     widget.state.addListener(_onState);
+    // 抢单 ack 超时后，状态机需要再要一份快照来确认归属。回调注入，
+    // 避免 `GameState` 反过来依赖 WebSocket 客户端。
+    widget.state.onResyncRequested = widget.client.resync;
     // 进主界面才开定位：登录页没必要问权限，也不想在没连上时就上报。
     LocationService.instance.attach(widget.client, widget.state);
     // 每秒重绘一次，让倒计时 / 时钟走字。
@@ -64,6 +87,7 @@ class _RiderHomePageState extends State<RiderHomePage> {
   @override
   void dispose() {
     widget.state.removeListener(_onState);
+    widget.state.onResyncRequested = null;
     _ticker?.cancel();
     super.dispose();
   }
@@ -179,6 +203,21 @@ class _RiderHomePageState extends State<RiderHomePage> {
     await Future<void>.delayed(const Duration(milliseconds: 650));
   }
 
+  /// 打开路线规划。两种模式的落点不同：
+  ///
+  /// - 平台偏好**关**：跳独立页面（原本的行为，不动）；
+  /// - 平台偏好**开**：在首页盖一层（任务要求"不跳转独立页面"）。
+  ///
+  /// 两条路都只是"看"——**不碰订单状态、派单状态或骑手容量**。
+  /// 覆盖层是纯展示组件，关掉就把整棵子树摘掉。
+  void _openRoute() {
+    if (widget.state.platformPref) {
+      setState(() => _routeOpen = true);
+    } else {
+      showRoutePlan(context, state: widget.state, client: widget.client);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = widget.state;
@@ -196,54 +235,95 @@ class _RiderHomePageState extends State<RiderHomePage> {
               title: _Title(state: state, client: widget.client),
               actions: [_BellButton(state: state)],
             ),
-            body: Column(
+            // Stack：底层是正常首页，上层是「平台偏好」模式下的页内路线图。
+            // 覆盖层只在 `_routeOpen` 时构建，关闭即销毁（见字段注释）。
+            body: Stack(
               children: [
-                _NoticeStrip(state: state),
-                _CapacityStrip(state: state),
-                TabBar(
-                  dividerColor: Colors.black12,
-                  tabs: [
-                    Tab(text: _tabLabel('待抢', hall.length)),
-                    Tab(text: _tabLabel('待取', pickup.length)),
-                    Tab(text: _tabLabel('待送', delivery.length)),
+                Column(
+                  children: [
+                    _NoticeStrip(state: state),
+                    _CapacityStrip(state: state),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TabBar(
+                            dividerColor: Colors.black12,
+                            tabs: [
+                              Tab(text: _tabLabel('待抢', hall.length)),
+                              Tab(text: _tabLabel('待取', pickup.length)),
+                              Tab(text: _tabLabel('待送', delivery.length)),
+                            ],
+                          ),
+                        ),
+                        // 平台偏好模式：路线规划从底栏挪到「待送」右侧。
+                        // 放在 TabBar 的 Row 里而不是浮动按钮，是为了让它
+                        // 跟着标签栏一起滚开/固定，位置稳定、不挡订单卡。
+                        if (state.platformPref)
+                          Padding(
+                            padding: const EdgeInsets.only(right: 4),
+                            child: IconButton(
+                              icon: const Icon(Icons.alt_route, size: 20),
+                              tooltip: '路线规划',
+                              onPressed: _openRoute,
+                            ),
+                          ),
+                      ],
+                    ),
+                    Expanded(
+                      child: TabBarView(
+                        children: [
+                          _OrderList(
+                            orders: hall,
+                            mode: OrderCardMode.hall,
+                            state: state,
+                            client: widget.client,
+                            empty: '大厅暂时没单，下拉刷新试试。',
+                            onRefresh: _refresh,
+                            platformPref: state.platformPref,
+                          ),
+                          _OrderList(
+                            orders: pickup,
+                            mode: OrderCardMode.pickup,
+                            state: state,
+                            client: widget.client,
+                            empty: '没有待取的单。去大厅抢一单吧。',
+                            onRefresh: _refresh,
+                            platformPref: state.platformPref,
+                          ),
+                          _OrderList(
+                            orders: delivery,
+                            mode: OrderCardMode.delivery,
+                            state: state,
+                            client: widget.client,
+                            empty: '没有待送的单。',
+                            onRefresh: _refresh,
+                            platformPref: state.platformPref,
+                          ),
+                        ],
+                      ),
+                    ),
                   ],
                 ),
-                Expanded(
-                  child: TabBarView(
-                    children: [
-                      _OrderList(
-                        orders: hall,
-                        mode: OrderCardMode.hall,
-                        state: state,
-                        client: widget.client,
-                        empty: '大厅暂时没单，下拉刷新试试。',
-                        onRefresh: _refresh,
+                if (_routeOpen)
+                  Positioned.fill(
+                    child: Material(
+                      color: Theme.of(context).colorScheme.surface,
+                      child: SafeArea(
+                        child: RoutePlanView(
+                          state: state,
+                          client: widget.client,
+                          onClose: () => setState(() => _routeOpen = false),
+                        ),
                       ),
-                      _OrderList(
-                        orders: pickup,
-                        mode: OrderCardMode.pickup,
-                        state: state,
-                        client: widget.client,
-                        empty: '没有待取的单。去大厅抢一单吧。',
-                        onRefresh: _refresh,
-                      ),
-                      _OrderList(
-                        orders: delivery,
-                        mode: OrderCardMode.delivery,
-                        state: state,
-                        client: widget.client,
-                        empty: '没有待送的单。',
-                        onRefresh: _refresh,
-                      ),
-                    ],
+                    ),
                   ),
-                ),
               ],
             ),
-            bottomNavigationBar: _BottomTools(
+            bottomNavigationBar: BottomTools(
               state: state,
               client: widget.client,
               onRefresh: _refresh,
+              onRoutePlan: _openRoute,
             ),
           ),
         );
@@ -390,7 +470,8 @@ class _BellButton extends StatelessWidget {
       ),
       icon: n == 0
           ? const Icon(Icons.notifications_none)
-          : Badge(label: Text('$n'), child: const Icon(Icons.notifications_none)),
+          : Badge(
+              label: Text('$n'), child: const Icon(Icons.notifications_none)),
     );
   }
 }
@@ -467,8 +548,7 @@ class _NoticeStrip extends StatelessWidget {
                   child: Icon(Icons.emoji_events_outlined,
                       size: 16, color: Colors.deepOrange.shade400),
                 ),
-              const Icon(Icons.chevron_right,
-                  size: 18, color: Colors.black38),
+              const Icon(Icons.chevron_right, size: 18, color: Colors.black38),
             ],
           ),
         ),
@@ -569,6 +649,7 @@ class _OrderList extends StatelessWidget {
     required this.client,
     required this.empty,
     required this.onRefresh,
+    this.platformPref = false,
   });
 
   final List<OrderView> orders;
@@ -579,6 +660,9 @@ class _OrderList extends StatelessWidget {
 
   /// 下拉刷新。Future 结束之前，顶上的刷新圈不会收。
   final Future<void> Function() onRefresh;
+
+  /// 平台偏好模式：空态的插画位换成预留占位块。
+  final bool platformPref;
 
   @override
   Widget build(BuildContext context) {
@@ -600,12 +684,24 @@ class _OrderList extends StatelessWidget {
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      // 插画是透明底的线稿，跟着主题走不会突兀。
-                      Image.asset(
-                        'assets/illustrations/empty_orders.png',
-                        width: 200,
-                        filterQuality: FilterQuality.medium,
-                      ),
+                      // 插画位。
+                      //
+                      // 平台偏好模式要求这里换成"预留的插画"——所以给一个
+                      // 与插画同宽的占位块，两种模式之间切换时下面的文案不会跳位置。
+                      //
+                      // TODO(illustration): 平台偏好专属插画待接入。
+                      // 换的时候把 `_IllustrationPlaceholder` 换成
+                      // `Image.asset('assets/illustrations/...')` 即可，
+                      // 尺寸保持 200 宽，别动下面的间距。
+                      if (platformPref)
+                        const _IllustrationPlaceholder()
+                      else
+                        // 插画是透明底的线稿，跟着主题走不会突兀。
+                        Image.asset(
+                          'assets/illustrations/empty_orders.png',
+                          width: 200,
+                          filterQuality: FilterQuality.medium,
+                        ),
                       const SizedBox(height: 12),
                       Text(
                         empty,
@@ -640,22 +736,32 @@ class _OrderList extends StatelessWidget {
 ///
 /// 前两个是低频操作，做小：图标在上、文字在下、不带边框；
 /// 刷新是跑单时一直想按的，做大，单手拇指好够。
-class _BottomTools extends StatefulWidget {
-  const _BottomTools({
+///
+/// 公开（而不是 `_BottomTools`）只是为了**布局测试能单独 pump 它**——
+/// 整个首页挂着定时器和连接状态，为了量一次按钮宽度去 pump 全页太重。
+/// 业务上它仍然只服务这个页面。
+@visibleForTesting
+class BottomTools extends StatefulWidget {
+  const BottomTools({
     required this.state,
     required this.client,
     required this.onRefresh,
+    required this.onRoutePlan,
   });
 
   final GameState state;
   final GameClient client;
   final Future<void> Function() onRefresh;
 
+  /// 点「路线规划」。具体是跳页还是盖一层由父级决定——
+  /// 底栏不该知道平台偏好，它只负责把点击传上去。
+  final VoidCallback onRoutePlan;
+
   @override
-  State<_BottomTools> createState() => _BottomToolsState();
+  State<BottomTools> createState() => BottomToolsState();
 }
 
-class _BottomToolsState extends State<_BottomTools> {
+class BottomToolsState extends State<BottomTools> {
   /// 刷新进行中：图标换成转圈，顺便按住重复点击。
   bool _busy = false;
 
@@ -715,23 +821,31 @@ class _BottomToolsState extends State<_BottomTools> {
               ),
             ),
           ),
-          const SizedBox(width: 4),
-          Expanded(
-            flex: 2,
-            child: _toolButton(
-              icon: Icons.alt_route,
-              label: '路线规划',
-              onTap: () => showRoutePlan(
-                context,
-                state: widget.state,
-                client: widget.client,
+          // 平台偏好开启时这一格让出来：路线规划已经挪到「待送」右侧，
+          // 底栏再留一个等于同一个动作给两个入口，宽度还更好分给刷新。
+          if (!widget.state.platformPref) ...[
+            const SizedBox(width: 4),
+            Expanded(
+              flex: 2,
+              child: _toolButton(
+                icon: Icons.alt_route,
+                label: '路线规划',
+                onTap: widget.onRoutePlan,
               ),
             ),
-          ),
+          ],
           const SizedBox(width: 8),
-          // 六成：一颗大按钮，转圈就是刷新动效。
+          // 刷新按钮。平台偏好开启时它让出一截：
+          //
+          // - `flex` 6 → 5：剩余宽度里少分一份，按钮本身变窄；
+          // - 右侧再补 20px 留白：右边缘向左收，不至于顶到屏幕最右边——
+          //   那一带是拇指回勾最容易误触的地方，而且上方 TabBar 右侧还挂着
+          //   路线规划图标，底栏右边缘留白能跟它形成一条视觉竖线。
+          //
+          // 只动宽度分配，不动高度、不改字号、不缩小图标：
+          // 触控面积仍然是一整条 46 高的按钮，比原来只窄一点点。
           Expanded(
-            flex: 6,
+            flex: widget.state.platformPref ? 5 : 6,
             child: FilledButton.tonal(
               onPressed: _busy ? null : _refresh,
               style: FilledButton.styleFrom(
@@ -760,6 +874,43 @@ class _BottomToolsState extends State<_BottomTools> {
                       ),
               ),
             ),
+          ),
+          if (widget.state.platformPref) const SizedBox(width: 20),
+        ],
+      ),
+    );
+  }
+}
+
+/// 平台偏好模式下的插画占位。
+///
+/// 尺寸对齐原来的插画（200 宽），两种模式切换时下面的文案不会跳位置。
+///
+/// TODO(illustration): 接入平台偏好专属插画后删掉这个组件，
+/// 换成 `Image.asset(...)`，宽度保持 200。
+class _IllustrationPlaceholder extends StatelessWidget {
+  const _IllustrationPlaceholder();
+
+  @override
+  Widget build(BuildContext context) {
+    final c = Theme.of(context).colorScheme;
+    return Container(
+      width: 200,
+      height: 120,
+      decoration: BoxDecoration(
+        color: c.surfaceContainerHighest.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: c.outlineVariant),
+      ),
+      alignment: Alignment.center,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.image_outlined, size: 26, color: c.onSurfaceVariant),
+          const SizedBox(height: 6),
+          Text(
+            '插画位（待接入）',
+            style: TextStyle(fontSize: 12, color: c.onSurfaceVariant),
           ),
         ],
       ),

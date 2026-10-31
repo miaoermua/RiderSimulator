@@ -93,7 +93,8 @@ class OrderDetailPage extends StatelessWidget {
                           children: [
                             OutlinedButton.icon(
                               onPressed: () => client.urge(order.id),
-                              icon: const Icon(Icons.campaign_outlined, size: 18),
+                              icon:
+                                  const Icon(Icons.campaign_outlined, size: 18),
                               label: const Text('催单'),
                             ),
                             const SizedBox(width: 10),

@@ -21,12 +21,31 @@ LatLng wgs84ToGcj02(double lat, double lng) {
   magic = 1 - _ee * magic * magic;
   final sqrtMagic = math.sqrt(magic);
 
-  dLat = (dLat * 180.0) /
-      ((_a * (1 - _ee)) / (magic * sqrtMagic) * math.pi);
-  dLng = (dLng * 180.0) /
-      (_a / sqrtMagic * math.cos(radLat) * math.pi);
+  dLat = (dLat * 180.0) / ((_a * (1 - _ee)) / (magic * sqrtMagic) * math.pi);
+  dLng = (dLng * 180.0) / (_a / sqrtMagic * math.cos(radLat) * math.pi);
 
   return LatLng(lat + dLat, lng + dLng);
+}
+
+/// GCJ-02 → WGS-84，正变换的逆。
+///
+/// 火星坐标系的正变换没有解析逆，工程上通用做法是**迭代逼近**：
+/// 拿当前估计值做一次正变换，用偏差反推回去，两轮就收敛到 1 米以内
+/// （偏移量本身只有几百米，收敛极快）。
+///
+/// 用途：把 GCJ-02 的目标点交给只认 WGS-84 的应用（Google Maps）。
+/// 境外坐标不做变换，与正变换保持对称。
+LatLng gcj02ToWgs84(double lat, double lng) {
+  if (!inChina(lat, lng)) return LatLng(lat, lng);
+
+  var wgsLat = lat;
+  var wgsLng = lng;
+  for (var i = 0; i < 2; i++) {
+    final g = wgs84ToGcj02(wgsLat, wgsLng);
+    wgsLat -= g.latitude - lat;
+    wgsLng -= g.longitude - lng;
+  }
+  return LatLng(wgsLat, wgsLng);
 }
 
 /// 粗略的「是否在中国境内」判断，够用来决定要不要做偏移。
@@ -47,8 +66,7 @@ double _transformLat(double x, double y) {
           20.0 * math.sin(2.0 * x * math.pi)) *
       2.0 /
       3.0;
-  ret += (20.0 * math.sin(y * math.pi) +
-          40.0 * math.sin(y / 3.0 * math.pi)) *
+  ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) *
       2.0 /
       3.0;
   ret += (160.0 * math.sin(y / 12.0 * math.pi) +
@@ -69,8 +87,7 @@ double _transformLng(double x, double y) {
           20.0 * math.sin(2.0 * x * math.pi)) *
       2.0 /
       3.0;
-  ret += (20.0 * math.sin(x * math.pi) +
-          40.0 * math.sin(x / 3.0 * math.pi)) *
+  ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) *
       2.0 /
       3.0;
   ret += (150.0 * math.sin(x / 12.0 * math.pi) +

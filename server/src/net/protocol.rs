@@ -360,6 +360,16 @@ pub struct ConfigPatch {
     /// 抢单窗口秒数，1~10。
     #[serde(default)]
     pub claim_window_secs: Option<u32>,
+    /// 派单范围半径（km）。合法区间见 `sim::dispatch::RADIUS_MIN_KM/RADIUS_MAX_KM`（1~500）。
+    ///
+    /// 与老字段不同，这个**越界会报错而不是静默夹取**：半径直接决定
+    /// "骑手能看见哪些单"，悄悄把 0 改成 1、把 9999 改成 500，
+    /// 管理员会以为配置生效了。非法值必须让人看见。
+    #[serde(default)]
+    pub dispatch_radius_km: Option<f64>,
+    /// 推荐单概率（百分比 0~100）。越界同样报错不夹取。
+    #[serde(default)]
+    pub recommend_percent: Option<u32>,
     #[serde(default)]
     pub allow_speeding: Option<bool>,
     #[serde(default)]
@@ -536,6 +546,26 @@ impl Ack {
             code: Some(code.into()),
             message: Some(message.into()),
             data: None,
+        }
+    }
+
+    /// 失败 + 附加数据。
+    ///
+    /// 有些动作的失败必须能**对应回具体对象**，否则并发时客户端分不清是哪一单：
+    /// 抢单失败就是这种——骑手可能同时滑了两张卡，只给 code 的话失败原因会
+    /// 挂到错误的卡片上。`data` 在这里只放 `order_id` 这类定位字段。
+    pub fn err_with(
+        action: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        Self {
+            action: action.into(),
+            ok: false,
+            code: Some(code.into()),
+            message: Some(message.into()),
+            data: Some(data),
         }
     }
 }

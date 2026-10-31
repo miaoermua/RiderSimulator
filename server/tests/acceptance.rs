@@ -116,8 +116,16 @@ fn claiming_is_atomic_exactly_one_winner() {
         riders.push(w.spawn_human_rider(format!("骑手{i}")));
     }
     // 真人骑手默认是下线状态，得先上线才能抢单。
+    //
+    // 同时补一次定位上报：`spawn_human_rider` 造出来的身体
+    // `position_report_wall_ms` 是 0（= 从没上报过），按派单范围规则
+    // 一单都不给看见。真实客户端上线后立刻上报，这里补的是同一个前提。
     for rid in &riders {
         scheduler::set_online(&mut w, *rid, true).expect("上线应该成功");
+        let now = w.wall_ms;
+        let r = w.rider_mut(*rid).expect("刚上线的骑手在");
+        let pos = rider_sim::sim::geo::LatLng::new(r.lat, r.lng);
+        r.report_position(pos, now);
     }
     let order = w.generate_order().expect("应该能出一单");
 

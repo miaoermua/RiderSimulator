@@ -1,6 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'alert_event.dart';
+import 'navigation_service.dart';
 import 'protocol.dart';
 
 /// 连接状态。UI 用它决定顶栏圆点颜色与重连提示。
@@ -17,6 +21,65 @@ class LogLine {
 }
 
 enum LogKind { info, good, bad, money, chat }
+
+/// 一笔抢单请求的阶段。
+///
+/// 刻意不合成一个 `isLoading`：等待、确认、成功、失败在界面上的表现完全不同，
+/// 而且"确认中"必须能和"提交中"区分开——前者表示**服务端可能已经处理完了**，
+/// 只是客户端没收到回包。
+enum ClaimPhase {
+  /// 请求已发出，等 ack。
+  submitting,
+
+  /// 等太久没等到 ack，正在用快照确认这一单到底归谁。
+  confirming,
+
+  /// 服务端已明确把这一单分配给本人。
+  succeeded,
+
+  /// 服务端明确拒绝，或快照证明没有抢到。
+  failed,
+}
+
+/// 一张订单的抢单尝试。
+///
+/// 按订单存，不按页面存：骑手可能先后滑两张卡，两单的等待/成功/失败互不影响。
+class ClaimAttempt {
+  ClaimAttempt({
+    required this.order,
+    required this.gen,
+    required this.index,
+    this.phase = ClaimPhase.submitting,
+  });
+
+  /// 提交那一刻的订单快照。成功后这张卡会从大厅被移走，但成功态还要在原位
+  /// 停留一会儿，所以不能依赖 `hall` 里还能找到它。
+  final OrderView order;
+
+  /// 每次重试 +1。界面上拿它当 key，把滑块里那个一次性的 `_fired` 锁重置掉。
+  final int gen;
+
+  /// 提交时在大厅里的下标，快照整表替换后用来把成功卡片插回原位。
+  final int index;
+
+  ClaimPhase phase;
+
+  /// 服务端错误码（本地网络错误为 null）。
+  String? code;
+
+  /// 给人看的原因。
+  String? message;
+
+  /// 失败后还能不能再滑一次。
+  bool retryable = true;
+
+  /// 「确认中」是否已经发过一次 resync，避免无限重发。
+  bool resynced = false;
+
+  bool get active =>
+      phase == ClaimPhase.submitting || phase == ClaimPhase.confirming;
+  bool get succeeded => phase == ClaimPhase.succeeded;
+}
 
 /// 钱包里的一条收支。金额单位是分，负数是支出（罚款 / 抽水）。
 class WalletEntry {
@@ -42,6 +105,89 @@ class WalletEntry {
 /// **这是 UI 的唯一数据源**：网络层只负责把帧喂给 [applyFrame]，
 /// UI 只监听本对象。所有解析失败都在这里被吞掉并记一条日志，绝不崩界面。
 class GameState extends ChangeNotifier {
+  /// 抢单相关的节奏都做成入参：生产用默认值，测试可以压到毫秒级。
+  GameState({
+    this.claimAckTimeout = const Duration(seconds: 8),
+    this.claimConfirmTimeout = const Duration(seconds: 8),
+    this.claimSuccessHold = const Duration(milliseconds: 1500),
+    this.claimGoneHold = const Duration(milliseconds: 1200),
+  });
+
+  // ---------------------------------------------------------------------
+  // 本地界面偏好（只影响骑手自己看到的版式）
+  // ---------------------------------------------------------------------
+
+  /// 「平台偏好」开关。
+  ///
+  /// 开了之后首页换一套版式：插画位换成预留块、路线规划从底栏挪到
+  /// 「待送」右边、点开是页内地图而不是跳新页面。
+  ///
+  /// **它和派单半径没有关系**——半径是服务端的业务配置，改了会影响
+  /// 能不能看见单；这里只是骑手自己喜不喜欢这个版式。所以它存在本地、
+  /// 不上报服务端，也不参与任何业务判断。
+  bool _platformPref = false;
+  bool get platformPref => _platformPref;
+
+  static const _kPlatformPref = 'platform_pref_enabled';
+
+  /// 启动时读一次。读失败按默认（关）处理——一个界面偏好不值得让 App 起不来。
+  Future<void> loadPlatformPref() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _platformPref = prefs.getBool(_kPlatformPref) ?? false;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('platform_pref: 读取失败，按默认关闭处理 $e');
+    }
+  }
+
+  Future<void> setPlatformPref(bool v) async {
+    if (_platformPref == v) return;
+    _platformPref = v;
+    // 先通知再落盘：界面立刻切过去，写盘失败也不该让按钮卡在那里。
+    notifyListeners();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_kPlatformPref, v);
+    } catch (e) {
+      debugPrint('platform_pref: 保存失败 $e');
+    }
+  }
+
+  /// 默认导航应用。
+  ///
+  /// 只存一个枚举名（`system` / `amap` / ...），读的时候按当前平台过滤一遍：
+  /// 在 iPhone 上选了 Apple 地图、换成 Android 后读出来会回落到「系统默认」，
+  /// 而不是记着一个这台机器上根本打不开的选项。
+  NavApp _navApp = NavApp.system;
+  NavApp get navApp => _navApp;
+
+  static const _kNavApp = 'default_nav_app';
+
+  Future<void> loadNavApp() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = NavApp.parse(prefs.getString(_kNavApp));
+      _navApp = NavApp.forPlatform().contains(saved) ? saved : NavApp.system;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('nav_app: 读取失败，按系统默认处理 $e');
+    }
+  }
+
+  Future<void> setNavApp(NavApp v) async {
+    if (_navApp == v) return;
+    _navApp = v;
+    // 先通知再落盘：下一次点导航图标要立刻用新选择，不等写盘。
+    notifyListeners();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kNavApp, v.name);
+    } catch (e) {
+      debugPrint('nav_app: 保存失败 $e');
+    }
+  }
+
   // ---------------------------------------------------------------------
   // 连接 / 身份
   // ---------------------------------------------------------------------
@@ -121,7 +267,8 @@ class GameState extends ChangeNotifier {
   /// 插值后的「当前模拟分钟」。UI 每秒刷新一次即可。
   int get nowMinute {
     final interval = tickIntervalMs <= 0 ? 1000 : tickIntervalMs;
-    final drift = DateTime.now().difference(_syncedAt).inMilliseconds ~/ interval;
+    final drift =
+        DateTime.now().difference(_syncedAt).inMilliseconds ~/ interval;
     return _syncedMinute + drift;
   }
 
@@ -160,7 +307,8 @@ class GameState extends ChangeNotifier {
 
   /// 大厅里还剩多少毫秒可抢。负数表示已过期。
   int claimRemainingMs(OrderView o) =>
-      (o.claimDeadlineMin - nowMinute) * (tickIntervalMs <= 0 ? 1000 : tickIntervalMs);
+      (o.claimDeadlineMin - nowMinute) *
+      (tickIntervalMs <= 0 ? 1000 : tickIntervalMs);
 
   bool get isRider => riderId != null;
 
@@ -210,8 +358,8 @@ class GameState extends ChangeNotifier {
   int get assignRemainingMs {
     final at = _assignAt;
     if (at == null) return 0;
-    final left =
-        assignWindow.inMilliseconds - DateTime.now().difference(at).inMilliseconds;
+    final left = assignWindow.inMilliseconds -
+        DateTime.now().difference(at).inMilliseconds;
     return left < 0 ? 0 : left;
   }
 
@@ -223,7 +371,9 @@ class GameState extends ChangeNotifier {
 
   /// 关闭指派单确认界面（接受或拒绝之后都要调）。
   void resolveAssign() {
-    if (assignOrderId == null && _assignAt == null && _assignMode == null) return;
+    if (assignOrderId == null && _assignAt == null && _assignMode == null) {
+      return;
+    }
     assignOrderId = null;
     _assignMode = null;
     _assignAt = null;
@@ -262,9 +412,11 @@ class GameState extends ChangeNotifier {
 
   /// 每拒掉一单 +1，首页靠它判断「是不是新的一次」，避免重复弹。
   int rejectNoticeSeq = 0;
+
   /// 这次拒单之后的已用次数 / 当日上限（0 = 不限）。
   int rejectNoticeUsed = 0;
   int rejectNoticeLimit = 0;
+
   /// 这次拒单是否把额度用尽、当场被强制下线。
   bool rejectNoticeForcedOffline = false;
 
@@ -316,6 +468,230 @@ class GameState extends ChangeNotifier {
     if (logs.length > 200) logs.removeLast();
     unreadLogs++;
     notifyListeners();
+  }
+
+  // ---------------------------------------------------------------------
+  // 抢单：按订单隔离的状态机
+  //
+  // 这里只管「这一单现在处于什么阶段」，不碰手势。滑块仍然留在
+  // `SlideToConfirm` 里，卡片按阶段决定画滑块、Loading、成功还是失败。
+  // ---------------------------------------------------------------------
+
+  /// ack 迟迟不来，就从「提交中」转「确认中」的等待时间。
+  final Duration claimAckTimeout;
+
+  /// 「确认中」再等一轮的时间。到点只补发一次 resync，不认定失败。
+  final Duration claimConfirmTimeout;
+
+  /// 成功后卡片留在原位置的时间（此时待取列表里已经有同一单）。
+  final Duration claimSuccessHold;
+
+  /// 已被抢走 / 已失效的卡片多留一会儿，让人看清原因再移除。
+  final Duration claimGoneHold;
+
+  /// 每单一条，键是订单 id。
+  final Map<int, ClaimAttempt> claims = {};
+
+  final Map<int, Timer> _claimTimers = {};
+
+  /// 已经播过成功音效的订单。快照 / 重连 / 事件重放都不该再响。
+  final Set<int> _celebrated = {};
+
+  int _claimGen = 0;
+  bool _disposed = false;
+
+  /// 结果不确定时把现有快照再要一份。由首页接到 `GameClient.resync`。
+  void Function()? onResyncRequested;
+
+  ClaimAttempt? claimAttemptFor(int orderId) => claims[orderId];
+
+  /// 发起抢单。返回 false 表示这次没把请求发出去（离线 / 重复）。
+  bool beginClaim(OrderView order) {
+    final cur = claims[order.id];
+    if (cur != null && cur.phase != ClaimPhase.failed) return false;
+    final idx = hall.indexWhere((o) => o.id == order.id);
+    final a = ClaimAttempt(
+      order: order,
+      gen: ++_claimGen,
+      index: idx < 0 ? hall.length : idx,
+    );
+    claims[order.id] = a;
+    if (status != ConnStatus.online) {
+      _failClaim(order.id, null, message: '网络未连接，请重连后再试');
+      note('网络未连接，请重连后再试', kind: LogKind.bad);
+      return false;
+    }
+    _armClaimTimer(order.id, claimAckTimeout, () => _onAckTimeout(order.id));
+    notifyListeners();
+    return true;
+  }
+
+  void _armClaimTimer(int orderId, Duration d, VoidCallback cb) {
+    _claimTimers.remove(orderId)?.cancel();
+    _claimTimers[orderId] = Timer(d, () {
+      _claimTimers.remove(orderId);
+      if (_disposed) return;
+      cb();
+    });
+  }
+
+  /// 超时不是失败：服务端可能已经处理完，只是回包丢了。
+  void _onAckTimeout(int orderId) {
+    final a = claims[orderId];
+    if (a == null || a.phase != ClaimPhase.submitting) return;
+    a.phase = ClaimPhase.confirming;
+    notifyListeners();
+    onResyncRequested?.call();
+    _armClaimTimer(
+      orderId,
+      claimConfirmTimeout,
+      () => _onConfirmTimeout(orderId),
+    );
+  }
+
+  void _onConfirmTimeout(int orderId) {
+    final a = claims[orderId];
+    if (a == null || a.phase != ClaimPhase.confirming) return;
+    // 只补一次 resync。之后保持「结果未知」：滑块不回来、不许重复提交，
+    // 等重连或下一次快照对账。
+    if (a.resynced) return;
+    a.resynced = true;
+    onResyncRequested?.call();
+    _armClaimTimer(
+      orderId,
+      claimConfirmTimeout,
+      () => _onConfirmTimeout(orderId),
+    );
+  }
+
+  /// 服务端明确把单分给了本人。
+  ///
+  /// [announce] 为 false 时只画成功态、只响一声，不写成功文案——调用方
+  /// （`order_claimed` 事件）自己会写一行"抢到了"，避免一次抢单刷两遍屏。
+  void _resolveClaimSuccess(int orderId, {bool announce = true}) {
+    final a = claims[orderId];
+    if (a == null || a.phase == ClaimPhase.succeeded) return;
+    a
+      ..phase = ClaimPhase.succeeded
+      ..code = null
+      ..message = null;
+    _claimTimers.remove(orderId)?.cancel();
+    if (_celebrated.add(orderId)) {
+      onAlert?.call(
+        const RiderAlert(
+          kind: AlertKind.claimSuccess,
+          title: '抢单成功',
+          body: '🎉 抢单成功！恭喜你成功获得这笔订单，请按照平台要求及时前往商家取货，'
+              '并按照订单信息完成配送。祝你配送顺利！',
+        ),
+      );
+    }
+    if (announce) {
+      note(
+        '🎉 抢单成功！请按照平台要求及时前往商家取货，并按照订单信息完成配送。',
+        kind: LogKind.good,
+      );
+    }
+    _armClaimTimer(orderId, claimSuccessHold, () => _retireClaim(orderId));
+    notifyListeners();
+  }
+
+  /// 成功态停留结束：只收走大厅里那张「复制卡」，待取列表不动。
+  void _retireClaim(int orderId) {
+    hall.removeWhere((o) => o.id == orderId);
+    claims.remove(orderId);
+    notifyListeners();
+  }
+
+  void _failClaim(int orderId, String? code, {String? message}) {
+    final a = claims[orderId];
+    if (a == null || a.phase == ClaimPhase.succeeded) return;
+    final (retryable, gone) = _classifyClaimFailure(code);
+    a
+      ..phase = ClaimPhase.failed
+      ..code = code
+      ..retryable = retryable
+      ..message = (message != null && message.isNotEmpty)
+          ? message
+          : ErrCode.humanize(code);
+    _claimTimers.remove(orderId)?.cancel();
+    if (gone) {
+      // 这单已经不可能再抢：先让人看清原因，再把卡片收走。
+      _armClaimTimer(orderId, claimGoneHold, () {
+        hall.removeWhere((o) => o.id == orderId);
+        claims.remove(orderId);
+        notifyListeners();
+      });
+      onResyncRequested?.call();
+    }
+    if (code == ErrCode.outOfRange) onResyncRequested?.call();
+    notifyListeners();
+  }
+
+  static (bool retryable, bool gone) _classifyClaimFailure(String? code) {
+    switch (code) {
+      case ErrCode.alreadyClaimed:
+      case ErrCode.orderNotFound:
+      case ErrCode.orderExpired:
+      case ErrCode.wrongPhase:
+        return (false, true);
+      default:
+        return (true, false);
+    }
+  }
+
+  /// 用快照对账。
+  ///
+  /// 快照是权威的：只要单在我的 active 里，就是成功；还留在大厅就不是我的。
+  /// 这里**不动**已经处于失败态的卡片，避免 resync 把失败原因冲掉。
+  void _reconcileClaims() {
+    if (claims.isEmpty) return;
+    final mine = riderId;
+    for (final id in claims.keys.toList()) {
+      final a = claims[id];
+      if (a == null) continue;
+      final isMine = activeOrders.any(
+        (o) => o.id == id && o.status.isActive && o.assignedTo == mine,
+      );
+      if (isMine) {
+        _resolveClaimSuccess(id, announce: a.phase != ClaimPhase.succeeded);
+        continue;
+      }
+      final pending = hall.any((o) => o.id == id);
+      switch (a.phase) {
+        case ClaimPhase.submitting:
+        case ClaimPhase.confirming:
+          if (pending && a.phase == ClaimPhase.confirming) {
+            _failClaim(id, null, message: '抢单没有成功，请重试');
+          } else if (!pending) {
+            _failClaim(id, ErrCode.orderExpired);
+          }
+        case ClaimPhase.succeeded:
+          // 快照把大厅整表替换了，把成功卡片插回原位，别让它提前闪没。
+          if (!pending) {
+            final at = a.index < 0
+                ? 0
+                : (a.index > hall.length ? hall.length : a.index);
+            hall.insert(
+              at,
+              _copyOrder(a.order,
+                  status: OrderStatus.assigned, assignedTo: mine),
+            );
+          }
+        case ClaimPhase.failed:
+          if (a.retryable && !pending) claims.remove(id);
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    for (final t in _claimTimers.values) {
+      t.cancel();
+    }
+    _claimTimers.clear();
+    super.dispose();
   }
 
   /// 吃一帧。返回后 UI 会被通知一次。
@@ -452,10 +828,35 @@ class GameState extends ChangeNotifier {
     ledgers = s.lastDayLedgers;
     activities = s.activities;
     notice = s.notice;
+    // 快照会整表替换 hall / activeOrders，正在进行的抢单必须跟着对账。
+    _reconcileClaims();
     if (announce) note('已同步世界状态');
   }
 
   void _applyAck(Ack a) {
+    if (a.action == Msg.claim) {
+      final orderId = optInt(a.data['order_id']);
+      if (a.ok) {
+        if (orderId != null) {
+          // 成功文案和音效都交给状态机，保证同一单只响一次；事件那边
+          // (`order_claimed`) 已经写过一行"抢到了"，这里不再重复。
+          _resolveClaimSuccess(orderId);
+        } else {
+          note('抢单成功', kind: LogKind.good);
+        }
+        return;
+      }
+      // 服务端的 message 比通用文案更具体（"已被其他骑手抢走"这种）。
+      final said = a.message;
+      final msg =
+          (said != null && said.isNotEmpty) ? said : ErrCode.humanize(a.code);
+      lastError = msg;
+      errorSeq++;
+      note(msg, kind: LogKind.bad);
+      // 没有 order_id 的是旧服务端，只能退回全局提示，卡片无法精确定位。
+      if (orderId != null) _failClaim(orderId, a.code, message: msg);
+      return;
+    }
     if (a.ok) {
       final label = switch (a.action) {
         Msg.claim => '抢单成功',
@@ -520,9 +921,30 @@ class GameState extends ChangeNotifier {
     // 旧服务端没有这个字段：那时平台塞过来的单都是可拒的，按指派单处理。
     final mode = p['assign_mode'] is String ? p['assign_mode'] as String : null;
     final idx = hall.indexWhere((o) => o.id == id);
+    final attempt = claims[id];
     if (idx >= 0) {
-      final old = hall.removeAt(idx);
-      activeOrders.add(_copyOrder(old, status: OrderStatus.assigned, assignedTo: by));
+      final old = hall[idx];
+      if (attempt != null && mine) {
+        // 自己刚抢到的单：大厅这张卡先留在原位显示 1.5s 成功态。
+        // 下面照样进 activeOrders，所以待取数量和收益立刻就是对的。
+        hall[idx] =
+            _copyOrder(old, status: OrderStatus.assigned, assignedTo: by);
+      } else {
+        hall.removeAt(idx);
+      }
+      if (!activeOrders.any((o) => o.id == id)) {
+        activeOrders.add(
+          _copyOrder(old, status: OrderStatus.assigned, assignedTo: by),
+        );
+      }
+    }
+    if (attempt != null) {
+      if (mine) {
+        // 事件里的 note 已经写了"抢到了"，这里只画成功态、响一声。
+        _resolveClaimSuccess(id, announce: false);
+      } else if (attempt.active) {
+        _failClaim(id, ErrCode.alreadyClaimed);
+      }
     }
     // 平台派来的单要骑手当面确认，先弹界面再算数：
     // 指派单可以拒（吃额度），强制派单只能同意。
@@ -537,7 +959,8 @@ class GameState extends ChangeNotifier {
           ? switch (mode) {
               'forced' => '强制派单：${reqStr(p['rider_name'], '你')} 塞来一单，只能同意',
               'offer' => '指派单：${reqStr(p['rider_name'], '你')} 给你派了一单',
-              _ => '抢到了：${reqStr(p['rider_name'], '你')} → ${yuan(reqInt(p['quoted_fee_cents']))} 元',
+              _ =>
+                '抢到了：${reqStr(p['rider_name'], '你')} → ${yuan(reqInt(p['quoted_fee_cents']))} 元',
             }
           : '单 ${reqStr(p['rider_name'], '他人')} 抢走了',
       kind: mine ? LogKind.good : LogKind.info,
@@ -650,6 +1073,9 @@ class GameState extends ChangeNotifier {
   void _removeOrder(int id) {
     hall.removeWhere((o) => o.id == id);
     activeOrders.removeWhere((o) => o.id == id);
+    _claimTimers.remove(id)?.cancel();
+    claims.remove(id);
+    _celebrated.remove(id);
     if (assignOrderId == id) resolveAssign();
   }
 
@@ -701,7 +1127,8 @@ class GameState extends ChangeNotifier {
     );
     // 财务字段会随后续的 rider_state_changed 修正；本地先乐观累加。
     _patchMe((r) => _copyRider(r,
-        takehomeCents: r.takehomeCents == null ? null : r.takehomeCents! + delta));
+        takehomeCents:
+            r.takehomeCents == null ? null : r.takehomeCents! + delta));
   }
 
   void _patchMe(RiderView Function(RiderView) update) {
@@ -737,7 +1164,8 @@ class GameState extends ChangeNotifier {
   }
 
   void _applyAiDecision(Map<String, dynamic> p) {
-    final n = (p['assignments'] is List) ? (p['assignments'] as List).length : 0;
+    final n =
+        (p['assignments'] is List) ? (p['assignments'] as List).length : 0;
     if (n > 0) note('AI 指派了 $n 单', kind: LogKind.info);
   }
 
@@ -789,6 +1217,13 @@ class GameState extends ChangeNotifier {
 
   void _applyDayClosed(Map<String, dynamic> p) {
     ledgers = listOf(p['ledgers'], DayLedgerView.fromJson);
+    // 跨天了，上一轮的成功/失败卡片与去重集合都不该留到新的一天。
+    for (final t in _claimTimers.values) {
+      t.cancel();
+    }
+    _claimTimers.clear();
+    claims.clear();
+    _celebrated.clear();
     note(
       '第 ${reqInt(p['day'])} 天结算，总到手 ${yuan(reqInt(p['total_takehome_cents']))} 元',
       kind: LogKind.money,

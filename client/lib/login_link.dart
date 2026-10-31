@@ -141,9 +141,7 @@ String normalizeServerUrl(String raw, {int defaultPort = kDefaultPort}) {
     // ws / http / 其它一律当明文 ws：局域网里没有证书。
     _ => 'ws',
   };
-  final port = uri.hasPort
-      ? uri.port
-      : (scheme == 'wss' ? 443 : defaultPort);
+  final port = uri.hasPort ? uri.port : (scheme == 'wss' ? 443 : defaultPort);
   // 用户自己带了路径就用他的（可能挂在反代子路径下），否则用约定的 /ws。
   final path = (uri.path.isEmpty || uri.path == '/') ? kWsPath : uri.path;
 

@@ -49,6 +49,7 @@ class _LoginPageState extends State<LoginPage> {
   late final TextEditingController _token;
 
   bool _obscure = true;
+
   /// 本地校验的错（比如地址填错）。服务端拒的那条走 `widget.error`。
   String? _localError;
 
@@ -209,7 +210,8 @@ class _LoginPageState extends State<LoginPage> {
                         Expanded(child: Divider()),
                         Padding(
                           padding: EdgeInsets.symmetric(horizontal: 12),
-                          child: Text('或者手填', style: TextStyle(color: Colors.grey)),
+                          child: Text('或者手填',
+                              style: TextStyle(color: Colors.grey)),
                         ),
                         Expanded(child: Divider()),
                       ],
@@ -260,7 +262,9 @@ class _LoginPageState extends State<LoginPage> {
                         labelText: '密码',
                         border: const OutlineInputBorder(),
                         suffixIcon: IconButton(
-                          icon: Icon(_obscure ? Icons.visibility : Icons.visibility_off),
+                          icon: Icon(_obscure
+                              ? Icons.visibility
+                              : Icons.visibility_off),
                           onPressed: () => setState(() => _obscure = !_obscure),
                         ),
                       ),
@@ -276,10 +280,12 @@ class _LoginPageState extends State<LoginPage> {
 
                     // 开发后门藏起来：骑手不该在这里纠结填什么。
                     Theme(
-                      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+                      data: Theme.of(context)
+                          .copyWith(dividerColor: Colors.transparent),
                       child: ExpansionTile(
                         tilePadding: EdgeInsets.zero,
-                        title: const Text('高级（开发用）', style: TextStyle(fontSize: 14)),
+                        title: const Text('高级（开发用）',
+                            style: TextStyle(fontSize: 14)),
                         children: [
                           TextField(
                             controller: _token,

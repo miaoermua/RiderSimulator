@@ -211,6 +211,22 @@ export interface ConfigView {
   commission_rate: number;
   discriminative_commission: boolean;
   claim_window_secs: number;
+  /**
+   * 派单范围半径（km）。圆心是骑手当前有效定位，判「骑手 → 订单取货点」。
+   *
+   * 合法 1~500，越界时服务端返回 400 而不是夹取——所以后台输入框
+   * 的 min/max 只是提示，真正的边界在 `sim::dispatch`。
+   * 老配置没有这个字段时服务端补 90。
+   */
+  dispatch_radius_km: number;
+  /**
+   * 推荐单概率（百分比 0~100）。
+   *
+   * 控制的是**订单被标上「推荐」的概率**，不是被接单/被派送的概率。
+   * 判定是 `hash(seed, rider_id, order_id) % 100 < 概率`，
+   * 同一骑手同一订单结果恒定，刷新不会让标签闪。
+   */
+  recommend_percent: number;
   allow_speeding: boolean;
   allow_unrestricted: boolean;
   /** 允许真人骑手做违规操作（没过到位置就点「到店 / 送达」）。 */

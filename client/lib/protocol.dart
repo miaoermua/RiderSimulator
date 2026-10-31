@@ -21,6 +21,7 @@ abstract final class Msg {
   static const ping = 'ping';
   static const claim = 'claim';
   static const reject = 'reject';
+
   /// 确认收下系统指派来的单（指派单在点「接受」之前一直挂着待确认标记）。
   static const acceptAssign = 'accept_assign';
   static const urge = 'urge';
@@ -34,9 +35,11 @@ abstract final class Msg {
   static const setPosition = 'set_position';
   static const changePassword = 'change_password';
   static const taskMessage = 'task_message';
+
   /// 订单会话（末端交付沟通）里打字说一句。**不要求订单挂任务**，
   /// 与绑在附加任务上的 [taskMessage] 是两回事。
   static const chatSay = 'chat_say';
+
   /// 订单会话里点一条预设话术。文本由服务端按枚举补全，客户端只发枚举名。
   static const chatPreset = 'chat_preset';
 }
@@ -56,6 +59,7 @@ abstract final class Ev {
   static const orderBroadcast = 'order_broadcast';
   static const orderClaimed = 'order_claimed';
   static const orderExpired = 'order_expired';
+
   /// 拒掉了一张待确认的指派单。只推给本人与控制端。
   static const assignRejected = 'assign_rejected';
   static const orderPickedUp = 'order_picked_up';
@@ -64,17 +68,22 @@ abstract final class Ev {
   static const riderFinance = 'rider_finance';
   static const weatherChanged = 'weather_changed';
   static const fineIssued = 'fine_issued';
+
   /// 活动定义变化（新建 / 上下架 / 删除）。
   static const activitiesChanged = 'activities_changed';
+
   /// 活动进度变化（又完成了一单）。只推给本人与控制端。
   static const activityProgress = 'activity_progress';
+
   /// 活动达成，奖金已自动入账。只推给本人与控制端。
   static const activityReward = 'activity_reward';
+
   /// 首页通知变了（烽火台改文字 / 清空）。全体可见。
   static const noticeChanged = 'notice_changed';
   static const configChanged = 'config_changed';
   static const aiDecision = 'ai_decision';
   static const taskMessage = 'task_message';
+
   /// 订单会话消息（末端交付沟通）。骑手与顾客说的话都走它，按 `order_id` 归并。
   static const chatMessage = 'chat_message';
   static const dayClosed = 'day_closed';
@@ -87,8 +96,10 @@ abstract final class ErrCode {
   static const helloRequired = 'HELLO_REQUIRED';
   static const protocolMismatch = 'PROTOCOL_MISMATCH';
   static const unauthorized = 'UNAUTHORIZED';
+
   /// 这个名字在烽火台还没建过号。
   static const noAccount = 'NO_ACCOUNT';
+
   /// 名字不在、或密码不对（登录时不做区分，防止被人拿去撞名字）。
   static const badCredentials = 'BAD_CREDENTIALS';
   static const notARider = 'NOT_A_RIDER';
@@ -96,6 +107,8 @@ abstract final class ErrCode {
   static const featureDisabled = 'FEATURE_DISABLED';
   static const noTask = 'NO_TASK';
   static const taskFinished = 'TASK_FINISHED';
+
+  /// 服务端内部错误（`app.rs` 的兜底码）。
   static const internal = 'INTERNAL';
 
   static const orderNotFound = 'ORDER_NOT_FOUND';
@@ -107,18 +120,29 @@ abstract final class ErrCode {
   static const riderInjured = 'RIDER_INJURED';
   static const ratingTooLow = 'RATING_TOO_LOW';
   static const heldLimitReached = 'HELD_LIMIT_REACHED';
+
+  /// 当天已完成单量到上限。与 [heldLimitReached] 分开，提示不同。
+  static const dailyLimitReached = 'DAILY_LIMIT_REACHED';
   static const backOrderDisabled = 'BACK_ORDER_DISABLED';
   static const backOrderDetourTooLong = 'BACK_ORDER_DETOUR_TOO_LONG';
   static const wrongPhase = 'WRONG_PHASE';
   static const notAssignedToYou = 'NOT_ASSIGNED_TO_YOU';
+
+  /// 订单取货点超出骑手的派单范围（接口兜底，界面本不该出现这张单）。
+  static const outOfRange = 'OUT_OF_RANGE';
+
   /// 人还没走到就点到店 / 到顾客，控制端没开「允许真人违规操作」。
   static const offsiteOp = 'OFFSITE_OP';
+
   /// 今日拒单额度已用尽，这张指派单拒不掉了。
   static const rejectLimitReached = 'REJECT_LIMIT_REACHED';
+
   /// 这是一张强制派单，本来就没有拒绝这个动作。
   static const assignForced = 'ASSIGN_FORCED';
+
   /// 今天已被强制下线（拒单额度用尽），不能再自己上线。
   static const forcedOffline = 'FORCED_OFFLINE';
+
   /// 世界不在实时档：真人骑手必须和现实时间对齐，模拟加速档只跑 AI。
   static const realtimeOnly = 'REALTIME_ONLY';
 
@@ -129,6 +153,9 @@ abstract final class ErrCode {
         orderExpired => '这单已经过期',
         ratingTooLow => '评分不够，抢不了这一档',
         heldLimitReached => '手上的单太多了',
+        dailyLimitReached => '今日接单已达上限',
+        outOfRange => '超出派单范围，看不到这单',
+        internal => '服务端开小差了，请重试',
         riderOffline => '你先上线才能接单',
         riderFrozen => '账号被冻结了',
         riderInjured => '你受伤了，先歇会儿',
@@ -186,10 +213,7 @@ Map<String, dynamic> asMap(Object? v) =>
     v is Map ? Map<String, dynamic>.from(v) : const {};
 
 List<T> listOf<T>(Object? v, T Function(Map<String, dynamic>) make) => v is List
-    ? v
-        .whereType<Map>()
-        .map((e) => make(Map<String, dynamic>.from(e)))
-        .toList()
+    ? v.whereType<Map>().map((e) => make(Map<String, dynamic>.from(e))).toList()
     : const [];
 
 /// 分 → 元，保留两位。
@@ -347,6 +371,7 @@ class ConfigDistanceTier {
 
   /// 距离下界（米）。本单距离取不超过它的最大档。
   final int fromM;
+
   /// 该档的总附加费（分）。
   final int cents;
 }
@@ -369,11 +394,14 @@ class ConfigFeeRules {
   /// 起步价（分），含第一档里程。
   final int baseFeeCents;
   final List<ConfigDistanceTier> distanceTiers;
+
   /// 超出最后一档后每公里单价（分/km）。
   final int perKmOverCents;
+
   /// 等级加成（分/级）。
   final int levelBonusPerLevelCents;
   final double surgeMultiplier;
+
   /// 订单重投上限与每次加价。
   final int maxRedispatchAttempts;
   final int redispatchSurchargeStepCents;
@@ -385,7 +413,8 @@ class ConfigFeeRules {
         levelBonusPerLevelCents: reqInt(j['level_bonus_per_level_cents']),
         surgeMultiplier: reqDouble(j['surge_multiplier'], 1),
         maxRedispatchAttempts: reqInt(j['max_redispatch_attempts']),
-        redispatchSurchargeStepCents: reqInt(j['redispatch_surcharge_step_cents']),
+        redispatchSurchargeStepCents:
+            reqInt(j['redispatch_surcharge_step_cents']),
       );
 
   /// 阶梯是 `[[距离, 金额]]` 这样的**数组对**，不是对象数组，
@@ -460,6 +489,10 @@ class OrderView {
     required this.urgeCount,
     required this.prepMinutes,
     required this.task,
+    this.recommended = false,
+    this.onTheWayPct,
+    this.samePickup = false,
+    this.sameDropoff = false,
   });
 
   final int id;
@@ -479,13 +512,16 @@ class OrderView {
   final int? pickedUpAtMin;
   final int? deliveredAtMin;
   final FeeView fee;
+
   /// 退回大厅重投的次数：没人接、或骑手取消都会累加。
   final int redispatchCount;
+
   /// 重投叠加的调度补贴（分），全给骑手、不抽水。
   final int surchargeCents;
   final OrderStatus status;
   final int? assignedTo;
   final bool forced;
+
   /// 平台派单方式：`offer` = 指派单（可拒），`forced` = 强制派单（只能同意）。
   /// null = 不是平台派过来的（大厅抢的 / AI 派的）。
   final String? assignMode;
@@ -493,6 +529,24 @@ class OrderView {
   final int urgeCount;
   final int? prepMinutes;
   final ExtraTaskView? task;
+
+  /// 推荐单。**由服务端按"当前这个骑手"算**，同一张单别人看到的可能不是推荐。
+  ///
+  /// 只有大厅里的订单带这个标记（`active_orders` 上没有），缺字段时按 false 处理，
+  /// 老服务端照常工作。
+  final bool recommended;
+
+  /// 顺路度（0~100 整数）。`null` = 算不出来——可能是没有配送中的单，
+  /// 也可能是缺坐标。与「顺路度 0%」是两件事，界面要据此决定显不显示。
+  ///
+  /// 口径：额外绕行占这单直达里程的比例（球面直线距离，**不是道路路线**）。
+  final int? onTheWayPct;
+
+  /// 与手上某笔**配送中**订单同一个取货地点（同一家店）。
+  final bool samePickup;
+
+  /// 与手上某笔配送中订单同一个送货地点（50 米内视为同一处）。
+  final bool sameDropoff;
 
   bool isMine(int? riderId) => riderId != null && assignedTo == riderId;
 
@@ -506,8 +560,9 @@ class OrderView {
   int get effectiveTakehomeCents => fee.takehomeCents + surchargeCents;
 
   /// 距离展示：`1.2km` / `860m`。
-  String get distanceLabel =>
-      distanceM >= 1000 ? '${(distanceM / 1000).toStringAsFixed(1)}km' : '${distanceM}m';
+  String get distanceLabel => distanceM >= 1000
+      ? '${(distanceM / 1000).toStringAsFixed(1)}km'
+      : '${distanceM}m';
 
   factory OrderView.fromJson(Map<String, dynamic> j) {
     final task = j['task'];
@@ -534,11 +589,17 @@ class OrderView {
       status: OrderStatus.parse(reqStr(j['status'])),
       assignedTo: optInt(j['assigned_to']),
       forced: reqBool(j['forced']),
-      assignMode: j['assign_mode'] is String ? j['assign_mode'] as String : null,
+      assignMode:
+          j['assign_mode'] is String ? j['assign_mode'] as String : null,
       backOrder: reqBool(j['back_order']),
       urgeCount: reqInt(j['urge_count']),
       prepMinutes: optInt(j['prep_minutes']),
       task: task is Map ? ExtraTaskView.fromJson(asMap(task)) : null,
+      // 服务端只给大厅订单注入这四个字段；缺省值让旧服务端不受影响。
+      recommended: reqBool(j['recommended']),
+      onTheWayPct: optInt(j['on_the_way_pct']),
+      samePickup: reqBool(j['same_pickup']),
+      sameDropoff: reqBool(j['same_dropoff']),
     );
   }
 }
@@ -555,10 +616,13 @@ class ActivityView {
 
   final int id;
   final String title;
+
   /// 目标单数。
   final int targetOrders;
+
   /// 奖金（分）。
   final int rewardCents;
+
   /// 是否在进行中。下架的活动不再累计，也不发奖。
   final bool active;
 
@@ -609,6 +673,7 @@ class ActivityProgressView {
 
   final int activityId;
   final int completed;
+
   /// 奖金是否已发（发过就只涨进度、不再发钱）。
   final bool rewarded;
 
@@ -659,8 +724,10 @@ class RiderView {
   final int level;
   final double rating;
   final int completed;
+
   /// 今日已用掉的拒单次数（配合 [ConfigView.maxRejectsPerDay] 显示额度）。
   final int rejectsToday;
+
   /// 今天因拒单额度用尽被强制下线：不能自己再上线，日结才解封。
   final bool forcedOffline;
   final List<int> held;
@@ -708,7 +775,10 @@ class RiderView {
         rejectsToday: reqInt(j['rejects_today']),
         forcedOffline: reqBool(j['forced_offline']),
         held: j['held'] is List
-            ? (j['held'] as List).whereType<num>().map((e) => e.toInt()).toList()
+            ? (j['held'] as List)
+                .whereType<num>()
+                .map((e) => e.toInt())
+                .toList()
             : const [],
         heldCap: optInt(j['held_cap']),
         phase: RiderPhase.parse(j['phase']),
@@ -828,16 +898,20 @@ class ConfigView {
   final bool backorderEnabled;
   final int backorderMax;
   final int maxOrdersPerDay;
+
   /// 每日拒单额度。**0 = 不限**。
   final int maxRejectsPerDay;
   final bool isPeak;
   final double surgeMultiplier;
+
   /// 下发坐标的坐标系。地图底图必须跟着它走，否则点位整体偏几百米。
   final CoordSystem coordSystem;
+
   /// 计价规则（单价系统）。过去这里只有一个 `base_fee_cents`，
   /// 起步价以外的里程、等级、重投补贴都拿不到。
   final ConfigFeeRules fee;
   final int insurancePerDayCents;
+
   /// 取送半径（米）：真实坐标进圈就能点到店 / 送达，0 = 关闭。
   final int arriveRadiusM;
 
@@ -965,9 +1039,8 @@ class Snapshot {
         lastDayLedgers: listOf(j['last_day_ledgers'], DayLedgerView.fromJson),
         claimWindowMs: reqInt(j['claim_window_ms'], 5000),
         activities: listOf(j['activities'], ActivityView.fromJson),
-        notice: j['notice'] is Map
-            ? NoticeView.fromJson(asMap(j['notice']))
-            : null,
+        notice:
+            j['notice'] is Map ? NoticeView.fromJson(asMap(j['notice'])) : null,
       );
 }
 

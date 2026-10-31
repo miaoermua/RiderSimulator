@@ -197,7 +197,8 @@ class _CameraError extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.no_photography_outlined, size: 64, color: Colors.white54),
+            const Icon(Icons.no_photography_outlined,
+                size: 64, color: Colors.white54),
             const SizedBox(height: 16),
             Text(
               title,
@@ -208,7 +209,8 @@ class _CameraError extends StatelessWidget {
             Text(
               detail,
               textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
+              style: const TextStyle(
+                  color: Colors.white70, fontSize: 13, height: 1.5),
             ),
             const SizedBox(height: 24),
             Wrap(
@@ -223,7 +225,8 @@ class _CameraError extends StatelessWidget {
                 ),
                 TextButton.icon(
                   onPressed: onPaste,
-                  icon: const Icon(Icons.content_paste, size: 18, color: Colors.white70),
+                  icon: const Icon(Icons.content_paste,
+                      size: 18, color: Colors.white70),
                   label: const Text(
                     '改用粘贴登录串',
                     style: TextStyle(color: Colors.white70),
@@ -262,7 +265,10 @@ class _CameraError extends StatelessWidget {
               '还不行就用粘贴登录。${raw == null ? '' : '\n（$raw）'}',
         );
       default:
-        return ('相机现在用不了', '${error.errorCode.name}${raw == null ? '' : ' · $raw'}');
+        return (
+          '相机现在用不了',
+          '${error.errorCode.name}${raw == null ? '' : ' · $raw'}'
+        );
     }
   }
 }

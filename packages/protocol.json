@@ -131,7 +131,7 @@
     "transport": {
       "welcome": "握手成功。payload: { protocol_version, role, rider_id, rider_key, tick_interval_ms, server_minute, snapshot }",
       "snapshot": "完整世界快照。payload: { day, sim_minute, elapsed_min, weather, config, riders, hall, active_orders, merchants, stats, claim_window_ms, activities, notice }。notice 是烽火台写的单条首页通知（可关联活动），null = 没写。config.coord_system 决定所有下发坐标的坐标系。config.fee 是计价规则（起步价 / 里程阶梯 / 每公里单价 / 等级加成 / 重投补贴），订单自己的 fee 是按其算出的单笔明细，另加 surcharge_cents（重投补贴）。claim_window_ms 是抢单窗口的**真实挂钟时长**，实时档下为 60000。",
-      "ack": "动作应答。payload: { action, ok, code?, message?, data? }",
+      "ack": "动作应答。payload: { action, ok, code?, message?, data? }。claim 的失败也带 data.order_id：多单并发时客户端靠它把原因挂回对应卡片。",
       "error": "传输层错误。payload: { code, message }",
       "pong": "心跳应答。payload: { elapsed_min }",
       "server_info": "控制端专用状态。payload: { ...stats, brain_note, brain_calls_today, llm_enabled, ... }"
@@ -236,10 +236,12 @@
       "RIDER_INJURED",
       "RATING_TOO_LOW",
       "HELD_LIMIT_REACHED",
+      "DAILY_LIMIT_REACHED",
       "BACK_ORDER_DISABLED",
       "BACK_ORDER_DETOUR_TOO_LONG",
       "WRONG_PHASE",
-      "NOT_ASSIGNED_TO_YOU"
+      "NOT_ASSIGNED_TO_YOU",
+      "OUT_OF_RANGE"
     ],
     "comment": "客户端一律按 code 分支，不要匹配 message 文案。"
   }

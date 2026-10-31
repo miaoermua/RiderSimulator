@@ -18,6 +18,25 @@ fn app() -> App {
     App::new(world(), Store::in_memory().unwrap(), AppOptions::default())
 }
 
+/// 让一具新出生的真人身体"上报一次定位"，把 `position_report_wall_ms` 刷新到当下。
+///
+/// `spawn_human_rider` 造出来的身体时间戳是 0，按 `dispatch::PositionState`
+/// 判定属于「从没上报过」，看不见任何单——所有大厅抢单类测试都会撞上。
+///
+/// 真实世界里客户端一登录就开始上报（`LocationService` 默认 30 秒一次），
+/// 所以这里补的是**真实前提**，不是在绕过被测规则。反过来说：
+/// **不要为了让它过就把范围校验关掉**，那等于把新加的业务约束拆了。
+fn report_fresh_pos(app: &mut App, rid: RiderId) {
+    let now = app.world.wall_ms;
+    let Some((lat, lng)) = app.world.rider(rid).map(|r| (r.lat, r.lng)) else {
+        panic!("骑手 {rid} 不在世界里");
+    };
+    app.world
+        .rider_mut(rid)
+        .expect("刚查过")
+        .report_position(crate::sim::geo::LatLng::new(lat, lng), now);
+}
+
 fn control_app() -> App {
     let opts = AppOptions {
         allow_control: true,
@@ -206,6 +225,7 @@ fn new_token_creates_a_human_rider() {
 fn a_claim_moves_the_order_and_acks_with_the_report() {
     let mut app = app();
     let rid = app.world.spawn_human_rider("张三");
+    report_fresh_pos(&mut app, rid);
     let (mut rx, _w) = hello(&mut app, 1, Some(&rider_token(rid)));
     let oid = app.world.generate_order().expect("应该能出一单");
 
@@ -232,6 +252,8 @@ fn a_second_claim_on_the_same_order_fails_and_does_not_steal_it() {
     let mut app = app();
     let r1 = app.world.spawn_human_rider("甲");
     let r2 = app.world.spawn_human_rider("乙");
+    report_fresh_pos(&mut app, r1);
+    report_fresh_pos(&mut app, r2);
     let (mut c1, _) = hello(&mut app, 1, Some(&rider_token(r1)));
     let (mut c2, _) = hello(&mut app, 2, Some(&rider_token(r2)));
     let oid = app.world.generate_order().expect("应该能出一单");
@@ -259,6 +281,12 @@ fn a_second_claim_on_the_same_order_fails_and_does_not_steal_it() {
     let a = ack(&second);
     assert_eq!(a["payload"]["ok"].as_bool(), Some(false));
     assert_eq!(a["payload"]["code"].as_str(), Some("ALREADY_CLAIMED"));
+    // 失败 ack 也要能定位到单：多单并发时客户端靠它把原因挂回正确的卡片。
+    assert_eq!(
+        a["payload"]["data"]["order_id"].as_u64(),
+        Some(oid as u64),
+        "抢单失败必须带回 order_id"
+    );
     assert_eq!(app.world.order(oid).unwrap().assigned_to, Some(r1));
 }
 
@@ -965,6 +993,7 @@ fn disconnecting_the_last_connection_takes_the_rider_offline() {
 fn a_rider_holding_orders_stays_online_after_disconnect() {
     let mut app = app();
     let rid = app.world.spawn_human_rider("张三");
+    report_fresh_pos(&mut app, rid);
     let (mut rx, _w) = hello(&mut app, 1, Some(&rider_token(rid)));
     let oid = app.world.generate_order().expect("应该能出一单");
     send(
